@@ -1,6 +1,6 @@
-# CodeBuddy - IntelliJ IDEA AI 编程助手插件
+# LoongC - IntelliJ IDEA AI 编程助手插件
 
-CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智能代码补全、AI 聊天助手和项目文件分析功能。
+LoongC 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智能代码补全、AI 聊天助手和项目文件分析功能。
 
 ## 功能特性
 
@@ -23,7 +23,7 @@ CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智
 - 自动获取当前编辑器中的文件内容作为上下文
 
 ### 4. 代码生成功能
-- 选中代码后右键选择 "CodeBuddy 生成代码"
+- 选中代码后右键选择 "LoongC 生成代码"
 - 根据描述自动生成代码片段
 - 支持替换选中内容或在光标处插入
 
@@ -34,7 +34,7 @@ CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智
 2. 使用 IntelliJ IDEA 打开项目
 3. 运行 Gradle 任务：`gradle buildPlugin`
 4. 在 IDEA 中：`Settings -> Plugins -> Install from Disk`
-5. 选择 `build/distributions/CodeBuddy-1.0.0.zip`
+5. 选择 `build/distributions/LoongC-1.0.0.zip`
 
 ### 方式二：从源码运行
 1. 使用 IntelliJ IDEA 打开本项目
@@ -45,7 +45,7 @@ CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智
 ## 配置说明
 
 ### 首次使用配置
-1. 安装插件后，打开 `Settings -> CodeBuddy`
+1. 安装插件后，打开 `Settings -> LoongC`
 2. 输入你的 DeepSeek API Key（从 [DeepSeek 开放平台](https://platform.deepseek.com/) 获取）
 3. 可选：修改 API Base URL、选择模型、调整参数
 
@@ -62,7 +62,7 @@ CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智
 ## 使用指南
 
 ### 快捷键
-- `Ctrl + Shift + C`：打开 CodeBuddy 聊天窗口
+- `Ctrl + Shift + C`：打开 LoongC 聊天窗口
 - `Ctrl + Shift + G`：使用 AI 生成代码
 
 ### 聊天命令
@@ -79,34 +79,7 @@ CodeBuddy 是一个基于 DeepSeek 大模型的 IntelliJ IDEA 插件，提供智
 ## 项目结构
 
 ```
-codebuddy/
-├── build.gradle.kts              # Gradle 构建配置
-├── settings.gradle.kts           # Gradle 设置
-├── src/
-│   └── main/
-│       ├── java/com/codebuddy/
-│       │   ├── api/
-│       │   │   ├── DeepSeekClient.java          # DeepSeek API 客户端
-│       │   │   └── model/                       # API 请求/响应模型
-│       │   ├── completion/
-│       │   │   ├── CodeBuddyCompletionContributor.java   # 代码补全入口
-│       │   │   └── CodeBuddyCompletionProvider.java      # 补全逻辑
-│       │   ├── settings/
-│       │   │   ├── CodeBuddySettings.java       # 设置持久化
-│       │   │   └── CodeBuddySettingsConfigurable.java    # 设置 UI
-│       │   ├── toolwindow/
-│       │   │   ├── CodeBuddyToolWindowFactory.java       # 工具窗口工厂
-│       │   │   └── ChatPanel.java               # 聊天面板 UI
-│       │   ├── actions/
-│       │   │   ├── OpenChatAction.java          # 打开聊天 Action
-│       │   │   └── GenerateCodeAction.java      # 生成代码 Action
-│       │   └── utils/
-│       │       └── FileReaderUtil.java          # 项目文件读取工具
-│       └── resources/
-│           ├── META-INF/
-│           │   └── plugin.xml     # 插件配置文件
-│           └── icons/
-│               └── codebuddy.svg  # 插件图标
+LoongC/
 ```
 
 ## 技术栈
