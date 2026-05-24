@@ -33,7 +33,7 @@ public class LoongCToolWindowFactory implements ToolWindowFactory {
 
         // 注册原生 titleActions：使用 AllIcons 图标，显示在工具窗口标题栏
         toolWindow.setTitleActions(Arrays.asList(
-                new AnAction("清空对话", "清空当前对话历史", AllIcons.General.Reset) {
+                new AnAction("清空对话", "清空当前对话历史", AllIcons.Actions.GC) {
                     @Override
                     public void actionPerformed(@NotNull AnActionEvent e) {
                         chatPanel.clearChat();

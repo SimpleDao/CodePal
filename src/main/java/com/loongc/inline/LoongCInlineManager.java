@@ -15,6 +15,7 @@ import okhttp3.Call;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -347,8 +348,8 @@ public class LoongCInlineManager {
             activeInlineInlay.getRenderer().updateText(firstLine);
             activeInlineInlay.update();
         } else if (!firstLine.isEmpty()) {
-            activeInlineInlay = inlayModel.addInlineElement(
-                    offset, true, new LoongCInlayRenderer(firstLine, editor));
+            activeInlineInlay = (Inlay<LoongCInlayRenderer>) addInlineElementCompat(
+                    inlayModel, offset, true, new LoongCInlayRenderer(firstLine, editor));
         }
 
         // ── 块 Inlay：复用或新建/销毁 ────────────────────
@@ -357,9 +358,9 @@ public class LoongCInlineManager {
             if (activeBlockInlay != null && activeBlockInlay.isValid()) {
                 activeBlockInlay.getRenderer().updateLines(restLines);
                 activeBlockInlay.update();
-            } else {
-                activeBlockInlay = inlayModel.addBlockElement(
-                        lineEnd, true, false, 0,
+            }  else {
+                activeBlockInlay = (Inlay<LoongCBlockRenderer>) addBlockElementCompat(
+                        inlayModel, lineEnd, true, false, 0,
                         new LoongCBlockRenderer(restLines, editor));
             }
         } else if (activeBlockInlay != null) {
@@ -368,6 +369,92 @@ public class LoongCInlineManager {
             activeBlockInlay = null;
         }
     }
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // InlayModel API 兼容性封装（2023.3 → 2026.1）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 兼容性添加行内 Inlay。
+     * IDEA 2024+ 中 addInlineElement 签名可能变为 (int, InlayProperties, Renderer)，
+     * 通过反射适配旧版本的 (int, boolean, Renderer) 签名。
+     */
+    @SuppressWarnings("unchecked")
+    private static Inlay<?> addInlineElementCompat(InlayModel model, int offset,
+                                                   boolean relatesToPrecedingText,
+                                                   LoongCInlayRenderer renderer) {
+        try {
+            // 方法1：尝试旧签名（2023.3 及之前）
+            Method oldMethod = InlayModel.class.getMethod(
+                    "addInlineElement", int.class, boolean.class,
+                    com.intellij.openapi.editor.EditorCustomElementRenderer.class);
+            return (Inlay<?>) oldMethod.invoke(model, offset, relatesToPrecedingText, renderer);
+        } catch (NoSuchMethodException e) {
+            // 方法2：尝试新签名（2024+ 带 InlayProperties）
+            try {
+                Class<?> propsClass = Class.forName(
+                        "com.intellij.openapi.editor.InlayProperties");
+                Object props = propsClass.getDeclaredConstructor().newInstance();
+                Method relatesMethod = propsClass.getMethod("relatesToPrecedingText", boolean.class);
+                relatesMethod.invoke(props, relatesToPrecedingText);
+
+                Method newMethod = InlayModel.class.getMethod(
+                        "addInlineElement", int.class, propsClass,
+                        com.intellij.openapi.editor.EditorCustomElementRenderer.class);
+                return (Inlay<?>) newMethod.invoke(model, offset, props, renderer);
+            } catch (Exception ex) {
+                throw new RuntimeException("无法找到兼容的 addInlineElement 方法", ex);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 兼容性添加块级 Inlay。
+     * IDEA 2024+ 中 addBlockElement 签名可能变为 (int, InlayProperties, Renderer)，
+     * 通过反射适配旧版本的 (int, boolean, boolean, int, Renderer) 签名。
+     */
+    @SuppressWarnings("unchecked")
+    private static Inlay<?> addBlockElementCompat(InlayModel model, int offset,
+                                                  boolean relatesToPrecedingText,
+                                                  boolean showAbove,
+                                                  int priority,
+                                                  LoongCBlockRenderer renderer) {
+        try {
+            // 方法1：尝试旧签名（2023.3 及之前）
+            Method oldMethod = InlayModel.class.getMethod(
+                    "addBlockElement", int.class, boolean.class, boolean.class, int.class,
+                    com.intellij.openapi.editor.EditorCustomElementRenderer.class);
+            return (Inlay<?>) oldMethod.invoke(model, offset, relatesToPrecedingText,
+                    showAbove, priority, renderer);
+        } catch (NoSuchMethodException e) {
+            // 方法2：尝试新签名（2024+ 带 InlayProperties）
+            try {
+                Class<?> propsClass = Class.forName(
+                        "com.intellij.openapi.editor.InlayProperties");
+                Object props = propsClass.getDeclaredConstructor().newInstance();
+                Method relatesMethod = propsClass.getMethod("relatesToPrecedingText", boolean.class);
+                relatesMethod.invoke(props, relatesToPrecedingText);
+                Method aboveMethod = propsClass.getMethod("showAbove", boolean.class);
+                aboveMethod.invoke(props, showAbove);
+                Method prioMethod = propsClass.getMethod("priority", int.class);
+                prioMethod.invoke(props, priority);
+
+                Method newMethod = InlayModel.class.getMethod(
+                        "addBlockElement", int.class, propsClass,
+                        com.intellij.openapi.editor.EditorCustomElementRenderer.class);
+                return (Inlay<?>) newMethod.invoke(model, offset, props, renderer);
+            } catch (Exception ex) {
+                throw new RuntimeException("无法找到兼容的 addBlockElement 方法", ex);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
 
     // ── 工具方法 ───────────────────────────────────────────────
 

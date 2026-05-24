@@ -20,7 +20,7 @@
         </ul>
     ]]></change-notes>
 
-    <idea-version since-build="233"/>
+    <idea-version since-build="232"/>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.lang</depends>
@@ -39,6 +39,7 @@
 
         <!-- 幽灵文本：拦截 Tab 键，有活跃幽灵文本时接受补全 -->
         <editorActionHandler action="EditorTab"
+                             id="LoongC.EditorTabHandler"
                              implementationClass="com.loongc.inline.LoongCTabHandler"
                              order="first"/>
 

@@ -20,9 +20,17 @@ dependencies {
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.22.0")
 }
 
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(17))
+    }
+}
+
 intellij {
-    //version.set("2023.2.5")
-    localPath.set("E:/P-plugins/ideaIC-2023.2.5")
+    //localPath.set("E:/P-plugins/ideaIC-2023.2.5")
+    version.set("2023.2.5")
+    //localPath.set("D:/tools/I-IDEA/IntelliJ IDEA 2026.1")
+    //version.set("2023.3.7")
     type.set("IC")
     plugins.set(listOf())
 }
@@ -36,7 +44,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("232")
-        untilBuild.set("241.*")
+        untilBuild.set("261.*")
     }
 
     signPlugin {

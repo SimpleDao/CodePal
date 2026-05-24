@@ -16,13 +16,23 @@ import org.jetbrains.annotations.Nullable;
  * 逻辑：
  * - 当前编辑器有活跃幽灵文本 → 接受补全，消费 Tab 事件（不传递给下游缩进处理）
  * - 无幽灵文本 → 调用原 Tab 处理（正常缩进/补全列表选中）
+ * 兼容性注意：IDEA 2024+ 中 EditorActionHandler 构造函数可能要求不同的参数。
+ * 添加无参构造函数作为备选，并通过 getDelegate() 获取原处理器。
  */
 public class LoongCTabHandler extends EditorActionHandler {
 
     /** 原始 Tab 处理器（缩进等），接受时不调用它 */
     private final EditorActionHandler originalHandler;
 
+    /** 无参构造函数 — 用于平台反射实例化（IDEA 2024+ 兼容） */
+    public LoongCTabHandler() {
+        this(null);
+    }
+
     public LoongCTabHandler(EditorActionHandler originalHandler) {
+        // 使用无参构造函数以保持对早期版本的兼容
+        // 在 IDEA 2024+ 中 EditorActionHandler(boolean) 可能不存在
+        super();
         this.originalHandler = originalHandler;
     }
 
@@ -30,12 +40,16 @@ public class LoongCTabHandler extends EditorActionHandler {
     protected boolean isEnabledForCaret(@NotNull Editor editor,
                                         @NotNull Caret caret,
                                         DataContext dataContext) {
-        // 有活跃幽灵文本时，本 Handler 生效
+        // 有幽灵文本：本 handler 处理
         if (LoongCInlineManager.getInstance().hasActiveCompletion(editor)) {
             return true;
         }
-        // 否则让原 Handler 决定
-        return originalHandler != null && originalHandler.isEnabled(editor, caret, dataContext);
+        // 无幽灵文本：交给原 Tab 处理器判断
+        EditorActionHandler delegate = getDelegate();
+        if (delegate != null) {
+            return delegate.isEnabled(editor, caret, dataContext);
+        }
+        return false;
     }
 
     @Override
@@ -43,11 +57,31 @@ public class LoongCTabHandler extends EditorActionHandler {
                              @Nullable Caret caret,
                              DataContext dataContext) {
         if (LoongCInlineManager.getInstance().hasActiveCompletion(editor)) {
-            // 接受幽灵文本，将代码写入文档
+            // 接受幽灵文本：在当前 EDT 线程同步写入文档
             LoongCInlineManager.getInstance().acceptCompletion();
-        } else if (originalHandler != null) {
-            // 无幽灵文本，走原来的 Tab 逻辑（缩进）
-            originalHandler.execute(editor, caret, dataContext);
+        } else {
+            EditorActionHandler delegate = getDelegate();
+            if (delegate != null) {
+                // 无幽灵文本：走原来的 Tab 逻辑（缩进 / 代码补全选中等）
+                delegate.execute(editor, caret, dataContext);
+            }
         }
+    }
+
+    /**
+     * 获取原始处理器。如果构造时未传入，尝试从平台 EditorActionManager 获取。
+     */
+    private EditorActionHandler getDelegate() {
+        if (originalHandler != null) return originalHandler;
+        try {
+            com.intellij.openapi.editor.actionSystem.EditorActionManager mgr =
+                    com.intellij.openapi.editor.actionSystem.EditorActionManager.getInstance();
+            if (mgr == null) return null;
+            EditorActionHandler handler = mgr.getActionHandler("EditorTab");
+            if (handler != null && handler != this) {
+                return handler;
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 }

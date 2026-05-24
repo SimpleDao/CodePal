@@ -12,9 +12,6 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * @author 水龙吟
- * @date 2026-05-24
- *
  * Markdown 渲染工具：将 Markdown 文本转换为带 CSS 样式的 HTML 字符串，
  * 供 JEditorPane 渲染，自动适配 IDEA 暗色/亮色主题。
  */
@@ -140,8 +137,24 @@ public final class MarkdownUtil {
 
     /** 判断当前 IDE 是否为暗色主题 */
     public static boolean isDarkTheme() {
+        // 方式1：使用 Panel.background
         Color bg = UIManager.getColor("Panel.background");
-        if (bg == null) return true;
+        if (bg == null) {
+            // 方式2：使用 EditorPane.background
+            bg = UIManager.getColor("EditorPane.background");
+        }
+        if (bg == null) {
+            // 方式3：使用 window 背景
+            bg = UIManager.getColor("window");
+        }
+        if (bg == null) {
+            // 方式4：使用 control 背景
+            bg = UIManager.getColor("control");
+        }
+        if (bg == null) {
+            // 最终备选：默认暗色
+            return true;
+        }
         float[] hsb = Color.RGBtoHSB(bg.getRed(), bg.getGreen(), bg.getBlue(), null);
         return hsb[2] < 0.5f;
     }

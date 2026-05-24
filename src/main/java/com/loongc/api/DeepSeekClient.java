@@ -87,12 +87,17 @@ public class DeepSeekClient {
                         if (delta != null && delta.getContent() != null) {
                             callback.onMessage(delta.getContent());
                         }
+                        System.out.println("choice.getFinish_reason() + "+choice.getFinish_reason());
                         if (choice.getFinish_reason() != null) {
+                            // 最后一帧：先回调 usage（如果有），再回调 onComplete
+                            if (chatResponse.getUsage() != null) {
+                                callback.onUsage(chatResponse.getUsage());
+                            }
                             callback.onComplete();
                         }
                     }
                 } catch (Exception e) {
-                    System.err.println("Failed to parse SSE data: " + data);
+                    LOG.warn("Failed to parse SSE data: " + data, e);
                 }
             }
 
@@ -271,5 +276,10 @@ public class DeepSeekClient {
         void onMessage(String content);
         void onComplete();
         void onError(Throwable error);
+        /**
+         * 收到 token 用量统计时回调（通常在最后一帧，即 finish_reason != null 时触发）
+         * 默认空实现，不需要 usage 的调用方无需覆盖
+         */
+        default void onUsage(ChatResponse.Usage usage) {}
     }
 }

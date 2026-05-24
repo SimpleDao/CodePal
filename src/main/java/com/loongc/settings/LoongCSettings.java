@@ -22,6 +22,9 @@ import org.jetbrains.annotations.Nullable;
 )
 public class LoongCSettings implements PersistentStateComponent<LoongCSettings> {
 
+    // ── 通用字段配置 ──────────────────────────────────────────
+    private final String fontStyle = "Microsoft YaHei";
+
     // ── 聊天模型配置 ──────────────────────────────────────────
     private String apiKey = "";
     private String apiBase = "https://api.deepseek.com";
@@ -97,6 +100,10 @@ public class LoongCSettings implements PersistentStateComponent<LoongCSettings> 
 
     public int getCompletionDelayMs() { return completionDelayMs; }
     public void setCompletionDelayMs(int completionDelayMs) { this.completionDelayMs = completionDelayMs; }
+
+    public String getFontStyle() {
+        return fontStyle;
+    }
 
     // ── 便捷方法 ──────────────────────────────────────────────
     /** 聊天模型是否已配置 */

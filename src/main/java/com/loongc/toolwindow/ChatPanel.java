@@ -28,15 +28,13 @@ import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.geom.Path2D;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * @author 水龙吟
- * @date 2026-05-24
- *
  * LoongC 聊天面板
  * - 头部操作通过 LoongCToolWindowFactory.setTitleActions 注入（AllIcons 原生图标）
  * - 消息气泡：左侧 AI（头像+名称+圆角卡片），右侧用户（圆角气泡+颜文字头像）
@@ -48,7 +46,7 @@ public class ChatPanel extends JPanel {
 
     // 品牌色 / 用户气泡
     private static final Color BRAND_COLOR    = new Color(0x4B8EF0);
-    private static final Color USER_BG        = new Color(0x2E5FBE);
+    private static final Color USER_BG        = new Color(0x3C3F41);
     private static final Color USER_FG        = Color.WHITE;
     // AI 气泡（跟随主题）
     private static final Color AI_BG_DARK     = new Color(0x3C3F41);
@@ -64,7 +62,10 @@ public class ChatPanel extends JPanel {
     private static final Color DIVIDER_DARK   = new Color(0x4E5157);
     private static final Color SEND_HOVER     = new Color(0x3570D8);
 
-    private static final String USER_KAOMOJI_PICK = "\uD83C\uDF93";
+    private static final String USER_KAOMOJI_PICK;
+    static {
+        USER_KAOMOJI_PICK = "\uD83C\uDF93";
+    }
 
     private final Project project;
     private final DeepSeekClient client;
@@ -75,6 +76,8 @@ public class ChatPanel extends JPanel {
     private final JTextArea inputField;
     private final JComboBox<String> modelCombo;
     private final JLabel statusLabel;
+    /** 底部 token 用量 + 费用统计标签（显示在 modelCombo 右侧） */
+    private JLabel tokenStatsLabel;
 
     // 文件上下文条组件
     private final JPanel  ctxBar;
@@ -90,6 +93,12 @@ public class ChatPanel extends JPanel {
     private JTextArea  currentStreamArea  = null;
     private JPanel     currentBubbleInner = null;
     private String     currentAiRawText   = "";
+
+    // 当前会话累计 token 用量
+    private int sessionPromptTokens      = 0;
+    private int sessionCompletionTokens  = 0;
+    private int sessionCacheHitTokens    = 0;
+    private int sessionCacheMissTokens   = 0;
 
     public ChatPanel(Project project) {
         this.project = project;
@@ -108,6 +117,8 @@ public class ChatPanel extends JPanel {
         messagesPanel.setLayout(new BoxLayout(messagesPanel, BoxLayout.Y_AXIS));
         messagesPanel.setBackground(JBColor.namedColor("Panel.background", new Color(0x2B2D30)));
         messagesPanel.setBorder(JBUI.Borders.empty(14, 12, 6, 12));
+        // 确保 BoxLayout 下子组件能正确展开：在 Java 21 中某些情况下需要显式设置对齐
+        messagesPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         messagesScrollPane = new JBScrollPane(messagesPanel);
         messagesScrollPane.setBorder(null);
@@ -155,6 +166,12 @@ public class ChatPanel extends JPanel {
             conversationHistory.add(new ChatMessage("system",
                     "你是一个智能编程助手 LoongC。你可以帮助用户编写代码、分析项目文件、解答编程问题。" +
                             "回复时请使用 Markdown 格式，代码请放在代码块中。"));
+            // 重置 token 统计
+            sessionPromptTokens     = 0;
+            sessionCompletionTokens = 0;
+            sessionCacheHitTokens   = 0;
+            sessionCacheMissTokens  = 0;
+            if (tokenStatsLabel != null) tokenStatsLabel.setText("—");
             addAiMessage("对话已清空。有什么我可以帮你的吗？");
         });
     }
@@ -183,15 +200,15 @@ public class ChatPanel extends JPanel {
         leftGroup.setOpaque(false);
 
         JLabel iconLbl = new JLabel(">");
-        iconLbl.setFont(new Font("JetBrains Mono", Font.BOLD, 13));
+        iconLbl.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 13));
         iconLbl.setForeground(CTX_ACCENT);
         leftGroup.add(iconLbl);
 
-        ctxFileLabel.setFont(new Font("JetBrains Mono", Font.BOLD, 11));
+        ctxFileLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 11));
         ctxFileLabel.setForeground(CTX_ACCENT);
         leftGroup.add(ctxFileLabel);
 
-        ctxLineLabel.setFont(new Font("JetBrains Mono", Font.PLAIN, 11));
+        ctxLineLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
         ctxLineLabel.setForeground(JBColor.GRAY);
         leftGroup.add(ctxLineLabel);
 
@@ -347,7 +364,7 @@ public class ChatPanel extends JPanel {
         inner.setBorder(JBUI.Borders.empty(10, 12, 12, 12));
 
 
-        statusLabel.setFont(new Font("JetBrains Mono", Font.PLAIN, 11));
+        statusLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
         statusLabel.setForeground(JBColor.GRAY);
         inner.add(statusLabel, BorderLayout.NORTH);
 
@@ -375,14 +392,30 @@ public class ChatPanel extends JPanel {
                 JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK), 1, true));
         inputScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
 
-        JButton sendBtn = new JButton("发送");
-        sendBtn.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
+        JButton sendBtn = new JButton() {
+            @Override
+            protected void paintComponent(Graphics g) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                // 按钮背景圆角
+                g2.setColor(getBackground());
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+                // 绘制发送图标（纸飞机风格）
+                paintSendIcon(g2, getWidth(), getHeight(), isReceiving);
+                g2.dispose();
+            }
+            @Override protected void paintBorder(Graphics g) { /* 不画系统边框 */ }
+            @Override public boolean isOpaque() { return false; }
+        };
+//        sendBtn.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
+        sendBtn.setToolTipText("发送 (Enter)");
         sendBtn.setFocusable(false);
-        sendBtn.setForeground(Color.WHITE);
+//        sendBtn.setForeground(Color.WHITE);
         sendBtn.setBackground(BRAND_COLOR);
         sendBtn.setOpaque(true);
         sendBtn.setBorderPainted(false);
-        sendBtn.setPreferredSize(new Dimension(72, 0));
+        //sendBtn.setPreferredSize(new Dimension(72, 0));
+        sendBtn.setPreferredSize(new Dimension(52, 0));
         sendBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         sendBtn.addActionListener(e -> sendMessage());
         sendBtn.addMouseListener(new MouseAdapter() {
@@ -396,20 +429,28 @@ public class ChatPanel extends JPanel {
         inputRow.add(sendBtn, BorderLayout.EAST);
         inner.add(inputRow, BorderLayout.CENTER);
 
-        JPanel bottomBar = new JPanel(new BorderLayout());
+        JPanel bottomBar = new JPanel(new BorderLayout(0, 0));
         bottomBar.setOpaque(false);
         bottomBar.setBorder(JBUI.Borders.emptyTop(6));
 
 
         modelCombo.setSelectedItem(LoongCSettings.getInstance().getModel());
-        modelCombo.setFont(new Font("JetBrains Mono", Font.PLAIN, 11));
+        modelCombo.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
         modelCombo.addActionListener(e -> {
             String sel = (String) modelCombo.getSelectedItem();
             if (sel != null) LoongCSettings.getInstance().setModel(sel);
         });
         bottomBar.add(modelCombo, BorderLayout.WEST);
 
-        JLabel hint = new JLabel("Enter 发送  |  Shift+Enter 换行  |  右键可复制");
+        // Token 用量统计区（modelCombo 右侧，hint 左侧）
+        tokenStatsLabel = new JLabel("Token消耗实况");
+        tokenStatsLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
+        tokenStatsLabel.setForeground(JBColor.GRAY);
+        tokenStatsLabel.setToolTipText("当前会话累计：输入 token / 输出 token | 缓存命中 / 未命中 | 预估费用");
+        tokenStatsLabel.setBorder(JBUI.Borders.emptyLeft(8));
+        bottomBar.add(tokenStatsLabel, BorderLayout.CENTER);
+
+        JLabel hint = new JLabel("Enter 发送  |  Shift+Enter 换行");
         hint.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
         hint.setForeground(JBColor.GRAY);
         bottomBar.add(hint, BorderLayout.EAST);
@@ -597,9 +638,16 @@ public class ChatPanel extends JPanel {
         client.streamChat(conversationHistory, new DeepSeekClient.StreamCallback() {
             @Override
             public void onMessage(String chunk) {
-                System.out.println("onMessage:"+chunk);
                 SwingUtilities.invokeLater(() -> appendStreamChunk(chunk));
             }
+
+            @Override
+            public void onUsage(com.loongc.api.model.ChatResponse.Usage usage) {
+                // SSE 最后一帧收到 usage，累加到会话统计并更新标签
+                System.out.println("onUsage :" + usage.toString());
+                SwingUtilities.invokeLater(() -> updateTokenStats(usage));
+            }
+
             @Override
             public void onComplete() {
                 SwingUtilities.invokeLater(() -> {
@@ -615,6 +663,7 @@ public class ChatPanel extends JPanel {
                     currentAiRawText   = "";
                 });
             }
+
             @Override
             public void onError(Throwable error) {
                 SwingUtilities.invokeLater(() -> {
@@ -629,6 +678,91 @@ public class ChatPanel extends JPanel {
                 });
             }
         });
+    }
+
+    /**
+     * 累加本轮 usage 到会话统计，计算费用后刷新 tokenStatsLabel。
+     *
+     * DeepSeek 价格（元 / 百万 tokens，参考官方文档）：
+     *   deepseek-chat / deepseek-v4-flash:
+     *     缓存命中 0.02，未命中 1，输出 2
+     *   deepseek-reasoner / deepseek-v4-pro:
+     *     缓存命中 0.1，未命中 12，输出 24
+     *   其他模型使用 deepseek-chat 价格作为默认值
+     */
+    private void updateTokenStats(com.loongc.api.model.ChatResponse.Usage usage) {
+        if (usage == null) return;
+
+        sessionPromptTokens     += usage.getPromptTokens();
+        sessionCompletionTokens += usage.getCompletionTokens();
+        sessionCacheHitTokens   += usage.getPromptCacheHitTokens();
+        sessionCacheMissTokens  += usage.getPromptCacheMissTokens();
+
+        // 根据当前选择的模型确定单价（元 / token）
+        String model = (String) modelCombo.getSelectedItem();
+        double hitPrice, missPrice, outPrice;
+        if ("deepseek-V4-Pro".equals(model)) {
+            hitPrice  = 0.1  / 1_000_000.0;
+            missPrice = 12.0 / 1_000_000.0;
+            outPrice  = 24.0 / 1_000_000.0;
+        } else {
+            // deepseek-chat / deepseek-coder / 默认
+            hitPrice  = 0.02 / 1_000_000.0;
+            missPrice = 1.0  / 1_000_000.0;
+            outPrice  = 2.0  / 1_000_000.0;
+        }
+
+        double totalCost = sessionCacheHitTokens  * hitPrice
+                + sessionCacheMissTokens * missPrice
+                + sessionCompletionTokens * outPrice;
+
+        // 格式化费用：小于 0.01 分用科学计数，否则保留 4 位小数
+        String costStr;
+        if (totalCost < 0.0001) {
+            costStr = String.format("¥%.2e", totalCost);
+        } else {
+            costStr = String.format("¥%.4f", totalCost);
+        }
+
+        // 缓存命中率
+        int totalInput = sessionCacheHitTokens + sessionCacheMissTokens;
+        String hitRateStr = totalInput > 0
+                ? String.format("%.0f%%", sessionCacheHitTokens * 100.0 / totalInput)
+                : "—";
+
+        String text = String.format(
+                "↑%d ↓%d  |  💾命中:%d(%s) 未命中:%d  |  %s",
+                sessionPromptTokens,
+                sessionCompletionTokens,
+                sessionCacheHitTokens, hitRateStr,
+                sessionCacheMissTokens,
+                costStr
+        );
+
+        tokenStatsLabel.setText(text);
+        tokenStatsLabel.setForeground(JBColor.GRAY);
+        System.out.println(String.format(
+                "<html>当前会话累计<br>"
+                        + "输入 tokens：%d（缓存命中 %d + 未命中 %d）<br>"
+                        + "输出 tokens：%d<br>"
+                        + "缓存命中率：%s<br>"
+                        + "预估费用：%s 元</html>",
+                sessionPromptTokens,
+                sessionCacheHitTokens, sessionCacheMissTokens,
+                sessionCompletionTokens,
+                hitRateStr, costStr
+        ));
+        tokenStatsLabel.setToolTipText(String.format(
+                "<html>当前会话累计<br>"
+                        + "输入 tokens：%d（缓存命中 %d + 未命中 %d）<br>"
+                        + "输出 tokens：%d<br>"
+                        + "缓存命中率：%s<br>"
+                        + "预估费用：%s 元</html>",
+                sessionPromptTokens,
+                sessionCacheHitTokens, sessionCacheMissTokens,
+                sessionCompletionTokens,
+                hitRateStr, costStr
+        ));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -799,7 +933,7 @@ public class ChatPanel extends JPanel {
         bubble.add(textArea, BorderLayout.CENTER);
 
         JLabel nameLabel = new JLabel("你");
-        nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
+        nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
         nameLabel.setForeground(JBColor.GRAY);
         nameLabel.setHorizontalAlignment(SwingConstants.RIGHT);
         nameLabel.setBorder(JBUI.Borders.emptyBottom(2));
@@ -910,7 +1044,7 @@ public class ChatPanel extends JPanel {
         avatar.setMaximumSize(size);
 
         JLabel lbl = new JLabel(USER_KAOMOJI_PICK);
-        lbl.setFont(new Font("Monospaced", Font.BOLD, 12));
+        lbl.setFont(new Font("Monospaced", Font.BOLD, 15));
         lbl.setForeground(JBColor.namedColor("Label.foreground", Color.WHITE));
         lbl.setHorizontalAlignment(SwingConstants.CENTER);
         lbl.setVerticalAlignment(SwingConstants.CENTER);
@@ -952,5 +1086,43 @@ public class ChatPanel extends JPanel {
             JScrollBar v = messagesScrollPane.getVerticalScrollBar();
             v.setValue(v.getMaximum());
         });
+    }
+
+    /**
+     * 在发送按钮中心绘制"向上发送"图标（纸飞机风格）。
+     * receiving=true 时绘制停止方块，提示可点击中止（视觉反馈）。
+     */
+    private void paintSendIcon(Graphics2D g2, int w, int h, boolean receiving) {
+        g2.setColor(Color.WHITE);
+        g2.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+
+        if (receiving) {
+            // 正在接收时：绘制圆角停止方块
+            int s = Math.min(w, h) / 3;
+            int x = (w - s) / 2;
+            int y = (h - s) / 2;
+            g2.fillRoundRect(x, y, s, s, 3, 3);
+        } else {
+            // 纸飞机图标：主三角形 + 折叠尾翼线
+            int cx = w / 2;
+            int cy = h / 2;
+            int r  = Math.min(w, h) / 2 - 6;  // 图标半径
+
+            // 主体：向右上的三角（机身）
+            Path2D.Float plane = new Path2D.Float();
+            plane.moveTo(cx - r,       cy + r * 0.5f);   // 尾部左下
+            plane.lineTo(cx + r,       cy);               // 机头（右侧中心）
+            plane.lineTo(cx - r,       cy - r * 0.5f);   // 尾部左上
+            plane.lineTo(cx - r * 0.3f, cy);              // 折叠中心点
+            plane.closePath();
+            g2.fill(plane);
+
+            // 尾翼折叠线（从折叠点到尾部右下角，使图标更立体）
+            g2.setStroke(new BasicStroke(1.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+            g2.drawLine(
+                    (int)(cx - r * 0.3f), cy,
+                    (int)(cx - r),        (int)(cy + r * 0.5f)
+            );
+        }
     }
 }
