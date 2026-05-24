@@ -1,0 +1,148 @@
+package com.loongc.utils;
+
+import org.commonmark.ext.gfm.strikethrough.StrikethroughExtension;
+import org.commonmark.ext.gfm.tables.TablesExtension;
+import org.commonmark.node.Node;
+import org.commonmark.parser.Parser;
+import org.commonmark.renderer.html.HtmlRenderer;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * @author 水龙吟
+ * @date 2026-05-24
+ *
+ * Markdown 渲染工具：将 Markdown 文本转换为带 CSS 样式的 HTML 字符串，
+ * 供 JEditorPane 渲染，自动适配 IDEA 暗色/亮色主题。
+ */
+public final class MarkdownUtil {
+
+    private static final Parser PARSER;
+    private static final HtmlRenderer RENDERER;
+
+    static {
+        List<org.commonmark.Extension> extensions = Arrays.asList(
+                TablesExtension.create(),
+                StrikethroughExtension.create()
+        );
+        PARSER = Parser.builder().extensions(extensions).build();
+        RENDERER = HtmlRenderer.builder().extensions(extensions).build();
+    }
+
+    private MarkdownUtil() {}
+
+    /**
+     * 将 Markdown 文本转换为完整的 HTML 页面（含 CSS），供 JEditorPane 显示。
+     *
+     * @param markdown   原始 Markdown 文本
+     * @param isDark     是否暗色主题
+     * @param bubbleBg   气泡背景色（CSS rgba 字符串，用于代码块背景）
+     * @return 完整 HTML 字符串
+     */
+    public static String toHtml(String markdown, boolean isDark, Color bubbleBg) {
+        Node document = PARSER.parse(markdown);
+        String bodyHtml = RENDERER.render(document);
+
+        // 基础颜色
+        String textColor    = isDark ? "#BCBEC4" : "#1a1a1a";
+        String bgColor      = colorToHex(bubbleBg);
+        String codeBg       = isDark ? "#1E1F22" : "#F0F0F0";
+        String codeColor    = isDark ? "#A9B7C6" : "#2B2B2B";
+        String codeBorder   = isDark ? "#3C3F41" : "#D0D0D0";
+        String linkColor    = isDark ? "#589DF6" : "#2563EB";
+        String blockquoteBg = isDark ? "#2E3136" : "#F5F5F5";
+        String blockquoteBdr= isDark ? "#5A8FD6" : "#3B82F6";
+        String tableBorder  = isDark ? "#4E5157" : "#D0D0D0";
+        String tableHeadBg  = isDark ? "#3C3F41" : "#E8E8E8";
+        String hrColor      = isDark ? "#4E5157" : "#D0D0D0";
+
+        return "<!DOCTYPE html><html><head><style>" +
+                "* { box-sizing: border-box; margin: 0; padding: 0; }" +
+                "body {" +
+                "  font-family: 'Microsoft YaHei', 'PingFang SC', 'Segoe UI', sans-serif;" +
+                "  font-size: 13px;" +
+                "  line-height: 1.65;" +
+                "  color: " + textColor + ";" +
+                "  background: " + bgColor + ";" +
+                "  padding: 2px 0;" +
+                "  word-break: break-word;" +
+                "}" +
+                // 段落
+                "p { margin: 0 0 8px 0; }" +
+                "p:last-child { margin-bottom: 0; }" +
+                // 标题
+                "h1,h2,h3,h4,h5,h6 { font-weight: bold; margin: 12px 0 6px 0; line-height: 1.3; }" +
+                "h1 { font-size: 18px; } h2 { font-size: 16px; } h3 { font-size: 14px; }" +
+                // 行内代码
+                "code {" +
+                "  font-family: 'JetBrains Mono', 'Consolas', 'Monaco', monospace;" +
+                "  font-size: 12px;" +
+                "  background: " + codeBg + ";" +
+                "  color: " + codeColor + ";" +
+                "  padding: 1px 5px;" +
+                "  border-radius: 3px;" +
+                "  border: 1px solid " + codeBorder + ";" +
+                "}" +
+                // 代码块
+                "pre {" +
+                "  background: " + codeBg + ";" +
+                "  border: 1px solid " + codeBorder + ";" +
+                "  border-radius: 6px;" +
+                "  padding: 10px 14px;" +
+                "  margin: 8px 0;" +
+                "  overflow-x: auto;" +
+                "}" +
+                "pre code {" +
+                "  background: none;" +
+                "  border: none;" +
+                "  padding: 0;" +
+                "  font-size: 12px;" +
+                "  color: " + codeColor + ";" +
+                "  white-space: pre;" +
+                "}" +
+                // 引用块
+                "blockquote {" +
+                "  background: " + blockquoteBg + ";" +
+                "  border-left: 3px solid " + blockquoteBdr + ";" +
+                "  margin: 8px 0;" +
+                "  padding: 6px 12px;" +
+                "  border-radius: 0 4px 4px 0;" +
+                "}" +
+                // 列表
+                "ul, ol { padding-left: 20px; margin: 6px 0; }" +
+                "li { margin: 3px 0; }" +
+                // 链接
+                "a { color: " + linkColor + "; text-decoration: none; }" +
+                "a:hover { text-decoration: underline; }" +
+                // 表格
+                "table { border-collapse: collapse; width: 100%; margin: 8px 0; }" +
+                "th, td { border: 1px solid " + tableBorder + "; padding: 6px 10px; text-align: left; }" +
+                "th { background: " + tableHeadBg + "; font-weight: bold; }" +
+                // 水平线
+                "hr { border: none; border-top: 1px solid " + hrColor + "; margin: 10px 0; }" +
+                // 加粗/斜体
+                "strong { font-weight: bold; }" +
+                "em { font-style: italic; }" +
+                // 删除线
+                "del { text-decoration: line-through; opacity: 0.7; }" +
+                "</style></head><body>" +
+                bodyHtml +
+                "</body></html>";
+    }
+
+    private static String colorToHex(Color c) {
+        if (c == null) return "transparent";
+        return String.format("rgb(%d,%d,%d)", c.getRed(), c.getGreen(), c.getBlue());
+    }
+
+    /** 判断当前 IDE 是否为暗色主题 */
+    public static boolean isDarkTheme() {
+        Color bg = UIManager.getColor("Panel.background");
+        if (bg == null) return true;
+        float[] hsb = Color.RGBtoHSB(bg.getRed(), bg.getGreen(), bg.getBlue(), null);
+        return hsb[2] < 0.5f;
+    }
+}

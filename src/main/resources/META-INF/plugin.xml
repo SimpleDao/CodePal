@@ -1,0 +1,73 @@
+<idea-plugin>
+    <id>com.loongc.plugin</id>
+    <name>LoongC</name>
+    <version>1.0.0</version>
+    <vendor>LoongC</vendor>
+    <description><![CDATA[
+        <p>LoongC - 您的智能编程助手</p>
+        <ul>
+            <li>基于 DeepSeek 大模型的智能代码补全</li>
+            <li>AI 聊天助手，支持项目文件上下文分析</li>
+            <li>自动读取项目文件，提供精准代码建议</li>
+        </ul>
+    ]]></description>
+    <change-notes><![CDATA[
+        <p>1.0.0 - 初始版本</p>
+        <ul>
+            <li>智能代码自动补全</li>
+            <li>DeepSeek API 集成</li>
+            <li>项目文件上下文聊天</li>
+        </ul>
+    ]]></change-notes>
+
+    <idea-version since-build="233"/>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- 工具窗口 -->
+        <toolWindow id="LoongC"
+                    anchor="right"
+                    secondary="true"
+                    icon="/icons/loongc.svg"
+                    factoryClass="com.loongc.toolwindow.LoongCToolWindowFactory"/>
+
+        <!-- 幽灵文本：监听每个编辑器的文档变化，驱动内联补全 -->
+        <editorFactoryListener
+                implementation="com.loongc.inline.LoongCEditorListener"/>
+
+        <!-- 幽灵文本：拦截 Tab 键，有活跃幽灵文本时接受补全 -->
+        <editorActionHandler action="EditorTab"
+                             implementationClass="com.loongc.inline.LoongCTabHandler"
+                             order="first"/>
+
+        <!-- 设置页面 -->
+        <applicationConfigurable
+                parentId="tools"
+                instance="com.loongc.settings.LoongCSettingsConfigurable"
+                id="com.loongc.settings.LoongCSettingsConfigurable"
+                displayName="LoongC"/>
+
+        <applicationService
+                serviceImplementation="com.loongc.settings.LoongCSettings"/>
+    </extensions>
+
+    <actions>
+        <action id="LoongC.OpenChat"
+                class="com.loongc.actions.OpenChatAction"
+                text="打开 LoongC 聊天"
+                description="打开 LoongC AI 助手聊天窗口">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift C"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+
+        <action id="LoongC.GenerateCode"
+                class="com.loongc.actions.GenerateCodeAction"
+                text="LoongC 生成代码"
+                description="使用 AI 生成代码">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift G"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
