@@ -5,33 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="a386a2f8-6759-4e16-9d5c-5f01025d1916" name="Changes" comment="兼容2023.2 - 2026.1">
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules/LoongC.test.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/loongc/model/ChatMessage.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/loongc/model/ChatRequest.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/modules.xml" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/build.gradle.kts" beforeDir="false" afterPath="$PROJECT_DIR$/build.gradle.kts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/actions/GenerateCodeAction.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/actions/GenerateCodeAction.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/DeepSeekClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/api/DeepSeekClient.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/model/ChatMessage.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/model/ChatRequest.java" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/model/ChatResponse.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/model/ChatResponse.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/model/CompletionRequest.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/model/CompletionRequest.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/api/model/CompletionResponse.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/model/CompletionResponse.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/inline/LoongCInlineManager.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/inline/LoongCInlineManager.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/settings/LoongCSettings.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/settings/LoongCSettings.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/settings/LoongCSettingsConfigurable.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/settings/LoongCSettingsConfigurable.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/toolwindow/ChatPanel.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/toolwindow/ChatPanel.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/toolwindow/LoongCToolWindowFactory.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/toolwindow/LoongCToolWindowFactory.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/loongc/utils/FileReaderUtil.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/loongc/utils/FileReaderUtil.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/resources/META-INF/plugin.xml" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/resources/META-INF/plugin.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/ChatMessage.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/ChatMessage.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/ChatPanel.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/ChatPanel.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/ChatRequest.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/ChatRequest.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/ChatResponse.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/ChatResponse.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/CodeBuddyCompletionProvider.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/CodeBuddyCompletionProvider.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/DeepSeekClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/DeepSeekClient.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/tasks/GenerateCodeAction.java" beforeDir="false" afterPath="$PROJECT_DIR$/tasks/GenerateCodeAction.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/gradle/wrapper/gradle-wrapper.properties" beforeDir="false" afterPath="$PROJECT_DIR$/gradle/wrapper/gradle-wrapper.properties" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -72,7 +50,7 @@
                 <item name="" type="6a2764b6:ExternalProjectsStructure$RootNode" />
                 <item name="LoongC" type="f1a62948:ProjectNode" />
                 <item name="Tasks" type="e4a08cd1:TasksNode" />
-                <item name="intellij" type="c8890929:TasksNode$1" />
+                <item name="build" type="c8890929:TasksNode$1" />
               </path>
             </expand>
             <select />
@@ -90,6 +68,11 @@
     </option>
   </component>
   <component name="Git.Settings">
+    <option name="RECENT_BRANCH_BY_REPOSITORY">
+      <map>
+        <entry key="$PROJECT_DIR$" value="2025-2026" />
+      </map>
+    </option>
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="GitHubPullRequestSearchHistory">{
@@ -134,7 +117,7 @@
     "Gradle.LoongC [:com.loongc.actions.Main.main()].executor": "Run",
     "Gradle.LoongC [:com.loongc.db.DBChatHistoryRepository.main()].executor": "Run",
     "Gradle.LoongC [buildPlugin].executor": "Run",
-    "Gradle.LoongC [build].executor": "Debug",
+    "Gradle.LoongC [build].executor": "Run",
     "Gradle.LoongC [clean].executor": "Run",
     "Gradle.LoongC [runIde].executor": "Run",
     "Gradle.LoongC [setupDependencies].executor": "Run",
@@ -169,27 +152,7 @@
       <recent name="" />
     </key>
   </component>
-  <component name="RunManager" selected="Gradle.self [runIde]">
-    <configuration name="DBChatHistoryRepository" type="Application" factoryName="Application" temporary="true" nameIsGenerated="true">
-      <option name="MAIN_CLASS_NAME" value="com.loongc.db.DBChatHistoryRepository" />
-      <module name="LoongC.main" />
-      <extension name="coverage">
-        <pattern>
-          <option name="PATTERN" value="com.loongc.db.*" />
-          <option name="ENABLED" value="true" />
-        </pattern>
-      </extension>
-      <method v="2">
-        <option name="Make" enabled="true" />
-      </method>
-    </configuration>
-    <configuration name="H2DatabaseManager" type="Application" factoryName="Application" temporary="true" nameIsGenerated="true">
-      <option name="MAIN_CLASS_NAME" value="H2DatabaseManager" />
-      <module name="LoongC.test" />
-      <method v="2">
-        <option name="Make" enabled="true" />
-      </method>
-    </configuration>
+  <component name="RunManager" selected="Gradle.LoongC [build]">
     <configuration name="LoongC [buildPlugin]" type="GradleRunConfiguration" factoryName="Gradle" temporary="true">
       <ExternalSystemSettings>
         <option name="executionName" />
@@ -202,6 +165,56 @@
         <option name="taskNames">
           <list>
             <option value="buildPlugin" />
+          </list>
+        </option>
+        <option name="vmOptions" />
+      </ExternalSystemSettings>
+      <ExternalSystemDebugServerProcess>true</ExternalSystemDebugServerProcess>
+      <ExternalSystemReattachDebugProcess>true</ExternalSystemReattachDebugProcess>
+      <ExternalSystemDebugDisabled>false</ExternalSystemDebugDisabled>
+      <DebugAllEnabled>false</DebugAllEnabled>
+      <RunAsTest>false</RunAsTest>
+      <GradleProfilingDisabled>false</GradleProfilingDisabled>
+      <GradleCoverageDisabled>false</GradleCoverageDisabled>
+      <method v="2" />
+    </configuration>
+    <configuration name="LoongC [build]" type="GradleRunConfiguration" factoryName="Gradle" temporary="true">
+      <ExternalSystemSettings>
+        <option name="executionName" />
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="externalSystemIdString" value="GRADLE" />
+        <option name="scriptParameters" />
+        <option name="taskDescriptions">
+          <list />
+        </option>
+        <option name="taskNames">
+          <list>
+            <option value="build" />
+          </list>
+        </option>
+        <option name="vmOptions" />
+      </ExternalSystemSettings>
+      <ExternalSystemDebugServerProcess>true</ExternalSystemDebugServerProcess>
+      <ExternalSystemReattachDebugProcess>true</ExternalSystemReattachDebugProcess>
+      <ExternalSystemDebugDisabled>false</ExternalSystemDebugDisabled>
+      <DebugAllEnabled>false</DebugAllEnabled>
+      <RunAsTest>false</RunAsTest>
+      <GradleProfilingDisabled>false</GradleProfilingDisabled>
+      <GradleCoverageDisabled>false</GradleCoverageDisabled>
+      <method v="2" />
+    </configuration>
+    <configuration name="LoongC [clean]" type="GradleRunConfiguration" factoryName="Gradle" temporary="true">
+      <ExternalSystemSettings>
+        <option name="executionName" />
+        <option name="externalProjectPath" value="$PROJECT_DIR$" />
+        <option name="externalSystemIdString" value="GRADLE" />
+        <option name="scriptParameters" />
+        <option name="taskDescriptions">
+          <list />
+        </option>
+        <option name="taskNames">
+          <list>
+            <option value="clean" />
           </list>
         </option>
         <option name="vmOptions" />
@@ -278,11 +291,11 @@
     </configuration>
     <recent_temporary>
       <list>
-        <item itemvalue="Gradle.self [runIde]" />
-        <item itemvalue="Gradle.LoongC [buildPlugin]" />
+        <item itemvalue="Gradle.LoongC [build]" />
         <item itemvalue="Gradle.LoongC [verifyPlugin]" />
-        <item itemvalue="Application.H2DatabaseManager" />
-        <item itemvalue="Application.DBChatHistoryRepository" />
+        <item itemvalue="Gradle.LoongC [buildPlugin]" />
+        <item itemvalue="Gradle.LoongC [clean]" />
+        <item itemvalue="Gradle.self [runIde]" />
       </list>
     </recent_temporary>
   </component>

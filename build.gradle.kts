@@ -1,6 +1,6 @@
 plugins {
     id("java")
-    id("org.jetbrains.intellij") version "1.17.3"
+    id("org.jetbrains.intellij.platform") version "2.16.0"
 
 }
 
@@ -10,6 +10,10 @@ version = "1.0.0"
 repositories {
     maven { url = uri("https://maven.aliyun.com/repository/public") }
     mavenCentral()
+
+    intellijPlatform {
+        defaultRepositories()
+    }
 }
 
 dependencies {
@@ -20,29 +24,25 @@ dependencies {
     implementation("org.commonmark:commonmark-ext-gfm-tables:0.22.0")
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.22.0")
     implementation("com.h2database:h2:2.2.224")
+
+    intellijPlatform {
+        intellijIdea("2026.1")
+        bundledPlugin("com.intellij.java")
+    }
 }
 
 java {
     toolchain {
-        languageVersion.set(JavaLanguageVersion.of(17))
+        languageVersion.set(JavaLanguageVersion.of(21))
     }
 }
 
-intellij {
-    //localPath.set("E:/P-plugins/ideaIC-2023.2.5")
-    version.set("2023.2.5")
-    //localPath.set("D:/tools/I-IDEA/IntelliJ IDEA 2026.1")
-    //version.set("2023.3.7")
-    type.set("IC")
-    //plugins.set(listOf())
 
-    plugins.set(listOf("java"))
-}
 
 tasks {
     withType<JavaCompile> {
-        sourceCompatibility = "17"
-        targetCompatibility = "17"
+        sourceCompatibility = "21"
+        targetCompatibility = "21"
         options.encoding = "UTF-8"
     }
 
