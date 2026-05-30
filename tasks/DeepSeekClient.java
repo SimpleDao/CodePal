@@ -1,8 +1,8 @@
 package com.loongc.api;
 
-import com.loongc.api.model.ChatMessage;
-import com.loongc.api.model.ChatRequest;
-import com.loongc.api.model.ChatResponse;
+import com.loongc.model.ChatMessage;
+import com.loongc.model.ChatRequest;
+import com.loongc.model.ChatResponse;
 import com.loongc.settings.CodeBuddySettings;
 import com.google.gson.Gson;
 import com.intellij.openapi.diagnostic.Logger;

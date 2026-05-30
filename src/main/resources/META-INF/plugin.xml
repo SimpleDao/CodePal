@@ -24,6 +24,7 @@
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.lang</depends>
+    <depends>com.intellij.modules.java</depends>
 
     <extensions defaultExtensionNs="com.intellij">
         <!-- 工具窗口 -->
@@ -43,12 +44,40 @@
                              implementationClass="com.loongc.inline.LoongCTabHandler"
                              order="first"/>
 
-        <!-- 设置页面 -->
+        <!-- 设置页面：LoongC 父节点 -->
         <applicationConfigurable
                 parentId="tools"
                 instance="com.loongc.settings.LoongCSettingsConfigurable"
                 id="com.loongc.settings.LoongCSettingsConfigurable"
                 displayName="LoongC"/>
+
+        <!-- 设置页面：LoongC 子节点 — General -->
+        <applicationConfigurable
+                parentId="com.loongc.settings.LoongCSettingsConfigurable"
+                instance="com.loongc.settings.LoongCGeneralConfigurable"
+                id="com.loongc.settings.LoongCGeneralConfigurable"
+                displayName="General"/>
+
+        <!-- 设置页面：LoongC 子节点 — Model -->
+        <applicationConfigurable
+                parentId="com.loongc.settings.LoongCSettingsConfigurable"
+                instance="com.loongc.settings.LoongCModelConfigurable"
+                id="com.loongc.settings.LoongCModelConfigurable"
+                displayName="Model"/>
+
+        <!-- 设置页面：LoongC 子节点 — MCP -->
+        <applicationConfigurable
+                parentId="com.loongc.settings.LoongCSettingsConfigurable"
+                instance="com.loongc.settings.LoongCMcpConfigurable"
+                id="com.loongc.settings.LoongCMcpConfigurable"
+                displayName="MCP"/>
+
+        <!-- 设置页面：LoongC 子节点 — Skills -->
+        <applicationConfigurable
+                parentId="com.loongc.settings.LoongCSettingsConfigurable"
+                instance="com.loongc.settings.LoongCSkillsConfigurable"
+                id="com.loongc.settings.LoongCSkillsConfigurable"
+                displayName="Skills"/>
 
         <applicationService
                 serviceImplementation="com.loongc.settings.LoongCSettings"/>

@@ -1,7 +1,7 @@
 package com.loongc.toolwindow;
 
 import com.loongc.api.DeepSeekClient;
-import com.loongc.api.model.ChatMessage;
+import com.loongc.model.ChatMessage;
 import com.loongc.settings.CodeBuddySettings;
 import com.loongc.utils.FileReaderUtil;
 import com.intellij.openapi.editor.Editor;

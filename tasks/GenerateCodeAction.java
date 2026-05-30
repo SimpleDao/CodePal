@@ -1,7 +1,7 @@
 package com.loongc.actions;
 
 import com.loongc.api.DeepSeekClient;
-import com.loongc.api.model.ChatMessage;
+import com.loongc.model.ChatMessage;
 import com.loongc.settings.CodeBuddySettings;
 import com.intellij.openapi.actionSystem.AnAction;
 import com.intellij.openapi.actionSystem.AnActionEvent;

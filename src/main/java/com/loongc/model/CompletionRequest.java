@@ -1,4 +1,4 @@
-package com.loongc.api.model;
+package com.loongc.model;
 
 import java.util.List;
 

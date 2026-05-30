@@ -1,10 +1,17 @@
 package com.loongc.toolwindow;
 
+import com.google.gson.Gson;
+import com.intellij.icons.AllIcons;
+import com.intellij.openapi.application.ApplicationManager;
+import com.intellij.ui.components.*;
+import com.intellij.util.ui.UIUtil;
 import com.loongc.api.DeepSeekClient;
-import com.loongc.api.model.ChatMessage;
+import com.loongc.common.StringUtils;
+import com.loongc.model.*;
+import com.loongc.common.CollectUtils;
+import com.loongc.common.Constant;
+import com.loongc.db.DBChatHistoryRepository;
 import com.loongc.settings.LoongCSettings;
-import com.loongc.utils.FileReaderUtil;
-import com.loongc.utils.MarkdownUtil;
 import com.intellij.openapi.editor.Editor;
 import com.intellij.openapi.editor.SelectionModel;
 import com.intellij.openapi.editor.event.SelectionEvent;
@@ -15,21 +22,22 @@ import com.intellij.openapi.fileEditor.FileEditorManagerListener;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.ui.JBColor;
-import com.intellij.ui.components.JBScrollPane;
 import com.intellij.util.ui.JBUI;
+import com.loongc.utils.FileReaderUtil;
+import com.loongc.utils.MarkdownUtil;
+import com.loongc.utils.ThreadHelper;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.*;
 import javax.swing.border.LineBorder;
+import javax.swing.event.PopupMenuEvent;
+import javax.swing.event.PopupMenuListener;
 import javax.swing.text.JTextComponent;
 import java.awt.*;
 import java.awt.datatransfer.StringSelection;
-import java.awt.event.KeyAdapter;
-import java.awt.event.KeyEvent;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.geom.Path2D;
+import java.awt.event.*;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -44,23 +52,63 @@ import java.util.regex.Pattern;
  */
 public class ChatPanel extends JPanel {
 
-    // 品牌色 / 用户气泡
-    private static final Color BRAND_COLOR    = new Color(0x4B8EF0);
-    private static final Color USER_BG        = new Color(0x3C3F41);
-    private static final Color USER_FG        = Color.WHITE;
-    // AI 气泡（跟随主题）
-    private static final Color AI_BG_DARK     = new Color(0x3C3F41);
-    private static final Color AI_BG_LIGHT    = new Color(0xF0F1F3);
-    // 头像背景（AI 用圆圈+字母，用户用颜文字）
-    private static final Color AI_AVATAR_BG   = new Color(0x4E7EC8);
-    // 上下文条
-    private static final Color CTX_BG_DARK    = new Color(0x313438);
-    private static final Color CTX_BG_LIGHT   = new Color(0xE8EAF0);
-    private static final Color CTX_ACCENT     = new Color(0x4B8EF0);
-    // 输入区
-    private static final Color INPUT_BG_DARK  = new Color(0x45484B);
-    private static final Color DIVIDER_DARK   = new Color(0x4E5157);
-    private static final Color SEND_HOVER     = new Color(0x3570D8);
+    private static Color aiBubbleBg() {
+        return JBColor.namedColor("Panel.background",
+                UIUtil.isUnderDarcula() ? new Color(0x3C3F41) : new Color(0xF0F1F3));
+    }
+
+    /** 用户消息气泡背景：使用 IDEA 按钮强调色 */
+    private static Color userBubbleBg() {
+        return JBColor.namedColor("Button.default.background",
+                UIUtil.isUnderDarcula() ? new Color(0x365880) : new Color(0x2E5FBE));
+    }
+
+    /** 思考过程区块背景 */
+    private static Color reasoningBg() {
+        return JBColor.namedColor("Plugins.tagBackground",
+                UIUtil.isUnderDarcula() ? new Color(0x3D2F4A) : new Color(0xF3E5F5));
+    }
+
+    /** 思考过程文字颜色 */
+    private static Color reasoningFg() {
+        return JBColor.namedColor("Plugins.tagForeground",
+                UIUtil.isUnderDarcula() ? new Color(0xD1C4E9) : new Color(0x5E35B1));
+    }
+
+    /** 思考过程边框颜色 */
+    private static Color reasoningBd() {
+        return JBColor.namedColor("Component.focusedBorderColor",
+                UIUtil.isUnderDarcula() ? new Color(0x5E35B1) : new Color(0xCE93D8));
+    }
+
+    /** 分隔线颜色 */
+    private static Color dividerColor() {
+        return JBColor.namedColor("Separator.separatorColor",
+                UIUtil.isUnderDarcula() ? new Color(0x4E5157) : new Color(0xC9CCD6));
+    }
+
+    /** 输入框边框：普通态 */
+    private static Color inputBorderNormal() {
+        return JBColor.namedColor("Component.borderColor",
+                UIUtil.isUnderDarcula() ? new Color(0x4E5157) : new Color(0xC9CCD6));
+    }
+
+    /** 输入框边框：聚焦态 */
+    private static Color inputBorderFocus() {
+        return JBColor.namedColor("Component.focusedBorderColor", new Color(0x4B8EF0));
+    }
+
+    /** 状态/提示文字颜色 */
+    private static Color mutedFg() {
+        return JBColor.namedColor("Label.infoForeground", JBColor.GRAY);
+    }
+
+    /** 上下文条强调色 */
+    private static Color ctxAccent() {
+        return JBColor.namedColor("Link.activeForeground", new Color(0x4B8EF0));
+    }
+
+    private static final Gson GSON = new Gson();
 
     private static final String USER_KAOMOJI_PICK;
     static {
@@ -71,7 +119,15 @@ public class ChatPanel extends JPanel {
     private final DeepSeekClient client;
     private final List<ChatMessage> conversationHistory;
 
-    private final JPanel messagesPanel;
+    // 会话管理
+    private String currentSessionId = null;
+    private int historyLoadedCount = 0;   // 已从底部向上加载的消息数
+    private int historyTotalCount = 0;    // 会话总消息数
+    private boolean isLoadingHistory = false; // 是否正在懒加载历史消息
+    private JBPanel<?> loadingIndicator = null; // 顶部加载中动画
+
+
+    private final JBPanel<?>  messagesPanel;
     private final JBScrollPane messagesScrollPane;
     private final JTextArea inputField;
     private final JComboBox<String> modelCombo;
@@ -80,9 +136,9 @@ public class ChatPanel extends JPanel {
     private JLabel tokenStatsLabel;
 
     // 文件上下文条组件
-    private final JPanel  ctxBar;
-    private final JLabel  ctxFileLabel;
-    private final JLabel  ctxLineLabel;
+    private final JBPanel<?> ctxBar;
+    private final JBLabel ctxFileLabel;
+    private final JBLabel  ctxLineLabel;
     private final JButton ctxInsertBtn;
     private String ctxCurrentFile = null;
     private int    ctxStartLine   = -1;
@@ -90,9 +146,17 @@ public class ChatPanel extends JPanel {
 
     // 当前正在接收的 AI 消息组件引用
     private boolean isReceiving        = false;
-    private JTextArea  currentStreamArea  = null;
-    private JPanel     currentBubbleInner = null;
+    private JBTextArea currentStreamArea  = null;
+    private JBPanel<?>     currentBubbleInner = null;
     private String     currentAiRawText   = "";
+
+    // 思考过程区块组件引用
+    private JBTextArea currentReasoningArea  = null;
+    private JBPanel<?>    currentReasoningPanel = null;
+    private JBPanel<?>    currentReasoningContent = null;
+    private JBLabel    currentReasoningStatus  = null;
+    private String    currentReasoningText    = "";
+    private boolean   isReasoningCollapsed    = true; // 会话级折叠状态记忆
 
     // 当前会话累计 token 用量
     private int sessionPromptTokens      = 0;
@@ -100,57 +164,99 @@ public class ChatPanel extends JPanel {
     private int sessionCacheHitTokens    = 0;
     private int sessionCacheMissTokens   = 0;
 
+    // 发送按钮
+    JButton sendBtn;
+
+    // 面板切换（CardLayout）
+    private static final String CHAT_CARD = "chat";
+    private static final String HISTORY_CARD = "history";
+    private final CardLayout cardLayout;
+    private final JBPanel<?> cardPanel;
+
+    // 历史会话面板组件
+    private JBList<HistoryItem> historyList;
+    private DefaultListModel<HistoryItem> historyListModel;
+    private JBPanel<?> historyPanel;
+
     public ChatPanel(Project project) {
         this.project = project;
         this.client  = new DeepSeekClient();
         this.conversationHistory = new ArrayList<>();
 
         setLayout(new BorderLayout());
-        setBackground(JBColor.namedColor("Panel.background", new Color(0x2B2D30)));
+        setBackground(UIUtil.getPanelBackground());
 
-        conversationHistory.add(new ChatMessage("system",
-                "你是一个智能编程助手 LoongC。你可以帮助用户编写代码、分析项目文件、解答编程问题。" +
-                        "当用户询问项目相关内容时，你会根据提供的文件上下文给出精准回答。" +
-                        "回复时请使用 Markdown 格式，代码请放在代码块中。"));
+        conversationHistory.add(new ChatMessage("system", LoongCSettings.getInstance().getSystemPrompt()));
 
-        messagesPanel = new JPanel();
+        messagesPanel = new JBPanel(null);
         messagesPanel.setLayout(new BoxLayout(messagesPanel, BoxLayout.Y_AXIS));
-        messagesPanel.setBackground(JBColor.namedColor("Panel.background", new Color(0x2B2D30)));
+        messagesPanel.setBackground(UIUtil.getPanelBackground());
         messagesPanel.setBorder(JBUI.Borders.empty(14, 12, 6, 12));
         // 确保 BoxLayout 下子组件能正确展开：在 Java 21 中某些情况下需要显式设置对齐
-        messagesPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        //messagesPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         messagesScrollPane = new JBScrollPane(messagesPanel);
         messagesScrollPane.setBorder(null);
         messagesScrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
         messagesScrollPane.getVerticalScrollBar().setUnitIncrement(16);
-        add(messagesScrollPane, BorderLayout.CENTER);
+        // 注册滚动懒加载监听器
+        messagesScrollPane.getVerticalScrollBar().addAdjustmentListener(e -> {
+            if (!e.getValueIsAdjusting()) return;
+            maybeLoadOlderMessages();
+        });
+
+
+        //add(messagesScrollPane, BorderLayout.CENTER);
 
         // 初始化上下文条（先隐藏，有文件时显示）
-        ctxFileLabel  = new JLabel();
-        ctxLineLabel  = new JLabel();
+        ctxFileLabel  = new JBLabel();
+        ctxLineLabel  = new JBLabel();
         ctxInsertBtn  = new JButton("插入");
         ctxBar        = buildContextBar();
         ctxBar.setVisible(false);
 
-        statusLabel = new JLabel("就绪");
+        statusLabel = new JBLabel("就绪");
         inputField = new JTextArea(3, 0);
-        String[] models = {"deepseek-v4-flash"};
-        modelCombo = new JComboBox<>(models);
+        modelCombo = new JComboBox<>(LoongCSettings.getInstance().getChatModelNames());
         add(buildInputPanel(), BorderLayout.SOUTH);
 
+        // CardLayout：聊天视图 + 历史视图
+        cardLayout = new CardLayout();
+        cardPanel = new JBPanel<>(cardLayout);
+        cardPanel.setOpaque(false);
+        cardPanel.add(messagesScrollPane, CHAT_CARD);
+        // 构建历史会话面板
+        historyPanel = buildHistoryPanel();
+        cardPanel.add(historyPanel, HISTORY_CARD);
+
+        add(cardPanel, BorderLayout.CENTER);
         // 注册编辑器监听器
         if (project != null) {
             registerFileListener();
             registerSelectionListener();
         }
 
-        addAiMessage("你好！我是 **LoongC**，你的智能编程助手。\n\n" +
-                "我支持 Markdown 渲染，代码会高亮显示。\n\n" +
-                "常用命令：\n" +
-                "- `/file` — 读取并分析当前项目文件\n" +
-                "- `@文件名` — 引用特定文件作为上下文\n\n" +
-                "在编辑器中**打开文件**或**选中代码**，上方会出现快速插入提示。");
+        // 创建默认会话（问候语入库）
+        openSession();
+//        if(LoongCSettings.getInstance().isEnableMessagePersistence()){
+//
+//        } else {
+//            ThreadHelper.runOnUi(project,()->{
+//                addAiMessage(LoongCSettings.getInstance().getSayHello());
+//            });
+//        }
+    }
+
+    private void openSession() {
+        ThreadHelper.queryAsync(project, DBChatHistoryRepository::getRecentConversation,
+                (conversation)->{
+            System.out.println("openSession:"+conversation);
+            if(null == conversation){
+                createNewSession();
+            } else {
+                switchToSession(conversation.getId());
+            }
+        });
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -158,14 +264,12 @@ public class ChatPanel extends JPanel {
     // ─────────────────────────────────────────────────────────────────────────
 
     public void clearChat() {
-        SwingUtilities.invokeLater(() -> {
+        ApplicationManager.getApplication().invokeLater(() -> {
             messagesPanel.removeAll();
             messagesPanel.revalidate();
             messagesPanel.repaint();
             conversationHistory.clear();
-            conversationHistory.add(new ChatMessage("system",
-                    "你是一个智能编程助手 LoongC。你可以帮助用户编写代码、分析项目文件、解答编程问题。" +
-                            "回复时请使用 Markdown 格式，代码请放在代码块中。"));
+            conversationHistory.add(new ChatMessage("system", LoongCSettings.getInstance().getSystemPrompt()));
             // 重置 token 统计
             sessionPromptTokens     = 0;
             sessionCompletionTokens = 0;
@@ -183,45 +287,47 @@ public class ChatPanel extends JPanel {
     /**
      * 构建文件上下文条：显示当前文件名和选区行号，点击"插入"按钮将引用写入输入框
      */
-    private JPanel buildContextBar() {
-        boolean dark = MarkdownUtil.isDarkTheme();
-        Color bg = dark ? CTX_BG_DARK : CTX_BG_LIGHT;
+    private JBPanel<?> buildContextBar() {
+        Color panelBg = UIUtil.getPanelBackground();
+        Color accent  = ctxAccent();
 
-        JPanel bar = new JPanel(new BorderLayout(6, 0));
-        bar.setBackground(bg);
+        JBPanel<?> bar = new JBPanel<>(new BorderLayout(6, 0));
+        bar.setBackground(panelBg);
         bar.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createMatteBorder(0, 0, 1, 0,
-                        JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK)),
+                BorderFactory.createMatteBorder(0, 0, 1, 0, dividerColor()),
                 JBUI.Borders.empty(5, 12, 5, 8)
         ));
 
         // 左侧：文件图标 + 文件名
-        JPanel leftGroup = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        JBPanel<?>  leftGroup = new JBPanel<> (new FlowLayout(FlowLayout.LEFT, 4, 0));
         leftGroup.setOpaque(false);
 
-        JLabel iconLbl = new JLabel(">");
-        iconLbl.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 13));
-        iconLbl.setForeground(CTX_ACCENT);
+        JBLabel iconLbl = new JBLabel(AllIcons.Actions.IntentionBulb);
+        //iconLbl.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 13));
+        iconLbl.setForeground(accent);
         leftGroup.add(iconLbl);
 
-        ctxFileLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 11));
-        ctxFileLabel.setForeground(CTX_ACCENT);
+       // ctxFileLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.BOLD, 11));
+        ctxFileLabel.setFont(JBUI.Fonts.label(11));
+        ctxFileLabel.setForeground(accent);
         leftGroup.add(ctxFileLabel);
 
-        ctxLineLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
-        ctxLineLabel.setForeground(JBColor.GRAY);
+       // ctxLineLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
+        ctxLineLabel.setFont(JBUI.Fonts.label(11));
+        ctxLineLabel.setForeground(mutedFg());
         leftGroup.add(ctxLineLabel);
 
         bar.add(leftGroup, BorderLayout.CENTER);
 
         // 右侧：插入按钮
-        ctxInsertBtn.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
-        ctxInsertBtn.setForeground(CTX_ACCENT);
-        ctxInsertBtn.setBackground(bg);
+        ctxInsertBtn.setText("插入");
+        ctxInsertBtn.setFont(JBUI.Fonts.label(11));
+        ctxInsertBtn.setForeground(accent);
+        ctxInsertBtn.setBackground(panelBg);
         ctxInsertBtn.setOpaque(true);
         ctxInsertBtn.setBorderPainted(true);
         ctxInsertBtn.setBorder(BorderFactory.createCompoundBorder(
-                new LineBorder(CTX_ACCENT, 1, true),
+                new LineBorder(accent, 1, true),
                 JBUI.Borders.empty(2, 8)
         ));
         ctxInsertBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
@@ -229,11 +335,11 @@ public class ChatPanel extends JPanel {
         ctxInsertBtn.addActionListener(e -> insertContextIntoInput());
         ctxInsertBtn.addMouseListener(new MouseAdapter() {
             @Override public void mouseEntered(MouseEvent e) {
-                ctxInsertBtn.setBackground(new Color(CTX_ACCENT.getRed(),
-                        CTX_ACCENT.getGreen(), CTX_ACCENT.getBlue(), 30));
+                ctxInsertBtn.setBackground(JBColor.namedColor("ActionButton.hoverBackground",
+                        UIUtil.isUnderDarcula() ? new Color(0x4B8EF0, true) : new Color(0xE3F2FD)));
             }
             @Override public void mouseExited(MouseEvent e) {
-                ctxInsertBtn.setBackground(bg);
+                ctxInsertBtn.setBackground(panelBg);
             }
         });
         bar.add(ctxInsertBtn, BorderLayout.EAST);
@@ -266,7 +372,7 @@ public class ChatPanel extends JPanel {
 
     /** 更新上下文条显示 */
     private void updateContextBar() {
-        SwingUtilities.invokeLater(() -> {
+        ApplicationManager.getApplication().invokeLater(() -> {
             if (ctxCurrentFile == null) {
                 ctxBar.setVisible(false);
                 return;
@@ -351,31 +457,32 @@ public class ChatPanel extends JPanel {
     // ─────────────────────────────────────────────────────────────────────────
 
     private JPanel buildInputPanel() {
-        JPanel panel = new JPanel(new BorderLayout(0, 0));
-        panel.setBackground(JBColor.namedColor("Panel.background", new Color(0x2B2D30)));
-        panel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0,
-                JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK)));
+        JBPanel<?> panel = new JBPanel<>(new BorderLayout(0, 0));
+        panel.setBackground(UIUtil.getPanelBackground());
+        panel.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, dividerColor()));
 
         // 上下文条（文件+行号引用）
         panel.add(ctxBar, BorderLayout.NORTH);
 
-        JPanel inner = new JPanel(new BorderLayout(0, 6));
+        JBPanel<?>  inner = new JBPanel<>(new BorderLayout(0, 6));
         inner.setOpaque(false);
         inner.setBorder(JBUI.Borders.empty(10, 12, 12, 12));
 
 
-        statusLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
-        statusLabel.setForeground(JBColor.GRAY);
+//        statusLabel.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
+        statusLabel.setFont(JBUI.Fonts.label(11));
+        statusLabel.setForeground(mutedFg());
         inner.add(statusLabel, BorderLayout.NORTH);
 
 
         // "Dialog" 逻辑字体获得更好的 Unicode fallback，支持 emoji 不会乱码
-        inputField.setFont(new Font("Dialog", Font.PLAIN, 13));
+      //  inputField.setFont(new Font("Dialog", Font.PLAIN, 13));
+        inputField.setFont(JBUI.Fonts.label(13));
         inputField.setLineWrap(true);
         inputField.setWrapStyleWord(true);
-        inputField.setBackground(JBColor.namedColor("TextField.background", INPUT_BG_DARK));
-        inputField.setForeground(JBColor.namedColor("TextField.foreground", Color.WHITE));
-        inputField.setCaretColor(JBColor.namedColor("TextField.caretForeground", Color.WHITE));
+        inputField.setBackground(UIUtil.getTextFieldBackground());
+        inputField.setForeground(UIUtil.getTextFieldForeground());
+        inputField.setCaretColor(UIUtil.getTextFieldForeground());
         inputField.setBorder(JBUI.Borders.empty(8, 10));
         inputField.addKeyListener(new KeyAdapter() {
             @Override
@@ -388,71 +495,90 @@ public class ChatPanel extends JPanel {
         });
 
         JBScrollPane inputScroll = new JBScrollPane(inputField);
-        inputScroll.setBorder(new LineBorder(
-                JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK), 1, true));
+        inputScroll.setBorder(BorderFactory.createLineBorder(inputBorderNormal(), 1));
         inputScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
 
-        JButton sendBtn = new JButton() {
-            @Override
-            protected void paintComponent(Graphics g) {
-                Graphics2D g2 = (Graphics2D) g.create();
-                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                // 按钮背景圆角
-                g2.setColor(getBackground());
-                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
-                // 绘制发送图标（纸飞机风格）
-                paintSendIcon(g2, getWidth(), getHeight(), isReceiving);
-                g2.dispose();
+        inputField.addFocusListener(new FocusAdapter() {
+            @Override public void focusGained(FocusEvent e) {
+                inputScroll.setBorder(BorderFactory.createLineBorder(inputBorderFocus(), 1));
             }
-            @Override protected void paintBorder(Graphics g) { /* 不画系统边框 */ }
-            @Override public boolean isOpaque() { return false; }
-        };
-//        sendBtn.setFont(new Font("Microsoft YaHei", Font.BOLD, 13));
-        sendBtn.setToolTipText("发送 (Enter)");
-        sendBtn.setFocusable(false);
-//        sendBtn.setForeground(Color.WHITE);
-        sendBtn.setBackground(BRAND_COLOR);
-        sendBtn.setOpaque(true);
-        sendBtn.setBorderPainted(false);
-        //sendBtn.setPreferredSize(new Dimension(72, 0));
-        sendBtn.setPreferredSize(new Dimension(52, 0));
-        sendBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        sendBtn.addActionListener(e -> sendMessage());
-        sendBtn.addMouseListener(new MouseAdapter() {
-            @Override public void mouseEntered(MouseEvent e) { sendBtn.setBackground(SEND_HOVER); }
-            @Override public void mouseExited(MouseEvent e)  { sendBtn.setBackground(BRAND_COLOR); }
+            @Override public void focusLost(FocusEvent e) {
+                inputScroll.setBorder(BorderFactory.createLineBorder(inputBorderNormal(), 1));
+            }
         });
 
-        JPanel inputRow = new JPanel(new BorderLayout(8, 0));
+//        JButton sendBtn = new JButton() {
+//            @Override
+//            protected void paintComponent(Graphics g) {
+//                Graphics2D g2 = (Graphics2D) g.create();
+//                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+//                // 按钮背景圆角
+//                g2.setColor(getBackground());
+//                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 8, 8);
+//                // 绘制发送图标（纸飞机风格）
+//                paintSendIcon(g2, getWidth(), getHeight(), isReceiving);
+//                g2.dispose();
+//            }
+//            @Override protected void paintBorder(Graphics g) { /* 不画系统边框 */ }
+//            @Override public boolean isOpaque() { return false; }
+//        };
+        sendBtn = new JButton(AllIcons.Actions.Execute);
+        sendBtn.setToolTipText("发送 (Enter)");
+        sendBtn.setFocusable(false);
+        sendBtn.setOpaque(true);
+        sendBtn.setBorderPainted(false);
+        sendBtn.setPreferredSize(new Dimension(40, 0));
+        sendBtn.addActionListener(e -> sendMessage());
+
+        JBPanel<?>  inputRow = new   JBPanel<> (new BorderLayout(8, 0));
         inputRow.setOpaque(false);
         inputRow.add(inputScroll, BorderLayout.CENTER);
         inputRow.add(sendBtn, BorderLayout.EAST);
         inner.add(inputRow, BorderLayout.CENTER);
 
-        JPanel bottomBar = new JPanel(new BorderLayout(0, 0));
+        JBPanel<?>  bottomBar = new JBPanel<> (new BorderLayout(0, 0));
         bottomBar.setOpaque(false);
         bottomBar.setBorder(JBUI.Borders.emptyTop(6));
 
 
-        modelCombo.setSelectedItem(LoongCSettings.getInstance().getModel());
-        modelCombo.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
+        modelCombo.setSelectedItem(LoongCSettings.getInstance().getChatModelName());
+//        modelCombo.setFont(new Font(LoongCSettings.getInstance().getFontStyle(), Font.PLAIN, 11));
+        modelCombo.setFont(JBUI.Fonts.label(11));
         modelCombo.addActionListener(e -> {
             String sel = (String) modelCombo.getSelectedItem();
-            if (sel != null) LoongCSettings.getInstance().setModel(sel);
+            if (sel != null) {
+                // 根据选中项的名称，查找其在 LoongCSettings 中的索引
+                List<ModelConfig> models = LoongCSettings.getInstance().getChatModels();
+                for (int i = 0; i < models.size(); i++) {
+                    if (models.get(i).getName().equals(sel)) {
+                        LoongCSettings.getInstance().setCurrentChatModelIndex(i);
+                        break;
+                    }
+                }
+            }
+        });
+        modelCombo.addPopupMenuListener(new PopupMenuListener() {
+            @Override
+            public void popupMenuWillBecomeVisible(PopupMenuEvent e) {
+                refreshModelCombo();
+            }
+            @Override public void popupMenuWillBecomeInvisible(PopupMenuEvent e) {}
+            @Override public void popupMenuCanceled(PopupMenuEvent e) {}
         });
         bottomBar.add(modelCombo, BorderLayout.WEST);
 
         // Token 用量统计区（modelCombo 右侧，hint 左侧）
-        tokenStatsLabel = new JLabel("Token消耗实况");
-        tokenStatsLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
-        tokenStatsLabel.setForeground(JBColor.GRAY);
+        tokenStatsLabel = new JBLabel("Token消耗实况");
+//        tokenStatsLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
+        tokenStatsLabel.setFont(JBUI.Fonts.label(10));
+        tokenStatsLabel.setForeground(mutedFg());
         tokenStatsLabel.setToolTipText("当前会话累计：输入 token / 输出 token | 缓存命中 / 未命中 | 预估费用");
         tokenStatsLabel.setBorder(JBUI.Borders.emptyLeft(8));
         bottomBar.add(tokenStatsLabel, BorderLayout.CENTER);
 
-        JLabel hint = new JLabel("Enter 发送  |  Shift+Enter 换行");
-        hint.setFont(new Font("Microsoft YaHei", Font.PLAIN, 10));
-        hint.setForeground(JBColor.GRAY);
+        JBLabel hint = new JBLabel("Enter 发送  |  Shift+Enter 换行");
+        hint.setFont(JBUI.Fonts.label(10));
+        hint.setForeground(mutedFg());
         bottomBar.add(hint, BorderLayout.EAST);
 
         inner.add(bottomBar, BorderLayout.SOUTH);
@@ -470,22 +596,20 @@ public class ChatPanel extends JPanel {
      */
     private void installPopupMenu(JTextComponent comp, String title) {
         JPopupMenu menu = new JPopupMenu();
-        menu.setBorder(new LineBorder(
-                JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK), 1, true));
-        menu.setBackground(JBColor.namedColor("PopupMenu.background",
-                new Color(0x3C3F41)));
+        menu.setBorder(new LineBorder(dividerColor(), 1, true));
+        menu.setBackground(UIUtil.getPanelBackground());
 
         // 小标题（不可点击，起分组说明作用）
-        JLabel header = new JLabel("  " + title);
-        header.setFont(new Font("Microsoft YaHei", Font.BOLD, 11));
-        header.setForeground(JBColor.GRAY);
+        JBLabel header = new JBLabel("  " + title);
+        header.setFont(JBUI.Fonts.label(11).asBold());
+        header.setForeground(mutedFg());
         header.setBorder(JBUI.Borders.empty(4, 6, 4, 6));
         menu.add(header);
         menu.addSeparator();
 
         // 复制选中内容
         JMenuItem copyItem = new JMenuItem("复制选中");
-        copyItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        copyItem.setFont(JBUI.Fonts.label(12));
         copyItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_C, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
         copyItem.addActionListener(e -> {
             String sel = comp.getSelectedText();
@@ -498,7 +622,7 @@ public class ChatPanel extends JPanel {
 
         // 复制全部（对于 AI 消息，复制原始文本更有用）
         JMenuItem copyAllItem = new JMenuItem("复制全部");
-        copyAllItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        copyAllItem.setFont(JBUI.Fonts.label(12));
         copyAllItem.addActionListener(e -> {
             String all = comp.getText();
             if (all != null && !all.isEmpty()) {
@@ -510,7 +634,7 @@ public class ChatPanel extends JPanel {
 
         // 全选
         JMenuItem selectAllItem = new JMenuItem("全选");
-        selectAllItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        selectAllItem.setFont(JBUI.Fonts.label(12));
         selectAllItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_A, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
         selectAllItem.addActionListener(e -> comp.selectAll());
         menu.add(selectAllItem);
@@ -523,20 +647,18 @@ public class ChatPanel extends JPanel {
      */
     private void installPopupMenuForAi(JEditorPane pane, String rawMarkdown) {
         JPopupMenu menu = new JPopupMenu();
-        menu.setBorder(new LineBorder(
-                JBColor.namedColor("Separator.separatorColor", DIVIDER_DARK), 1, true));
-        menu.setBackground(JBColor.namedColor("PopupMenu.background",
-                new Color(0x3C3F41)));
+        menu.setBorder(new LineBorder(dividerColor(), 1, true));
+        menu.setBackground(UIUtil.getPanelBackground());
 
-        JLabel header = new JLabel("  LoongC 回复");
-        header.setFont(new Font("Microsoft YaHei", Font.BOLD, 11));
-        header.setForeground(JBColor.GRAY);
+        JBLabel header = new JBLabel("  LoongC 回复");
+        header.setFont(JBUI.Fonts.label(11).asBold());
+        header.setForeground(mutedFg());
         header.setBorder(JBUI.Borders.empty(4, 6, 4, 6));
         menu.add(header);
         menu.addSeparator();
 
         JMenuItem copySelItem = new JMenuItem("复制选中");
-        copySelItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        copySelItem.setFont(JBUI.Fonts.label(12));
         copySelItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_C, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
         copySelItem.addActionListener(e -> {
             String sel = pane.getSelectedText();
@@ -547,18 +669,18 @@ public class ChatPanel extends JPanel {
         });
         menu.add(copySelItem);
 
-        JMenuItem copyMdItem = new JMenuItem("复制原始内容（Markdown）");
-        copyMdItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
+        JMenuItem copyMdItem = new JMenuItem("复制全部");
+        copyMdItem.setFont(JBUI.Fonts.label(12));
         copyMdItem.addActionListener(e ->
                 Toolkit.getDefaultToolkit().getSystemClipboard()
                         .setContents(new StringSelection(rawMarkdown), null));
         menu.add(copyMdItem);
 
-        JMenuItem selectAllItem = new JMenuItem("全选");
-        selectAllItem.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-        selectAllItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_A, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
-        selectAllItem.addActionListener(e -> pane.selectAll());
-        menu.add(selectAllItem);
+//        JMenuItem selectAllItem = new JMenuItem("全选");
+//        selectAllItem.setFont(JBUI.Fonts.label(12));
+//        selectAllItem.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_A, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()));
+//        selectAllItem.addActionListener(e -> pane.selectAll());
+//        menu.add(selectAllItem);
 
         pane.setComponentPopupMenu(menu);
     }
@@ -569,7 +691,14 @@ public class ChatPanel extends JPanel {
 
     private void sendMessage() {
         String text = inputField.getText().trim();
-        if (text.isEmpty() || isReceiving) return;
+        if (text.isEmpty() && !isReceiving) return;
+
+        if (isReceiving) {
+            isReceiving = false;
+            client.cancelCurrentStream();
+            restoreSendButton();
+            return;
+        }
 
         inputField.setText("");
         addUserMessage(text);
@@ -579,15 +708,26 @@ public class ChatPanel extends JPanel {
             return;
         }
 
-        StringBuilder prompt = new StringBuilder(text);
-        if (text.contains("@")) {
-            String fc = extractFileReferences(text);
-            if (!fc.isEmpty()) prompt.append("\n\n").append(fc);
-        }
-        String ec = getEditorContext();
-        if (!ec.isEmpty()) prompt.append("\n\n当前编辑的文件内容：\n").append(ec);
+//        StringBuilder prompt = new StringBuilder(text);
+//        if (text.contains("@")) {
+//            String fc = extractFileReferences(text);
+//            if (!fc.isEmpty()) prompt.append("\n\n").append(fc);
+//        }
+//        String ec = getEditorContext();
+//        if (!ec.isEmpty()) prompt.append("\n\n当前编辑的文件内容：\n").append(ec);
 
-        conversationHistory.add(new ChatMessage("user", prompt.toString()));
+        conversationHistory.add(new ChatMessage("user", text));
+        ChatMessageEntity message = new ChatMessageEntity(
+                DBChatHistoryRepository.getUUID(),
+                currentSessionId,
+                "user",
+                text,
+                (String) null,
+                (String) null,
+                (String) null,
+                (String) null
+        );
+        ThreadHelper.executeAsync(project,()->DBChatHistoryRepository.saveMessage(message),null);
         sendToApi();
     }
 
@@ -614,7 +754,7 @@ public class ChatPanel extends JPanel {
     private void readProjectFilesAndRespond() {
         statusLabel.setText("正在读取项目文件...");
         statusLabel.setForeground(JBColor.ORANGE);
-        SwingUtilities.invokeLater(() -> {
+        ApplicationManager.getApplication().invokeLater(() -> {
             List<FileReaderUtil.FileContent> files = FileReaderUtil.readProjectFiles(project);
             if (files.isEmpty()) {
                 addAiMessage("未找到代码文件。");
@@ -630,54 +770,148 @@ public class ChatPanel extends JPanel {
         });
     }
 
+    //业务层
     private void sendToApi() {
+//        final int MAX_TOOL_ROUNDS = 5;
         isReceiving = true;
-        statusLabel.setText("思考中...");
         statusLabel.setForeground(new Color(0x4CAF50));
+        if(!sendBtn.getIcon().equals(AllIcons.Actions.Suspend)){
+            sendBtn.setIcon(AllIcons.Actions.Suspend);
+            sendBtn.setToolTipText("停止生成");
+        }
+//        if (toolRound >= MAX_TOOL_ROUNDS) {
+//            ApplicationManager.getApplication().invokeLater(() -> {
+//                addAiMessage("*(已达到工具调用上限，继续回答...)*\n");
+//            });
+//        }
 
-        client.streamChat(conversationHistory, new DeepSeekClient.StreamCallback() {
-            @Override
-            public void onMessage(String chunk) {
-                SwingUtilities.invokeLater(() -> appendStreamChunk(chunk));
-            }
-
-            @Override
-            public void onUsage(com.loongc.api.model.ChatResponse.Usage usage) {
-                // SSE 最后一帧收到 usage，累加到会话统计并更新标签
-                System.out.println("onUsage :" + usage.toString());
-                SwingUtilities.invokeLater(() -> updateTokenStats(usage));
-            }
-
-            @Override
-            public void onComplete() {
-                SwingUtilities.invokeLater(() -> {
-                    isReceiving = false;
-                    statusLabel.setText("就绪");
-                    statusLabel.setForeground(JBColor.GRAY);
-                    if (!currentAiRawText.isEmpty()) {
-                        conversationHistory.add(new ChatMessage("assistant", currentAiRawText));
-                        finalizeAiMessage();
+        client.streamChat(conversationHistory, com.loongc.tools.ToolDefinitions.getAllTools(),
+                new DeepSeekClient.StreamCallback() {
+                    StringBuilder currentReasoning = new StringBuilder();
+                    //StringBuilder currentMessage = new StringBuilder();
+                    @Override
+                    public void onMessage(String chunk) {
+//                        System.out.println("message------------------------");
+                        ApplicationManager.getApplication().invokeLater(() -> {
+                            //currentMessage.append(chunk);
+                            // 第一次收到正式内容时，隐藏思考中状态
+                            if (currentReasoningStatus != null && !currentReasoningStatus.getText().isEmpty()) {
+                                currentReasoningStatus.setText("");
+                                currentReasoningStatus.setVisible(false);
+                            }
+                            statusLabel.setText("回复中...");
+                            statusLabel.setForeground(new Color(0x4CAF50));
+                            appendStreamChunk(chunk);
+                        });
                     }
-                    currentStreamArea  = null;
-                    currentBubbleInner = null;
-                    currentAiRawText   = "";
-                });
-            }
 
-            @Override
-            public void onError(Throwable error) {
-                SwingUtilities.invokeLater(() -> {
-                    isReceiving = false;
-                    statusLabel.setText("出错");
-                    statusLabel.setForeground(JBColor.RED);
-                    appendStreamChunk("\n\n**[错误]** " + error.getMessage());
-                    finalizeAiMessage();
-                    currentStreamArea  = null;
-                    currentBubbleInner = null;
-                    currentAiRawText   = "";
+                    //如果存在思考，则首先被执行
+                    @Override
+                    public void onReasoning(String reasoning) {
+                        System.out.println("reasoning------------------------");
+                        currentReasoning.append(reasoning);
+                        ApplicationManager.getApplication().invokeLater(() -> {
+                            statusLabel.setText("思考中...");
+                            statusLabel.setForeground(new Color(0xCE93D8));
+                            appendReasoningChunk(reasoning);
+                        });
+                    }
+
+                    @Override
+                    public void onToolCalls(java.util.List<com.loongc.model.ChatMessage.ToolCall> toolCalls) {
+                        System.out.println("onToolCalls------------------------:"+toolCalls);
+                        ChatMessage assistantMsg = com.loongc.model.ChatMessage.assistantWithToolCalls(toolCalls);
+                        if (!currentReasoning.isEmpty()) {
+                            assistantMsg.setReasoning_content(currentReasoning.toString());
+                        }
+                        conversationHistory.add(assistantMsg);
+                        ChatMessageEntity assistantEntity = new ChatMessageEntity(
+                                DBChatHistoryRepository.getUUID(),
+                                currentSessionId,
+                                Constant.ROLE_assistant,    //助手：我调用的工具是toolCalls
+                                null,                           // 发起工具调用时 content 为 null
+                                GSON.toJson(toolCalls),         // 👈 核心：List 转成 String 丢给实体类
+                                null,                           // toolCallId 为 null
+                                null,                           // name 为 null
+                                currentReasoning.toString()     // 思考过程
+                        );
+                        ThreadHelper.executeAsync(project,()->DBChatHistoryRepository.saveMessage(assistantEntity),null);
+                        for (com.loongc.model.ChatMessage.ToolCall tc : toolCalls) {
+                            String result = com.loongc.tools.ToolExecutor.execute(tc, project);
+                            String toolName = tc.getFunction() != null ? tc.getFunction().getName() : "unknown";
+                            System.out.println(String.format("toolName = %s,result = %s",toolName,result));
+                            addToolCallMessage(toolName, result);
+
+                            conversationHistory.add(com.loongc.model.ChatMessage.toolResult(tc.getId(),toolName, result));
+
+                            //持久化每次结果
+                            ChatMessageEntity toolEntity = new ChatMessageEntity(
+                                    DBChatHistoryRepository.getUUID(),
+                                    currentSessionId,
+                                    Constant.ROLE_tool,
+                                    result,                     // 工具返回的结果字串
+                                    (String) null,                       // toolCalls 为 null
+                                    tc.getId(),                 // 👈 匹配当前工具的 call_id
+                                    toolName,                   // 👈 工具名称
+                                    (String) null                       // 工具没有思考过程
+                            );
+                            ThreadHelper.executeAsync(project,()->DBChatHistoryRepository.saveMessage(toolEntity),null);
+                        }
+                        sendToApi();
+                    }
+
+                    //调用消息 思考 工具链路都完成时才被调用。
+                    @Override
+                    public void onComplete() {
+                        System.out.println("onComplete------------------------");
+                        ApplicationManager.getApplication().invokeLater(() -> {
+                            isReceiving = false;
+                            statusLabel.setText("就绪");
+                            restoreSendButton();
+                            statusLabel.setForeground(JBColor.GRAY);
+                            if (!currentAiRawText.isEmpty()) {
+                                ChatMessage assistant = new ChatMessage("assistant", currentAiRawText);
+                                if (!currentReasoning.isEmpty()) {
+                                    assistant.setReasoning_content(currentReasoning.toString()); // 👈 关键：带上思考过程
+                                }
+                                conversationHistory.add(assistant);
+                                ChatMessageEntity chatMessageEntity = new ChatMessageEntity(
+                                        DBChatHistoryRepository.getUUID(),
+                                        currentSessionId,
+                                        "assistant",
+                                        currentAiRawText,
+                                        (String) null,
+                                        (String) null,
+                                        (String) null,
+                                        currentReasoning.toString()
+                                );
+                                ThreadHelper.executeAsync(project,()-> DBChatHistoryRepository.saveMessage(chatMessageEntity),null);
+                                finalizeAiMessage();
+                            }
+                            clearStreamRefs();
+                        });
+                    }
+
+                    @Override
+                    public void onUsage(com.loongc.model.ChatResponse.Usage usage) {
+                        System.out.println("onUsage------------------------");
+                        ApplicationManager.getApplication().invokeLater(() -> updateTokenStats(usage));
+                    }
+
+                    @Override
+                    public void onError(Throwable error) {
+                        System.out.println("onError------------------------");
+                        ApplicationManager.getApplication().invokeLater(() -> {
+                            isReceiving = false;
+                            restoreSendButton();
+                            statusLabel.setText("出错");
+                            statusLabel.setForeground(JBColor.RED);
+                            appendStreamChunk("\n\n**[错误]** " + error.getMessage());
+                            finalizeAiMessage();
+                            clearStreamRefs();
+                        });
+                    }
                 });
-            }
-        });
     }
 
     /**
@@ -690,7 +924,7 @@ public class ChatPanel extends JPanel {
      *     缓存命中 0.1，未命中 12，输出 24
      *   其他模型使用 deepseek-chat 价格作为默认值
      */
-    private void updateTokenStats(com.loongc.api.model.ChatResponse.Usage usage) {
+    private void updateTokenStats(com.loongc.model.ChatResponse.Usage usage) {
         if (usage == null) return;
 
         sessionPromptTokens     += usage.getPromptTokens();
@@ -701,7 +935,7 @@ public class ChatPanel extends JPanel {
         // 根据当前选择的模型确定单价（元 / token）
         String model = (String) modelCombo.getSelectedItem();
         double hitPrice, missPrice, outPrice;
-        if ("deepseek-V4-Pro".equals(model)) {
+        if ("deepseek-v4-pro".equals(model)) {
             hitPrice  = 0.1  / 1_000_000.0;
             missPrice = 12.0 / 1_000_000.0;
             outPrice  = 24.0 / 1_000_000.0;
@@ -730,39 +964,79 @@ public class ChatPanel extends JPanel {
                 ? String.format("%.0f%%", sessionCacheHitTokens * 100.0 / totalInput)
                 : "—";
 
+        // 💡【核心修改 1】将原本的 %d 改为 %s，并调用单位转换函数缩写数字
         String text = String.format(
-                "↑%d ↓%d  |  💾命中:%d(%s) 未命中:%d  |  %s",
-                sessionPromptTokens,
-                sessionCompletionTokens,
-                sessionCacheHitTokens, hitRateStr,
-                sessionCacheMissTokens,
+                "↑%s ↓%s  |  💾命中:%s(%s) 未命中:%s  |  %s",
+                formatTokenCount(sessionPromptTokens),
+                formatTokenCount(sessionCompletionTokens),
+                formatTokenCount(sessionCacheHitTokens),
+                hitRateStr,
+                formatTokenCount(sessionCacheMissTokens),
                 costStr
         );
 
         tokenStatsLabel.setText(text);
         tokenStatsLabel.setForeground(JBColor.GRAY);
-        System.out.println(String.format(
-                "<html>当前会话累计<br>"
-                        + "输入 tokens：%d（缓存命中 %d + 未命中 %d）<br>"
-                        + "输出 tokens：%d<br>"
-                        + "缓存命中率：%s<br>"
-                        + "预估费用：%s 元</html>",
-                sessionPromptTokens,
-                sessionCacheHitTokens, sessionCacheMissTokens,
-                sessionCompletionTokens,
-                hitRateStr, costStr
-        ));
+
+        // 💡【核心修改 2】悬浮提示（Tooltip）中依然保留最精准的原始数字 %d，方便需要时核对
         tokenStatsLabel.setToolTipText(String.format(
                 "<html>当前会话累计<br>"
-                        + "输入 tokens：%d（缓存命中 %d + 未命中 %d）<br>"
-                        + "输出 tokens：%d<br>"
+                        + "输入 tokens：%s（缓存命中 %s + 未命中 %s）<br>"
+                        + "输出 tokens：%s<br>"
                         + "缓存命中率：%s<br>"
                         + "预估费用：%s 元</html>",
-                sessionPromptTokens,
-                sessionCacheHitTokens, sessionCacheMissTokens,
-                sessionCompletionTokens,
-                hitRateStr, costStr
+                formatTokenCount(sessionPromptTokens),
+                formatTokenCount(sessionCacheHitTokens),
+                formatTokenCount(sessionCacheMissTokens),
+                formatTokenCount(sessionCompletionTokens),
+                hitRateStr,
+                costStr
         ));
+    }
+
+    /**
+     * 恢复发送按钮为默认状态（发送图标）
+     */
+    private void restoreSendButton() {
+        if (sendBtn != null) {
+            sendBtn.setIcon(AllIcons.Actions.Execute);
+            sendBtn.setToolTipText("发送 (Enter)");
+        }
+    }
+
+    /**
+     * 💡【新增辅助方法】智能格式化 Token 计数
+     * 规则：
+     * - 950 -> "950"
+     * - 1000 -> "1K"
+     * - 1500 -> "1.5K"
+     * - 12345 -> "12.3K"
+     * - 1000000 -> "1M"
+     */
+    private String formatTokenCount(long count) {
+        if (count < 1000) {
+            return String.valueOf(count);
+        }
+        // 使用 DecimalFormat 自动格式化，最多保留一位小数，且自动去除尾随的 .0
+        java.text.DecimalFormat df = new java.text.DecimalFormat("#.#");
+        if (count < 1_000_000) {
+            return df.format(count / 1000.0) + "K";
+        }
+        return df.format(count / 1_000_000.0) + "M";
+    }
+
+    /**
+     * 清理本轮流式输出的所有组件引用
+     */
+    private void clearStreamRefs() {
+        currentStreamArea  = null;
+        currentBubbleInner = null;
+        currentAiRawText   = "";
+        currentReasoningArea   = null;
+        currentReasoningPanel  = null;
+        currentReasoningContent = null;
+        currentReasoningStatus = null;
+        currentReasoningText   = "";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -782,12 +1056,133 @@ public class ChatPanel extends JPanel {
     }
 
     /**
+     * 追加思考过程流式块，自动创建思考区块
+     */
+    private void appendReasoningChunk(String chunk) {
+        currentReasoningText += chunk;
+        if (currentReasoningPanel == null) {
+            addAiReasoningStreamRow();
+        }
+        if (currentReasoningArea != null) {
+            currentReasoningArea.append(chunk);
+            currentReasoningArea.setCaretPosition(currentReasoningArea.getDocument().getLength());
+        }
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
+    }
+
+    /**
+     * 流式思考过程区块：可折叠、与正式回复视觉区分
+     */
+    private void addAiReasoningStreamRow() {
+        Color bg = reasoningBg();
+        Color fg = reasoningFg();
+        Color bd = reasoningBd();
+
+        // ── 标题栏 ──
+        JBLabel arrowLabel = new JBLabel(isReasoningCollapsed ? "▶" : "▼");
+        arrowLabel.setFont(JBUI.Fonts.label(11));
+        arrowLabel.setForeground(fg);
+
+        JBLabel titleLabel = new JBLabel(AllIcons.Actions.IntentionBulb);
+        titleLabel.setText(" 思考过程");
+        titleLabel.setFont(JBUI.Fonts.label(12).asBold());
+        titleLabel.setForeground(fg);
+
+        JBLabel statusLabel = new JBLabel("思考中…");
+        statusLabel.setFont(JBUI.Fonts.label(11));
+        statusLabel.setForeground(fg);
+
+        JBPanel<?> header = new JBPanel<>(new BorderLayout(6, 0));
+        header.setOpaque(false);
+        header.setBorder(JBUI.Borders.empty(6, 10));
+
+        JBPanel<?> leftGroup = new JBPanel<>(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        leftGroup.setOpaque(false);
+        leftGroup.add(arrowLabel);
+        leftGroup.add(titleLabel);
+
+        header.add(leftGroup, BorderLayout.WEST);
+        header.add(statusLabel, BorderLayout.EAST);
+
+        // ── 内容区（JBTextArea）──
+        JBTextArea reasoningArea = new JBTextArea();
+        reasoningArea.setFont(JBUI.Fonts.label(12));
+        reasoningArea.setLineWrap(true);
+        reasoningArea.setWrapStyleWord(true);
+        reasoningArea.setEditable(false);
+        reasoningArea.setBackground(bg);
+        reasoningArea.setForeground(fg);
+        reasoningArea.setCaretColor(fg);
+        reasoningArea.setBorder(JBUI.Borders.empty(6, 10));
+        installPopupMenu(reasoningArea, "LoongC 思考过程");
+
+        JBPanel<?> contentPanel = new JBPanel<>(new BorderLayout());
+        contentPanel.setOpaque(false);
+        contentPanel.add(reasoningArea, BorderLayout.CENTER);
+        contentPanel.setVisible(!isReasoningCollapsed);
+
+        // ── 整体面板 ──
+        JBPanel<?> inner = new JBPanel<>(new BorderLayout());
+        inner.setOpaque(false);
+        inner.add(header, BorderLayout.NORTH);
+        inner.add(contentPanel, BorderLayout.CENTER);
+
+        JBPanel<?> bubble = new JBPanel<>(new BorderLayout());
+        bubble.setBackground(bg);
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(bd, 1),
+                JBUI.Borders.empty(1)
+        ));
+        bubble.add(inner, BorderLayout.CENTER);
+
+        // 点击标题栏折叠/展开
+        header.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        Runnable toggleAction = () -> {
+            isReasoningCollapsed = !isReasoningCollapsed;
+            arrowLabel.setText(isReasoningCollapsed ? "▶" : "▼");
+            contentPanel.setVisible(!isReasoningCollapsed);
+            bubble.revalidate();
+            bubble.repaint();
+            messagesPanel.revalidate();
+            messagesPanel.repaint();
+        };
+        header.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+        arrowLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+        titleLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+
+        // 引用保存
+        currentReasoningArea    = reasoningArea;
+        currentReasoningPanel   = bubble;
+        currentReasoningContent = contentPanel;
+        currentReasoningStatus  = statusLabel;
+
+        JBPanel<?> row = wrapAiRow("LoongC", bubble);
+        //row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+
+        messagesPanel.add(row);
+        messagesPanel.add(Box.createVerticalStrut(8));
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
+    }
+
+
+    /**
      * 流式完成：将气泡内 JTextArea 替换为 JEditorPane 渲染 Markdown，并安装右键菜单
      */
     private void finalizeAiMessage() {
         if (currentBubbleInner == null || currentAiRawText.isEmpty()) return;
         boolean dark = MarkdownUtil.isDarkTheme();
-        Color bubbleBg = dark ? AI_BG_DARK : AI_BG_LIGHT;
+        Color bubbleBg = aiBubbleBg();
         String rawMd = currentAiRawText;  // 保留原始 MD 供右键"复制 Markdown"使用
         String html  = MarkdownUtil.toHtml(rawMd, dark, bubbleBg);
 
@@ -795,15 +1190,14 @@ public class ChatPanel extends JPanel {
         mdPane.setEditable(false);
         mdPane.setOpaque(true);
         mdPane.setBackground(bubbleBg);
-        mdPane.setForeground(JBColor.namedColor("Label.foreground",
-                dark ? Color.WHITE : Color.BLACK));
+        mdPane.setForeground(UIUtil.getLabelForeground());
         mdPane.setBorder(JBUI.Borders.empty(10, 14));
         mdPane.setCaretPosition(0);
         installPopupMenuForAi(mdPane, rawMd);
 
-        JPanel bubbleInner = currentBubbleInner;
+        JBPanel<?> bubbleInner = currentBubbleInner;
         mdPane.addPropertyChangeListener("preferredSize", e ->
-                SwingUtilities.invokeLater(() -> {
+                ApplicationManager.getApplication().invokeLater(() -> {
                     bubbleInner.revalidate();
                     messagesPanel.revalidate();
                     messagesPanel.repaint();
@@ -825,54 +1219,55 @@ public class ChatPanel extends JPanel {
     // ─────────────────────────────────────────────────────────────────────────
 
     private void addUserMessage(String content) {
-        SwingUtilities.invokeLater(() -> {
-            messagesPanel.add(buildUserRow(content));
-            messagesPanel.add(Box.createVerticalStrut(12));
-            messagesPanel.revalidate();
-            messagesPanel.repaint();
-            scrollToBottom();
-        });
+        messagesPanel.add(buildUserRow(content));
+        messagesPanel.add(Box.createVerticalStrut(12));
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
     }
 
+    //
     private void addAiMessage(String content) {
-        SwingUtilities.invokeLater(() -> {
-            messagesPanel.add(buildAiRow(content));
-            messagesPanel.add(Box.createVerticalStrut(12));
-            messagesPanel.revalidate();
-            messagesPanel.repaint();
-            scrollToBottom();
-        });
+        messagesPanel.add(buildAiRow(content));
+        messagesPanel.add(Box.createVerticalStrut(12));
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
     }
 
     /** 流式 AI 消息：先用 JTextArea 占位，并安装右键菜单 */
     private void addAiStreamRow() {
-        boolean dark = MarkdownUtil.isDarkTheme();
-        Color bubbleBg = dark ? AI_BG_DARK : AI_BG_LIGHT;
+        Color bubbleBg = aiBubbleBg();
 
-        JTextArea streamArea = new JTextArea();
-        streamArea.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
+        JBTextArea streamArea = new JBTextArea();
+        streamArea.setFont(JBUI.Fonts.label(13));
         streamArea.setLineWrap(true);
         streamArea.setWrapStyleWord(true);
         streamArea.setEditable(false);
         streamArea.setBackground(bubbleBg);
-        streamArea.setForeground(JBColor.namedColor("Label.foreground",
-                dark ? Color.WHITE : Color.BLACK));
+        // 确保前景色不为透明，避免在某些主题下看不见
+        streamArea.setForeground(UIUtil.getLabelForeground());
+        streamArea.setCaretColor(UIUtil.getLabelForeground());
         streamArea.setBorder(JBUI.Borders.empty(10, 14));
         installPopupMenu(streamArea, "LoongC 回复（接收中）");
 
-        JPanel bubbleInner = new JPanel(new BorderLayout());
+        JBPanel<?> bubbleInner = new  JBPanel<>(new BorderLayout());
         bubbleInner.setOpaque(false);
         bubbleInner.add(streamArea, BorderLayout.CENTER);
 
-        RoundedPanel bubble = new RoundedPanel(bubbleBg, 10);
-        bubble.setLayout(new BorderLayout());
+        JBPanel<?> bubble = new JBPanel<>(new BorderLayout());
+        bubble.setBackground(bubbleBg);
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(dividerColor(), 1),
+                JBUI.Borders.empty(1)
+        ));
         bubble.add(bubbleInner, BorderLayout.CENTER);
 
         currentStreamArea  = streamArea;
         currentBubbleInner = bubbleInner;
 
-        JPanel row = wrapAiRow("LoongC", bubble);
-        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JBPanel<?> row = wrapAiRow("LoongC", bubble);
+        //row.setAlignmentX(Component.LEFT_ALIGNMENT);
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
 
         messagesPanel.add(row);
@@ -882,63 +1277,231 @@ public class ChatPanel extends JPanel {
         scrollToBottom();
     }
 
+
+    /**
+     * 显示工具调用信息（灰色小字，不进入对话历史）
+     */
+    private void addToolCallMessage(String toolName, String result) {
+        JBPanel<?> row = new JBPanel<>(new BorderLayout());
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+        row.setBorder(JBUI.Borders.empty(2, 40, 2, 12));
+
+        JBLabel lbl = new JBLabel(AllIcons.Actions.Search);
+        lbl.setText(" " + toolName + " 已执行");
+        lbl.setFont(JBUI.Fonts.label(11));
+        lbl.setForeground(mutedFg());
+        row.add(lbl, BorderLayout.WEST);
+
+        messagesPanel.add(row);
+        messagesPanel.revalidate();
+
+        ThreadHelper.runOnUi(project,()->{
+            JScrollBar sb = messagesScrollPane.getVerticalScrollBar();
+            sb.setValue(sb.getMaximum());
+        });
+    }
+
+    /**
+     * 从历史记录的 toolCallsJson 构建工具调用信息块
+     */
+    private JBPanel<?> buildToolCallsBlock(String toolCallsJson) {
+        JBPanel<?> wrapper = new JBPanel<>(new BorderLayout());
+        wrapper.setOpaque(false);
+        wrapper.setBorder(JBUI.Borders.empty(2, 40, 2, 12));
+        wrapper.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+
+        JBPanel<?> inner = new JBPanel<>(null);
+        inner.setLayout(new BoxLayout(inner, BoxLayout.Y_AXIS));
+        inner.setOpaque(false);
+
+        try {
+            com.google.gson.Gson gson = new com.google.gson.Gson();
+            java.lang.reflect.Type type = new com.google.gson.reflect.TypeToken<java.util.List<ChatMessage.ToolCall>>(){}.getType();
+            java.util.List<ChatMessage.ToolCall> toolCalls = gson.fromJson(toolCallsJson, type);
+            if (toolCalls != null) {
+                for (ChatMessage.ToolCall tc : toolCalls) {
+                    String toolName = tc.getFunction() != null ? tc.getFunction().getName() : "unknown";
+                    JBLabel lbl = new JBLabel(AllIcons.Actions.IntentionBulb);
+                    lbl.setText(" 请求调用工具: " + toolName);
+                    lbl.setFont(JBUI.Fonts.label(11));
+                    lbl.setForeground(mutedFg());
+                    inner.add(lbl);
+                }
+            }
+        } catch (Exception e) {
+            JBLabel lbl = new JBLabel("工具调用信息（解析失败）");
+            lbl.setFont(JBUI.Fonts.label(11));
+            lbl.setForeground(mutedFg());
+            inner.add(lbl);
+        }
+
+        wrapper.add(inner, BorderLayout.WEST);
+        return wrapper;
+    }
+
+    private JBPanel<?> buildAiReasoningBlock(String reasoningContent, boolean collapsed) {
+        Color bg = reasoningBg();
+        Color fg = reasoningFg();
+        Color bd = reasoningBd();
+
+        JBLabel arrowLabel = new JBLabel(collapsed ? "▶" : "▼");
+        arrowLabel.setFont(JBUI.Fonts.label(11));
+        arrowLabel.setForeground(fg);
+
+        JBLabel titleLabel = new JBLabel(AllIcons.Actions.IntentionBulb);
+        titleLabel.setText(" 思考过程");
+        titleLabel.setFont(JBUI.Fonts.label(12).asBold());
+        titleLabel.setForeground(fg);
+
+        JBPanel<?> header = new JBPanel<>(new BorderLayout(6, 0));
+        header.setOpaque(false);
+        header.setBorder(JBUI.Borders.empty(6, 10));
+
+        JBPanel<?> leftGroup = new JBPanel<>(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        leftGroup.setOpaque(false);
+        leftGroup.add(arrowLabel);
+        leftGroup.add(titleLabel);
+        header.add(leftGroup, BorderLayout.WEST);
+
+        JBTextArea reasoningArea = new JBTextArea(reasoningContent);
+        reasoningArea.setFont(JBUI.Fonts.label(12));
+        reasoningArea.setLineWrap(true);
+        reasoningArea.setWrapStyleWord(true);
+        reasoningArea.setEditable(false);
+        reasoningArea.setBackground(bg);
+        reasoningArea.setForeground(fg);
+        reasoningArea.setCaretColor(fg);
+        reasoningArea.setBorder(JBUI.Borders.empty(6, 10));
+        installPopupMenu(reasoningArea, "LoongC 思考过程");
+
+        JBPanel<?> contentPanel = new JBPanel<>(new BorderLayout());
+        contentPanel.setOpaque(false);
+        contentPanel.add(reasoningArea, BorderLayout.CENTER);
+        contentPanel.setVisible(!collapsed);
+
+        JBPanel<?> inner = new JBPanel<>(new BorderLayout());
+        inner.setOpaque(false);
+        inner.add(header, BorderLayout.NORTH);
+        inner.add(contentPanel, BorderLayout.CENTER);
+
+        JBPanel<?> bubble = new JBPanel<>(new BorderLayout());
+        bubble.setBackground(bg);
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(bd, 1),
+                JBUI.Borders.empty(1)
+        ));
+        bubble.add(inner, BorderLayout.CENTER);
+
+        Runnable toggleAction = () -> {
+            boolean nowCollapsed = !contentPanel.isVisible();
+            arrowLabel.setText(nowCollapsed ? "▶" : "▼");
+            contentPanel.setVisible(nowCollapsed);
+            bubble.revalidate();
+            bubble.repaint();
+            messagesPanel.revalidate();
+            messagesPanel.repaint();
+        };
+        header.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        header.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+        arrowLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+        titleLabel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { toggleAction.run(); }
+        });
+
+        JBPanel<?> row = wrapAiRow("LoongC", bubble);
+        //row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+        return row;
+    }
+
     /** 非流式 AI 消息行（欢迎语等）：直接渲染 Markdown，安装右键菜单 */
-    private JPanel buildAiRow(String mdContent) {
+        private JBPanel<?> buildAiRow(String mdContent) {
         boolean dark = MarkdownUtil.isDarkTheme();
-        Color bubbleBg = dark ? AI_BG_DARK : AI_BG_LIGHT;
+        Color bubbleBg = aiBubbleBg();
         String html = MarkdownUtil.toHtml(mdContent, dark, bubbleBg);
+
 
         JEditorPane mdPane = new JEditorPane("text/html", html);
         mdPane.setEditable(false);
         mdPane.setOpaque(true);
         mdPane.setBackground(bubbleBg);
-        mdPane.setForeground(JBColor.namedColor("Label.foreground",
-                dark ? Color.WHITE : Color.BLACK));
+        mdPane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
+        mdPane.addHyperlinkListener(e -> {
+            if (e.getEventType() == javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
+                // 可选：在浏览器中打开链接
+            }
+        });
+        mdPane.setForeground(UIUtil.getLabelForeground());
         mdPane.setBorder(JBUI.Borders.empty(10, 14));
         mdPane.setCaretPosition(0);
         installPopupMenuForAi(mdPane, mdContent);
 
-        JPanel bubbleInner = new JPanel(new BorderLayout());
+        JBPanel<?> bubbleInner = new JBPanel<>(new BorderLayout());
         bubbleInner.setOpaque(false);
         bubbleInner.add(mdPane, BorderLayout.CENTER);
 
-        RoundedPanel bubble = new RoundedPanel(bubbleBg, 10);
-        bubble.setLayout(new BorderLayout());
+        JBPanel<?> bubble = new JBPanel<>(new BorderLayout());
+        bubble.setBackground(bubbleBg);
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(dividerColor(), 1),
+                JBUI.Borders.empty(1)
+        ));
         bubble.add(bubbleInner, BorderLayout.CENTER);
 
-        JPanel row = wrapAiRow("LoongC", bubble);
-        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JBPanel<?> row = wrapAiRow("LoongC", bubble);
+        //row.setAlignmentX(Component.LEFT_ALIGNMENT);
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
         return row;
     }
 
     /**
-     * 用户消息行：颜文字头像 + 圆角蓝色气泡靠右，带右键菜单
+     * 用户消息行：+ 圆角蓝色气泡靠右，带右键菜单
      */
-    private JPanel buildUserRow(String content) {
-        Color bubbleBg = USER_BG;
+    private JBPanel<?> buildUserRow(String content) {
+        boolean dark = MarkdownUtil.isDarkTheme();
+        Color bubbleBg = userBubbleBg();
+        String html = MarkdownUtil.toHtml(content, dark, bubbleBg);
 
-        JTextArea textArea = new JTextArea(content);
-        textArea.setFont(new Font("Microsoft YaHei", Font.PLAIN, 13));
-        textArea.setLineWrap(true);
-        textArea.setWrapStyleWord(true);
-        textArea.setEditable(false);
-        textArea.setBackground(bubbleBg);
-        textArea.setForeground(USER_FG);
-        textArea.setBorder(JBUI.Borders.empty(10, 14));
-        installPopupMenu(textArea, "你的消息");
 
-        RoundedPanel bubble = new RoundedPanel(bubbleBg, 12);
-        bubble.setLayout(new BorderLayout());
-        bubble.add(textArea, BorderLayout.CENTER);
+        JEditorPane mdPane = new JEditorPane("text/html", html);
+        mdPane.setEditable(false);
+        mdPane.setOpaque(true);
+        mdPane.setBackground(bubbleBg);
+        mdPane.putClientProperty(JEditorPane.HONOR_DISPLAY_PROPERTIES, Boolean.TRUE);
+        mdPane.addHyperlinkListener(e -> {
+            if (e.getEventType() == javax.swing.event.HyperlinkEvent.EventType.ACTIVATED) {
+                // 可选：在浏览器中打开链接
+            }
+        });
+        mdPane.setForeground(UIUtil.getLabelForeground());
+        mdPane.setBorder(JBUI.Borders.empty(10, 14));
+        mdPane.setCaretPosition(0);
+        installPopupMenuForAi(mdPane, content);
 
-        JLabel nameLabel = new JLabel("你");
-        nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 12));
-        nameLabel.setForeground(JBColor.GRAY);
+        JBPanel<?> bubbleInner = new JBPanel<>(new BorderLayout());
+        bubbleInner.setOpaque(false);
+        bubbleInner.add(mdPane, BorderLayout.CENTER);
+
+        JBPanel<?> bubble = new JBPanel<>(new BorderLayout());
+        bubble.setBackground(bubbleBg);
+        bubble.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(dividerColor(), 1),
+                JBUI.Borders.empty(1)
+        ));
+        bubble.add(bubbleInner, BorderLayout.CENTER);
+
+        JBLabel nameLabel = new JBLabel("你");
+        nameLabel.setFont(JBUI.Fonts.label(11));
+        nameLabel.setForeground(mutedFg());
         nameLabel.setHorizontalAlignment(SwingConstants.RIGHT);
         nameLabel.setBorder(JBUI.Borders.emptyBottom(2));
 
-        JPanel contentArea = new JPanel();
+        JBPanel<?> contentArea = new JBPanel<>(null);
         contentArea.setLayout(new BoxLayout(contentArea, BoxLayout.Y_AXIS));
         contentArea.setOpaque(false);
         nameLabel.setAlignmentX(Component.RIGHT_ALIGNMENT);
@@ -946,17 +1509,18 @@ public class ChatPanel extends JPanel {
         contentArea.add(nameLabel);
         contentArea.add(bubble);
 
-        // 颜文字头像
-        JPanel avatar = buildKaomojiAvatar();
+        // 使用 IntelliJ 用户图标
+        JBLabel avatar = new JBLabel(AllIcons.General.User);
+        avatar.setBorder(JBUI.Borders.emptyTop(4));
 
-        JPanel row = new JPanel(new BorderLayout(8, 0));
+        JBPanel<?> row = new JBPanel<>(new BorderLayout(8, 0));
         row.setOpaque(false);
 
-        JPanel leftSpacer = new JPanel();
+        JBPanel<?> leftSpacer = new JBPanel<>(null);
         leftSpacer.setOpaque(false);
         row.add(leftSpacer, BorderLayout.CENTER);
 
-        JPanel rightGroup = new JPanel(new BorderLayout(8, 0));
+        JBPanel<?> rightGroup = new JBPanel<>(new BorderLayout(8, 0));
         rightGroup.setOpaque(false);
         rightGroup.add(contentArea, BorderLayout.CENTER);
         rightGroup.add(avatar, BorderLayout.EAST);
@@ -966,17 +1530,16 @@ public class ChatPanel extends JPanel {
         row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
         return row;
     }
-
     /**
      * AI 消息行包装：[蓝色圆形头像"L"] [8px] [内容区（名称+气泡）] [60px空白]
      */
-    private JPanel wrapAiRow(String name, JPanel bubble) {
-        JLabel nameLabel = new JLabel(name);
-        nameLabel.setFont(new Font("Microsoft YaHei", Font.PLAIN, 11));
-        nameLabel.setForeground(JBColor.GRAY);
+    private JBPanel<?> wrapAiRow(String name, JBPanel<?> bubble) {
+        JBLabel nameLabel = new JBLabel(name);
+        nameLabel.setFont(JBUI.Fonts.label(11));
+        nameLabel.setForeground(mutedFg());
         nameLabel.setBorder(JBUI.Borders.emptyBottom(2));
 
-        JPanel contentArea = new JPanel();
+        JBPanel<?> contentArea = new JBPanel<>(null);
         contentArea.setLayout(new BoxLayout(contentArea, BoxLayout.Y_AXIS));
         contentArea.setOpaque(false);
         nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -984,23 +1547,24 @@ public class ChatPanel extends JPanel {
         contentArea.add(nameLabel);
         contentArea.add(bubble);
 
-        JPanel avatar = buildLetterAvatar("L", AI_AVATAR_BG);
+        // 使用 IntelliJ AI/机器人图标
+        JBLabel avatar = new JBLabel(AllIcons.Actions.IntentionBulb);
+        avatar.setBorder(JBUI.Borders.emptyTop(4));
 
-        JPanel row = new JPanel(new BorderLayout(8, 0));
+        JBPanel<?> row = new JBPanel<>(new BorderLayout(8, 0));
         row.setOpaque(false);
-        JPanel avatarWrapper = new JPanel(new BorderLayout());
+        JBPanel<?> avatarWrapper = new JBPanel<>(new BorderLayout());
         avatarWrapper.setOpaque(false);
         avatarWrapper.add(avatar, BorderLayout.NORTH);
         row.add(avatarWrapper, BorderLayout.WEST);
         row.add(contentArea, BorderLayout.CENTER);
 
-        JPanel rightSpacer = new JPanel();
+        JBPanel<?> rightSpacer = new JBPanel<>(null);
         rightSpacer.setOpaque(false);
         rightSpacer.setPreferredSize(new Dimension(60, 0));
         row.add(rightSpacer, BorderLayout.EAST);
         return row;
     }
-
     // ─────────────────────────────────────────────────────────────────────────
     // 头像组件
     // ─────────────────────────────────────────────────────────────────────────
@@ -1082,47 +1646,560 @@ public class ChatPanel extends JPanel {
     // ─────────────────────────────────────────────────────────────────────────
 
     private void scrollToBottom() {
-        SwingUtilities.invokeLater(() -> {
-            JScrollBar v = messagesScrollPane.getVerticalScrollBar();
-            v.setValue(v.getMaximum());
+        JScrollBar v = messagesScrollPane.getVerticalScrollBar();
+        v.setValue(v.getMaximum());
+    }
+
+
+    /**
+     * 显示历史会话面板
+     */
+    public void showHistoryPanel() {
+        refreshHistoryList();
+        cardLayout.show(cardPanel, HISTORY_CARD);
+    }
+
+    /**
+     * 显示聊天面板（从历史面板返回）
+     */
+    public void showChatPanel() {
+        cardLayout.show(cardPanel, CHAT_CARD);
+    }
+
+    /**
+     * 构建历史会话面板：顶部工具栏（返回+标题+删除所有）+ 会话列表
+     */
+    private JBPanel<?> buildHistoryPanel() {
+        JBPanel<?> panel = new JBPanel<>(new BorderLayout(0, 0));
+        panel.setBackground(UIUtil.getPanelBackground());
+
+        // ── 顶部工具栏 ──
+        JBPanel<?> toolbar = new JBPanel<>(new BorderLayout(8, 0));
+        toolbar.setOpaque(false);
+        toolbar.setBorder(JBUI.Borders.empty(10, 12));
+
+        // 左侧：返回按钮
+        JButton backBtn = new JButton("  返回", AllIcons.Actions.Back);
+        backBtn.setFont(JBUI.Fonts.label(13));
+        backBtn.setFocusable(false);
+        backBtn.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(dividerColor(), 1),
+                JBUI.Borders.empty(4, 10)
+        ));
+        backBtn.setContentAreaFilled(false);
+        backBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        backBtn.addActionListener(e -> showChatPanel());
+        toolbar.add(backBtn, BorderLayout.WEST);
+
+        // 中间：标题
+        JBLabel titleLabel = new JBLabel("历史对话");
+        titleLabel.setFont(JBUI.Fonts.label(15).asBold());
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        toolbar.add(titleLabel, BorderLayout.CENTER);
+
+        // 右侧：删除所有按钮
+        JButton deleteAllBtn = new JButton("  删除所有", AllIcons.Actions.GC);
+        deleteAllBtn.setFont(JBUI.Fonts.label(12));
+        deleteAllBtn.setFocusable(false);
+        deleteAllBtn.setForeground(new Color(0xE53935));
+        deleteAllBtn.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(0xE53935), 1),
+                JBUI.Borders.empty(4, 10)
+        ));
+        deleteAllBtn.setContentAreaFilled(false);
+        deleteAllBtn.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        deleteAllBtn.addActionListener(e -> deleteAllSessions());
+        toolbar.add(deleteAllBtn, BorderLayout.EAST);
+
+        panel.add(toolbar, BorderLayout.NORTH);
+
+        // ── 会话列表 ──
+        historyListModel = new DefaultListModel<>();
+        historyList = new JBList<>(historyListModel);
+        historyList.setCellRenderer(new HistoryCellRenderer());
+        historyList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+        historyList.setBorder(JBUI.Borders.empty(4, 8));
+        historyList.setBackground(UIUtil.getPanelBackground());
+
+        // 双击打开会话
+        historyList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) {
+                    openSelectedHistorySession();
+                }
+            }
+        });
+
+        // 右键菜单
+        historyList.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (e.isPopupTrigger()) showHistoryPopup(e);
+            }
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (e.isPopupTrigger()) showHistoryPopup(e);
+            }
+        });
+
+        JBScrollPane scrollPane = new JBScrollPane(historyList);
+        scrollPane.setBorder(null);
+        scrollPane.setBackground(UIUtil.getPanelBackground());
+        panel.add(scrollPane, BorderLayout.CENTER);
+
+        return panel;
+    }
+
+
+    private void showHistoryPopup(MouseEvent e) {
+        int idx = historyList.locationToIndex(e.getPoint());
+        if (idx < 0) return;
+        historyList.setSelectedIndex(idx);
+        HistoryItem item = historyListModel.getElementAt(idx);
+        if (item == null || item.getSession() == null) return;
+
+        JPopupMenu menu = new JPopupMenu();
+        JMenuItem openItem = new JMenuItem("打开会话", AllIcons.Actions.ShowCode);
+        openItem.addActionListener(ev -> {
+            switchToSession(item.getSession().getId());
+            showChatPanel();
+        });
+        menu.add(openItem);
+
+        JMenuItem deleteItem = new JMenuItem("删除会话", AllIcons.Actions.GC);
+        deleteItem.addActionListener(ev -> deleteHistorySession(item.getSession()));
+        menu.add(deleteItem);
+
+        menu.show(historyList, e.getX(), e.getY());
+    }
+
+    private void openSelectedHistorySession() {
+        HistoryItem selected = historyList.getSelectedValue();
+        System.out.println("selected = "+selected);
+        if (selected != null && selected.getSession() != null) {
+            switchToSession(selected.getSession().getId());
+            showChatPanel();
+        }
+    }
+
+    private void refreshHistoryList() {
+        historyListModel.clear();
+        List<ChatSessionEntity> sessions = DBChatHistoryRepository.listSessions();
+        System.out.println("sessions = "+sessions);
+        if (sessions.isEmpty()) {
+            historyListModel.addElement(new HistoryItem(null, "暂无历史会话", ""));
+            return;
+        }
+        java.text.SimpleDateFormat df = new java.text.SimpleDateFormat("MM-dd HH:mm");
+        for (ChatSessionEntity s : sessions) {
+            String title = s.getName() != null && !s.getName().isEmpty() ? s.getName() : "未命名会话";
+            String time = s.getCreatedAt() != null ? df.format(s.getCreatedAt()) : "";
+            String info = s.getChatMessageCount() + " 条消息  ·  " + time;
+            historyListModel.addElement(new HistoryItem(s, title, info));
+        }
+    }
+
+    private void deleteHistorySession(ChatSessionEntity session) {
+        if (session == null) return;
+        int result = JOptionPane.showConfirmDialog(
+                this,
+                "确定要删除会话「" + session.getName() + "」吗？",
+                "删除会话",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+        );
+        if (result == JOptionPane.YES_OPTION) {
+            DBChatHistoryRepository.deleteSession(session.getId());
+            if (session.getId().equals(currentSessionId)) {
+                createNewSession();
+            }
+            refreshHistoryList();
+        }
+    }
+
+    private void deleteAllSessions() {
+        int result = JOptionPane.showConfirmDialog(
+                this,
+                "确定要删除所有历史会话吗？此操作不可恢复。",
+                "删除所有会话",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+        );
+        if (result == JOptionPane.YES_OPTION) {
+            List<ChatSessionEntity> sessions = DBChatHistoryRepository.listSessions();
+            for (ChatSessionEntity s : sessions) {
+                DBChatHistoryRepository.deleteSession(s.getId());
+            }
+            createNewSession();
+            refreshHistoryList();
+        }
+    }
+
+
+    static class HistoryCellRenderer extends JPanel implements ListCellRenderer<HistoryItem> {
+        private final JBLabel titleLabel;
+        private final JBLabel infoLabel;
+
+        HistoryCellRenderer() {
+            setLayout(new BorderLayout(8, 0));
+            setBorder(JBUI.Borders.empty(10, 12));
+
+            JBPanel<?> textPanel = new JBPanel<>(new GridLayout(2, 1, 0, 4));
+            textPanel.setOpaque(false);
+
+            titleLabel = new JBLabel();
+            titleLabel.setFont(JBUI.Fonts.label(13));
+            textPanel.add(titleLabel);
+
+            infoLabel = new JBLabel();
+            infoLabel.setFont(JBUI.Fonts.label(11));
+            infoLabel.setForeground(JBColor.namedColor("Label.infoForeground", JBColor.GRAY));
+            textPanel.add(infoLabel);
+
+            add(textPanel, BorderLayout.CENTER);
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends HistoryItem> list,
+                                                      HistoryItem value, int index,
+                                                      boolean isSelected, boolean cellHasFocus) {
+            titleLabel.setText(value.getTitle());
+            infoLabel.setText(value.getInfo());
+
+            if (isSelected) {
+                setBackground(list.getSelectionBackground());
+                titleLabel.setForeground(list.getSelectionForeground());
+            } else {
+                setBackground(list.getBackground());
+                titleLabel.setForeground(list.getForeground());
+            }
+            setOpaque(true);
+            return this;
+        }
+    }
+
+    public void switchToSession(String sessionId) {
+        if (sessionId == null || sessionId.equals(currentSessionId)) return;
+
+        // 取消当前流
+        if (isReceiving) {
+            client.cancelCurrentStream();
+        }
+        isReceiving = false;
+        restoreSendButton();
+        clearStreamRefs();
+
+        currentSessionId = sessionId;
+        historyLoadedCount = 0;
+        historyTotalCount = 10;
+        isLoadingHistory = false;
+        loadingIndicator = null;
+
+        // 重置 token 统计
+        sessionPromptTokens = 0;
+        sessionCompletionTokens = 0;
+        sessionCacheHitTokens = 0;
+        sessionCacheMissTokens = 0;
+        if (tokenStatsLabel != null) tokenStatsLabel.setText("—");
+
+        // 加载全部消息到 conversationHistory（用于 API 上下文）
+        ChatMessage systemMsg = conversationHistory.isEmpty() ? null : conversationHistory.get(0);
+        conversationHistory.clear();
+        if (systemMsg != null) conversationHistory.add(systemMsg);
+
+        ThreadHelper.queryAsync(project,
+                ()->DBChatHistoryRepository.getRecentMessages(sessionId,10,0),
+                (uiMsgs)->{
+                    System.out.println("uiMsgs = "+uiMsgs);
+                    historyLoadedCount = uiMsgs.size();
+                    messagesPanel.removeAll();
+                    if(CollectUtils.isNotEmpty(uiMsgs)){
+                        for (ChatMessageEntity rec : uiMsgs) {
+                            ChatMessage msg = new ChatMessage();
+                            msg.setRole(rec.getRole());
+                            msg.setContent(rec.getContent());
+                            msg.setReasoning_content(rec.getReasoningContent()); // 还原 DeepSeek 思考过程
+                            msg.setTool_call_id(rec.getToolCallId());             // 还原工具调用 ID
+                            msg.setName(rec.getName());                           // 还原工具名称
+                            String toolCallsJson = rec.getToolCallsJson();
+                            if (StringUtils.isNotBlank(toolCallsJson)) {
+                                try {
+                                    java.lang.reflect.Type listType = new com.google.gson.reflect.TypeToken<List<ChatMessage.ToolCall>>(){}.getType();
+                                    List<ChatMessage.ToolCall> toolCallsList = GSON.fromJson(toolCallsJson, listType);
+                                    msg.setTool_calls(toolCallsList);
+                                } catch (Exception e) {
+                                    System.err.println("还原历史 tool_calls 失败: " + e.getMessage());
+                                }
+                            }
+                            conversationHistory.add(msg);
+                        }
+                        // UI 渲染最新 10 条（从尾部取）
+                        int startIndex = Math.max(0, uiMsgs.size() - 10);
+                        List<ChatMessageEntity> subList = uiMsgs.subList(startIndex, uiMsgs.size());
+                        for (ChatMessageEntity rec : subList) {
+                            renderMessageRecord(rec);
+                        }
+                    }
+                    messagesPanel.revalidate();
+                    messagesPanel.repaint();
+                    scrollToBottom();
         });
     }
 
     /**
-     * 在发送按钮中心绘制"向上发送"图标（纸飞机风格）。
-     * receiving=true 时绘制停止方块，提示可点击中止（视觉反馈）。
+     * 渲染一条持久化的消息记录到 UI
      */
-    private void paintSendIcon(Graphics2D g2, int w, int h, boolean receiving) {
-        g2.setColor(Color.WHITE);
-        g2.setStroke(new BasicStroke(1.8f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+    private void renderMessageRecord(ChatMessageEntity rec) {
+        if (Constant.ROLE_user.equals(rec.getRole())) {
+            addUserMessage(rec.getContent());
+        } else if (Constant.ROLE_assistant.equals(rec.getRole())) {
+            renderAssistantMessage(rec.getContent(), rec.getReasoningContent(), rec.getToolCallsJson());
+        } else if (Constant.ROLE_tool.equals(rec.getRole())) {
+            System.out.println("name: "+rec.getName());
+            //renderToolMessage(rec.getContent(), rec.getName(), rec.getToolCallId());
+        }
+    }
 
-        if (receiving) {
-            // 正在接收时：绘制圆角停止方块
-            int s = Math.min(w, h) / 3;
-            int x = (w - s) / 2;
-            int y = (h - s) / 2;
-            g2.fillRoundRect(x, y, s, s, 3, 3);
-        } else {
-            // 纸飞机图标：主三角形 + 折叠尾翼线
-            int cx = w / 2;
-            int cy = h / 2;
-            int r  = Math.min(w, h) / 2 - 6;  // 图标半径
+    private void renderToolMessage(String content, String toolName, String toolCallId) {
+        // 构建工具执行结果 UI（例如灰色小字，显示工具名 + 结果）
+        JBPanel<?> row = new JBPanel<>(new BorderLayout());
+        row.setOpaque(false);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+        row.setBorder(JBUI.Borders.empty(2, 40, 2, 12));
 
-            // 主体：向右上的三角（机身）
-            Path2D.Float plane = new Path2D.Float();
-            plane.moveTo(cx - r,       cy + r * 0.5f);   // 尾部左下
-            plane.lineTo(cx + r,       cy);               // 机头（右侧中心）
-            plane.lineTo(cx - r,       cy - r * 0.5f);   // 尾部左上
-            plane.lineTo(cx - r * 0.3f, cy);              // 折叠中心点
-            plane.closePath();
-            g2.fill(plane);
+        JBLabel lbl = new JBLabel(AllIcons.Actions.Search);
+        lbl.setText(" " + toolName + " 已执行");
+        lbl.setFont(JBUI.Fonts.label(11));
+        lbl.setForeground(mutedFg());
+        row.add(lbl, BorderLayout.WEST);
 
-            // 尾翼折叠线（从折叠点到尾部右下角，使图标更立体）
-            g2.setStroke(new BasicStroke(1.4f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
-            g2.drawLine(
-                    (int)(cx - r * 0.3f), cy,
-                    (int)(cx - r),        (int)(cy + r * 0.5f)
-            );
+        // 显示结果（可折叠或简短显示）
+        JBTextArea resultArea = new JBTextArea(content);
+        resultArea.setEditable(false);
+        resultArea.setFont(JBUI.Fonts.label(11));
+        resultArea.setLineWrap(true);
+        resultArea.setWrapStyleWord(true);
+        resultArea.setBackground(UIUtil.getPanelBackground());
+        resultArea.setBorder(JBUI.Borders.empty(4, 0));
+        row.add(resultArea, BorderLayout.CENTER);
+
+        messagesPanel.add(row);
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
+    }
+
+    private void renderAssistantMessage(String content, String reasoningContent, String toolCallsJson) {
+        // 思考过程
+        if (reasoningContent != null && !reasoningContent.isEmpty()) {
+            messagesPanel.add(buildAiReasoningBlock(reasoningContent, true));
+        }
+        // 工具调用
+        if (toolCallsJson != null && !toolCallsJson.isEmpty()) {
+            messagesPanel.add(buildToolCallsBlock(toolCallsJson));
+        }
+        // 消息正文（content 可能为 null，如纯工具调用请求）
+        if (content != null && !content.isEmpty()) {
+            messagesPanel.add(buildAiRow(content));
+        }
+        messagesPanel.add(Box.createVerticalStrut(12));
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+        scrollToBottom();
+    }
+
+    /**
+     * 检测是否需要加载更旧的历史消息
+     */
+    private void maybeLoadOlderMessages() {
+        if (isLoadingHistory || historyLoadedCount >= historyTotalCount) return;
+        JScrollBar vbar = messagesScrollPane.getVerticalScrollBar();
+        // 滚动到顶部附近（值 < 80）时触发加载
+        if (vbar.getValue() <= 80) {
+            loadOlderMessages();
+        }
+    }
+
+    /**
+     * 懒加载更旧的消息：插入到 UI 顶部，保持滚动位置
+     */
+    private void loadOlderMessages() {
+        if (isLoadingHistory || currentSessionId == null) return;
+        isLoadingHistory = true;
+
+        ApplicationManager.getApplication().invokeLater(() -> {
+            showLoadingIndicator();
+            int oldHeight = messagesPanel.getHeight();
+            JScrollBar vbar = messagesScrollPane.getVerticalScrollBar();
+
+            // 加载下一页（更旧的消息）
+            List<ChatMessageEntity> records = DBChatHistoryRepository
+                    .getRecentMessages(currentSessionId, historyLoadedCount,10);
+            if (records.isEmpty()) {
+                hideLoadingIndicator();
+                isLoadingHistory = false;
+                return;
+            }
+
+            // 倒序排列（从旧到新），然后插入到顶部
+            Collections.reverse(records);
+            for (ChatMessageEntity rec : records) {
+                Component comp = buildMessageComponent(rec);
+                if (comp != null) {
+                    messagesPanel.add(comp, 0);
+                }
+            }
+            historyLoadedCount += records.size();
+
+            hideLoadingIndicator();
+            messagesPanel.revalidate();
+            messagesPanel.repaint();
+
+            // 保持滚动位置（新增内容在上方，滚动条向下偏移）
+            int newHeight = messagesPanel.getHeight();
+            vbar.setValue(vbar.getValue() + (newHeight - oldHeight));
+
+            isLoadingHistory = false;
+        });
+    }
+
+    private Component buildMessageComponent(ChatMessageEntity rec) {
+        if ("user".equals(rec.getRole())) {
+            JPanel row = buildUserRow(rec.getContent());
+            JPanel wrapper = new JBPanel<>(new BorderLayout());
+            wrapper.setOpaque(false);
+            wrapper.add(row, BorderLayout.CENTER);
+            wrapper.add(Box.createVerticalStrut(12), BorderLayout.SOUTH);
+            return wrapper;
+        } else if ("assistant".equals(rec.getRole())) {
+            JPanel row = buildAiRow(rec.getContent());
+            JPanel wrapper = new JBPanel<>(new BorderLayout());
+            wrapper.setOpaque(false);
+            wrapper.add(row, BorderLayout.CENTER);
+            wrapper.add(Box.createVerticalStrut(12), BorderLayout.SOUTH);
+            return wrapper;
+        }
+        return null;
+    }
+
+
+    private void showLoadingIndicator() {
+        if (loadingIndicator != null) return;
+        loadingIndicator = buildLoadingIndicator();
+        messagesPanel.add(loadingIndicator, 0);
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+    }
+
+    private void hideLoadingIndicator() {
+        if (loadingIndicator != null) {
+            messagesPanel.remove(loadingIndicator);
+            loadingIndicator = null;
+        }
+    }
+
+    private JBPanel<?> buildLoadingIndicator() {
+        JBPanel<?> panel = new JBPanel<>(new FlowLayout(FlowLayout.CENTER));
+        panel.setOpaque(false);
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 32));
+        JBLabel label = new JBLabel("加载中…", AllIcons.Actions.Refresh, SwingConstants.LEFT);
+        label.setFont(JBUI.Fonts.label(12));
+        label.setForeground(mutedFg());
+        panel.add(label);
+        return panel;
+    }
+
+    /**
+     * 创建新会话：生成会话ID，清空聊天区，输出问候语并入库
+     */
+    public void createNewSession() {
+        // 取消当前正在进行的流
+        if (isReceiving) {
+            client.cancelCurrentStream();
+        }
+        isReceiving = false;
+        restoreSendButton();
+        clearStreamRefs();
+
+
+
+        // 创建数据库会话
+        ChatSessionEntity session = DBChatHistoryRepository.createSession("新会话");
+        currentSessionId = session.getId();
+
+        historyLoadedCount = 0;
+        historyTotalCount = 0;
+        isLoadingHistory = false;
+        loadingIndicator = null;
+
+        messagesPanel.removeAll();
+        messagesPanel.revalidate();
+        messagesPanel.repaint();
+
+        // 清空对话历史（保留 system）
+        ChatMessage systemMsg = conversationHistory.isEmpty() ? null : conversationHistory.get(0);
+        conversationHistory.clear();
+        if (systemMsg != null) conversationHistory.add(systemMsg);
+
+        // 重置 token 统计
+        sessionPromptTokens = 0;
+        sessionCompletionTokens = 0;
+        sessionCacheHitTokens = 0;
+        sessionCacheMissTokens = 0;
+        if (tokenStatsLabel != null) tokenStatsLabel.setText("—");
+
+        // 问候语入库并显示
+        ChatMessageEntity messageEntity = new ChatMessageEntity(
+                DBChatHistoryRepository.getUUID(),
+                currentSessionId,
+                Constant.ROLE_assistant,
+                LoongCSettings.getInstance().getSayHello(),
+                (String) null,
+                (String) null,
+                (String) null,
+                (String) null
+        );
+
+        ThreadHelper.executeAsync(project,()-> DBChatHistoryRepository.saveMessage(messageEntity),()->{
+            addAiMessage(LoongCSettings.getInstance().getSayHello());
+        });
+    }
+
+    private void refreshModelCombo() {
+        // 获取最新模型列表
+        List<ModelConfig> models = LoongCSettings.getInstance().getChatModels();
+        System.out.println("models:"+models);
+        if (models == null || models.isEmpty()) {
+            return;
+        }
+
+        // 记住当前选中的模型 ID（如果当前有选中项）
+        String currentSelectedId = null;
+        if (modelCombo.getSelectedIndex() != -1) {
+            currentSelectedId = modelCombo.getItemAt(modelCombo.getSelectedIndex());
+        }
+
+        // 清空并重新填充
+        modelCombo.removeAllItems();
+        for (ModelConfig config : models) {
+            // 你可以选择显示 config.getModelId() 或 config.getName()
+            modelCombo.addItem(config.getName());
+        }
+
+        // 恢复选中项（按 ID 匹配）
+        if (currentSelectedId != null) {
+            for (int i = 0; i < modelCombo.getItemCount(); i++) {
+                if (modelCombo.getItemAt(i).equals(currentSelectedId)) {
+                    modelCombo.setSelectedIndex(i);
+                    break;
+                }
+            }
+        }
+
+        // 如果未选中（比如之前选项被删了），默认选第一个
+        if (modelCombo.getSelectedIndex() == -1 && modelCombo.getItemCount() > 0) {
+            modelCombo.setSelectedIndex(0);
         }
     }
 }

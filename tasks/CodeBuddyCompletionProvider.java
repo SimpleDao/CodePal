@@ -1,7 +1,7 @@
 package com.loongc.completion;
 
 import com.loongc.api.DeepSeekClient;
-import com.loongc.api.model.ChatMessage;
+import com.loongc.model.ChatMessage;
 import com.loongc.settings.CodeBuddySettings;
 import com.intellij.codeInsight.completion.CompletionParameters;
 import com.intellij.codeInsight.completion.CompletionResultSet;

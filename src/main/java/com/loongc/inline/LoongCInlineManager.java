@@ -119,7 +119,7 @@ public class LoongCInlineManager {
         }
 
         LoongCSettings s = LoongCSettings.getInstance();
-        if (!s.isEnableAutoComplete() || !s.isConfigured()) return;
+        if (!s.isEnableSmartAutoComplete() || !s.isConfigured()) return;
 
         cancelDebounce();
 

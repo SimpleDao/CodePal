@@ -33,6 +33,19 @@ public class LoongCToolWindowFactory implements ToolWindowFactory {
 
         // 注册原生 titleActions：使用 AllIcons 图标，显示在工具窗口标题栏
         toolWindow.setTitleActions(Arrays.asList(
+                new AnAction("新建会话", "创建新的聊天会话", AllIcons.General.Add) {
+                    @Override
+                    public void actionPerformed(@NotNull AnActionEvent e) {
+                        chatPanel.createNewSession();
+                    }
+                },
+                new AnAction("历史会话", "查看历史会话列表", AllIcons.Vcs.History) {
+                    @Override
+                    public void actionPerformed(@NotNull AnActionEvent e) {
+                        System.out.println("切换历史会话");
+                        chatPanel.showHistoryPanel();
+                    }
+                },
                 new AnAction("清空对话", "清空当前对话历史", AllIcons.Actions.GC) {
                     @Override
                     public void actionPerformed(@NotNull AnActionEvent e) {

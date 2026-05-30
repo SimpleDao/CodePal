@@ -1,6 +1,7 @@
 plugins {
     id("java")
     id("org.jetbrains.intellij") version "1.17.3"
+
 }
 
 group = "com.loongc"
@@ -18,6 +19,7 @@ dependencies {
     implementation("org.commonmark:commonmark:0.22.0")
     implementation("org.commonmark:commonmark-ext-gfm-tables:0.22.0")
     implementation("org.commonmark:commonmark-ext-gfm-strikethrough:0.22.0")
+    implementation("com.h2database:h2:2.2.224")
 }
 
 java {
@@ -32,7 +34,9 @@ intellij {
     //localPath.set("D:/tools/I-IDEA/IntelliJ IDEA 2026.1")
     //version.set("2023.3.7")
     type.set("IC")
-    plugins.set(listOf())
+    //plugins.set(listOf())
+
+    plugins.set(listOf("java"))
 }
 
 tasks {

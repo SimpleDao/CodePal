@@ -1,4 +1,4 @@
-package com.loongc.api.model;
+package com.loongc.model;
 
 /**
  * 聊天消息模型

@@ -1,10 +1,10 @@
 package com.loongc.api;
 
-import com.loongc.api.model.ChatMessage;
-import com.loongc.api.model.ChatRequest;
-import com.loongc.api.model.ChatResponse;
-import com.loongc.api.model.CompletionRequest;
-import com.loongc.api.model.CompletionResponse;
+import com.loongc.model.ChatMessage;
+import com.loongc.model.ChatRequest;
+import com.loongc.model.ChatResponse;
+import com.loongc.model.CompletionRequest;
+import com.loongc.model.CompletionResponse;
 import com.loongc.settings.LoongCSettings;
 import com.google.gson.Gson;
 import com.intellij.openapi.diagnostic.Logger;
@@ -25,11 +25,13 @@ import java.util.concurrent.TimeUnit;
  */
 public class DeepSeekClient {
     private static final Logger LOG = Logger.getInstance(DeepSeekClient.class);
-    private static final Gson GSON = new Gson();
+
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
-    private final OkHttpClient httpClient;
+    private static final Gson GSON = new Gson();
 
+    private final OkHttpClient httpClient;
+    private okhttp3.sse.EventSource currentEventSource;
     public DeepSeekClient() {
         this.httpClient = new OkHttpClient.Builder()
                 .connectTimeout(30, TimeUnit.SECONDS)
@@ -39,9 +41,12 @@ public class DeepSeekClient {
     }
 
     /**
-     * 发送流式聊天请求
+     * 发送流式聊天请求 （支持工具调用）
+     * 查看工作空间的vue项目
      */
-    public void streamChat(List<ChatMessage> messages, StreamCallback callback) {
+    public void streamChat(List<ChatMessage> messages,
+                           List<ChatRequest.ToolDefinition> tools,
+                           StreamCallback callback) {
         LoongCSettings settings = LoongCSettings.getInstance();
         if (!settings.isConfigured()) {
             callback.onError(new IllegalStateException("请先配置 DeepSeek API Key（Settings -> LoongC）"));
@@ -49,24 +54,36 @@ public class DeepSeekClient {
         }
 
         ChatRequest request = new ChatRequest();
-        request.setModel(settings.getModel());
+        request.setModel(settings.getChatModelName());
         request.setMessages(messages);
         request.setStream(true);
-        request.setMax_tokens(settings.getMaxTokens());
-        request.setTemperature(settings.getTemperature());
+        request.setMax_tokens(settings.getChatMaxTokens());
+        request.setTemperature(settings.getChatTemperature());
+        request.setThinking(true);
+        if (tools != null && !tools.isEmpty()) {
+            request.setTools(tools);
+            request.setTool_choice("auto");
+        }
 
         String jsonBody = GSON.toJson(request);
+        System.out.println("jsonBody = \n"+jsonBody);
         RequestBody body = RequestBody.create(jsonBody, JSON);
 
+
         Request httpRequest = new Request.Builder()
-                .url(settings.getApiBase() + "/v1/chat/completions")
-                .header("Authorization", "Bearer " + settings.getApiKey())
+                .url(settings.getChatApiBase() + "/v1/chat/completions")
+                .header("Authorization", "Bearer " + settings.getChatApiKey())
                 .header("Content-Type", "application/json")
                 .post(body)
                 .build();
 
         EventSource.Factory factory = EventSources.createFactory(httpClient);
-        factory.newEventSource(httpRequest, new EventSourceListener() {
+        currentEventSource = factory.newEventSource(httpRequest, new EventSourceListener() {
+            // 累积本轮 SSE 中的 tool_calls（DeepSeek 流式下 tool_calls 可能分多帧返回）
+            private final java.util.List<ChatMessage.ToolCall> accumulatedToolCalls = new java.util.ArrayList<>();
+            // 1. 新增：流是否已结束的防重入标志
+            private volatile boolean isFinished = false;
+
             @Override
             public void onOpen(EventSource eventSource, Response response) {
                 System.out.println("DeepSeek SSE connection opened");
@@ -74,31 +91,91 @@ public class DeepSeekClient {
 
             @Override
             public void onEvent(EventSource eventSource, String id, String type, String data) {
+                //[DONE] 流完全结束可以关闭
                 if ("[DONE]".equals(data)) {
-                    callback.onComplete();
+                    finishStream(null);
                     return;
                 }
                 try {
                     ChatResponse chatResponse = GSON.fromJson(data, ChatResponse.class);
+//                    System.out.println("chatResponse = \n"+chatResponse);
                     if (chatResponse != null && chatResponse.getChoices() != null
                             && !chatResponse.getChoices().isEmpty()) {
                         ChatResponse.Choice choice = chatResponse.getChoices().get(0);
                         ChatMessage delta = choice.getDelta();
-                        if (delta != null && delta.getContent() != null) {
-                            callback.onMessage(delta.getContent());
+                        if (delta != null) {
+                            // DeepSeek reasoning 模型：先返回 reasoning_content，再返回 content
+                            if (delta.getReasoning_content() != null) {
+                                callback.onReasoning(delta.getReasoning_content());
+                                //System.out.printf("delta.getReasoning_content() = %s%n",delta.getReasoning_content());
+                            }
+                            if (delta.getContent() != null) {
+                                callback.onMessage(delta.getContent());
+                                //System.out.printf("delta.getContent() = %s%n",delta.getContent());
+                            }
+                            if (delta.getTool_calls() != null && !delta.getTool_calls().isEmpty()) {
+                                for (ChatMessage.ToolCall deltaCall : delta.getTool_calls()) {
+                                    // 1. 判断这一帧是不是一个新工具调用的起点（有 id 或者有 function name）
+
+                                    boolean isNewCall = deltaCall.getId() != null ||
+                                            (deltaCall.getFunction() != null && deltaCall.getFunction().getName() != null);
+
+                                    if (isNewCall) {
+                                        System.out.printf("deltaCall.getFunction() = %s%n",deltaCall.getFunction().getName());
+                                        // 如果是新工具，直接放入累积列表
+                                        accumulatedToolCalls.add(deltaCall);
+                                    } else {
+                                        // 2. 如果是参数碎片（没有 id/name，只有 arguments），追加到最新一个工具的 arguments 中
+                                        if (!accumulatedToolCalls.isEmpty()) {
+                                            ChatMessage.ToolCall lastCall = accumulatedToolCalls.get(accumulatedToolCalls.size() - 1);
+                                            if (deltaCall.getFunction() != null && deltaCall.getFunction().getArguments() != null) {
+                                                if (lastCall.getFunction() != null) {
+                                                    String oldArgs = lastCall.getFunction().getArguments();
+                                                    // 增量拼接字符串
+                                                    lastCall.getFunction().setArguments((oldArgs == null ? "" : oldArgs) + deltaCall.getFunction().getArguments());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        System.out.println("choice.getFinish_reason() + "+choice.getFinish_reason());
+                        //System.out.println("choice.getFinish_reason() + "+choice.getFinish_reason());
+                        //截断原因：tool_calls error cancelled  如果遇到工具调用，这里也会被执行
                         if (choice.getFinish_reason() != null) {
                             // 最后一帧：先回调 usage（如果有），再回调 onComplete
                             if (chatResponse.getUsage() != null) {
                                 callback.onUsage(chatResponse.getUsage());
                             }
-                            callback.onComplete();
+                            finishStream(choice.getFinish_reason());
                         }
                     }
                 } catch (Exception e) {
                     LOG.warn("Failed to parse SSE data: " + data, e);
                 }
+            }
+
+            //流结束 或者 被某种原因截断
+            private void finishStream(String finishReason) {
+                System.out.println("finishStream = "+finishReason);
+                if (isFinished) return;
+                isFinished = true;
+
+                if ("tool_calls".equals(finishReason) || !accumulatedToolCalls.isEmpty()) {
+                    callback.onToolCalls(accumulatedToolCalls);
+                } else if ("length".equals(finishReason)) {
+                    callback.onError(new RuntimeException("模型生成内容超过单次最大 Token 限制。"));
+                } else if ("content_filter".equals(finishReason)) {
+                    callback.onError(new RuntimeException("生成内容涉嫌敏感信息，已被安全策略拦截。"));
+                } else {
+                    // 包含 "stop" 或 null 兜底
+                    callback.onComplete();
+                }
+//                if (!accumulatedToolCalls.isEmpty()) {
+//                    callback.onToolCalls(accumulatedToolCalls);  //有工具调用
+//                } else {
+//                    callback.onComplete();
+//                }
             }
 
             @Override
@@ -116,10 +193,17 @@ public class DeepSeekClient {
 
             @Override
             public void onClosed(EventSource eventSource) {
-                LOG.info("DeepSeek SSE connection closed");
+                System.out.println("DeepSeek SSE connection closed");
             }
         });
     }
+
+    /**
+     * 兼容旧接口：不带工具的流式聊天
+     */
+//    public void streamChat(List<ChatMessage> messages, StreamCallback callback) {
+//        streamChat(messages, null, callback);
+//    }
 
     /**
      * 非流式聊天请求
@@ -131,18 +215,18 @@ public class DeepSeekClient {
         }
 
         ChatRequest request = new ChatRequest();
-        request.setModel(settings.getModel());
+        request.setModel(settings.getChatModelName());
         request.setMessages(messages);
         request.setStream(false);
-        request.setMax_tokens(settings.getMaxTokens());
-        request.setTemperature(settings.getTemperature());
+        request.setMax_tokens(settings.getChatMaxTokens());
+        request.setTemperature(settings.getChatTemperature());
 
         String jsonBody = GSON.toJson(request);
         RequestBody body = RequestBody.create(jsonBody, JSON);
 
         Request httpRequest = new Request.Builder()
-                .url(settings.getApiBase() + "/v1/chat/completions")
-                .header("Authorization", "Bearer " + settings.getApiKey())
+                .url(settings.getChatApiBase() + "/v1/chat/completions")
+                .header("Authorization", "Bearer " + settings.getChatApiKey())
                 .header("Content-Type", "application/json")
                 .post(body)
                 .build();
@@ -182,7 +266,7 @@ public class DeepSeekClient {
 
         String apiKey  = s.getEffectiveCompletionApiKey();
         String apiBase = s.getEffectiveCompletionApiBase();
-        String model   = s.getCompletionModel();
+        String model   = s.getCompletionModelName();
 
         // 构建 FIM prompt
         String fimPrompt = "<|fim_prefix|>" + before
@@ -258,6 +342,17 @@ public class DeepSeekClient {
     }
 
     /**
+     * 取消当前正在进行的流式请求
+     */
+    public void cancelCurrentStream() {
+        if (currentEventSource != null) {
+            currentEventSource.cancel();
+            currentEventSource = null;
+            LOG.info("Stream cancelled by user");
+        }
+    }
+
+    /**
      * FIM 流式回调接口
      */
     public interface FIMCallback {
@@ -273,8 +368,15 @@ public class DeepSeekClient {
      * 流式响应回调接口
      */
     public interface StreamCallback {
+        /** 收到普通文本流式块 */
         void onMessage(String content);
+        /** 收到思考过程流式块（DeepSeek reasoning 模型特有） */
+        void onReasoning(String reasoning);
+        /** 流式结束且无工具调用时触发 */
         void onComplete();
+        /** 流式结束但检测到工具调用时触发 */
+        void onToolCalls(List<ChatMessage.ToolCall> toolCalls);
+        /** 发生错误时触发 */
         void onError(Throwable error);
         /**
          * 收到 token 用量统计时回调（通常在最后一帧，即 finish_reason != null 时触发）

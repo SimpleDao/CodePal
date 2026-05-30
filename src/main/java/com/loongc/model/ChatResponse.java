@@ -1,4 +1,4 @@
-package com.loongc.api.model;
+package com.loongc.model;
 
 import java.util.List;
 
@@ -64,6 +64,16 @@ public class ChatResponse {
         public void setMessage(ChatMessage message) { this.message = message; }
         public String getFinish_reason() { return finish_reason; }
         public void setFinish_reason(String finish_reason) { this.finish_reason = finish_reason; }
+
+        @Override
+        public String toString() {
+            return "Choice{" +
+                    "index=" + index +
+                    ", delta=" + delta +
+                    ", message=" + message +
+                    ", finish_reason='" + finish_reason + '\'' +
+                    '}';
+        }
     }
 
     public String getId() { return id; }
@@ -78,4 +88,16 @@ public class ChatResponse {
     public void setChoices(List<Choice> choices) { this.choices = choices; }
     public Usage getUsage() { return usage; }
     public void setUsage(Usage usage) { this.usage = usage; }
+
+    @Override
+    public String toString() {
+        return "ChatResponse{" +
+                "id='" + id + '\'' +
+                ", object='" + object + '\'' +
+                ", created=" + created +
+                ", model='" + model + '\'' +
+                ", choices=" + choices +
+                ", usage=" + usage +
+                '}';
+    }
 }
