@@ -1,6 +1,6 @@
 # CodePal Assistant — IntelliJ 平台 AI 编程助手插件
 
-CodePal Assistant 是一款运行在 IntelliJ IDEA（以及 Android Studio 等自带 Java 模块的 IntelliJ 平台 IDE）中的 AI 编程助手插件。它把大模型对话、代码生成、文件编辑、数据源查询、任务待办与项目上下文分析整合进一个侧边栏工具窗口，支持 **OpenAI 兼容**与 **Anthropic** 两种接口协议，并能接入 **MCP** 工具生态。
+CodePal Assistant 是一款运行在 IntelliJ IDEA（以及 Android Studio 等自带 Java 模块的 IntelliJ 平台 IDE）中的 AI 编程助手插件。它把大模型对话、代码生成、文件编辑、数据源查询、任务待办与项目上下文分析整合进一个侧边栏工具窗口，支持 **OpenAI **与 **Anthropic** 两种接口协议，并能接入Skill生态与 **MCP** 生态。
 
 > 开源地址：https://github.com/SimpleDao/CodePal.git
 > Marketplace 插件 ID：`com.loongc.plugin`（Java 包名：`com.codepal`）
