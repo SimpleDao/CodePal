@@ -1,0 +1,79 @@
+<idea-plugin>
+    <id>com.loongc.plugin</id>
+    <name>CodePal Assistant</name>
+    <version>2.1.3</version>
+    <vendor url="https://github.com/SimpleDao/CodePal.git" email="1838327804@qq.com">CodePal</vendor>
+    <description><![CDATA[
+This is an AI programming assistant plugin for IntelliJ IDEA and Android Studio.
+It integrates AI chat, file editing, project context awareness, MCP tools, todo management and inline ghost-text completion, supporting both OpenAI-compatible and Anthropic APIs.
+<br/><br/>
+这是一款适用于 IntelliJ IDEA 和 Android Studio 的 AI 编程助手插件。
+集成 AI 聊天、文件编辑、项目上下文感知、MCP 工具、待办管理与内联幽灵文本补全，同时支持 OpenAI-API与Anthropic-API。
+    ]]></description>
+
+    <idea-version since-build="232"/>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.lang</depends>
+    <depends>com.intellij.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- 工具窗口 -->
+        <toolWindow id="CodePal"
+                    anchor="right"
+                    secondary="true"
+                    icon="/icons/codepal.svg"
+                    factoryClass="com.codepal.toolwindow.CPToolWindowFactory"/>
+
+        <!-- 幽灵文本：监听每个编辑器的文档变化，驱动内联补全 -->
+        <editorFactoryListener
+                implementation="com.codepal.inline.CPEditorListener"/>
+
+        <!-- 幽灵文本：拦截 Tab 键，有活跃幽灵文本时接受补全 -->
+        <editorActionHandler action="EditorTab"
+                             id="CP.EditorTabHandler"
+                             implementationClass="com.codepal.inline.CPTabHandler"
+                             order="first"/>
+
+        <!-- 设置页面：CP 父节点 -->
+        <applicationConfigurable
+                parentId="tools"
+                instance="com.codepal.settings.CPSettingsConfigurable"
+                id="com.codepal.settings.CPSettingsConfigurable"
+                displayName="CodePal"/>
+
+        <!-- 设置页面：CP 子节点 — General -->
+        <applicationConfigurable
+                parentId="com.codepal.settings.CPSettingsConfigurable"
+                instance="com.codepal.settings.CPGeneralConfigurable"
+                id="com.codepal.settings.CPGeneralConfigurable"
+                displayName="General"/>
+
+        <!-- 设置页面：CP 子节点 — MCP -->
+        <applicationConfigurable
+                parentId="com.codepal.settings.CPSettingsConfigurable"
+                instance="com.codepal.settings.CPMcpConfigurable"
+                id="com.codepal.settings.CPMcpConfigurable"
+                displayName="MCP"/>
+
+        <applicationService
+                serviceImplementation="com.codepal.settings.CPSettings"/>
+    </extensions>
+
+    <actions>
+        <action id="CP.OpenChat"
+                class="com.codepal.actions.OpenChatAction"
+                text="打开 CodePal 聊天"
+                description="打开 CodePal AI 助手聊天窗口">
+            <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift C"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+
+        <action id="CP.ReportIssue"
+                class="com.codepal.actions.ReportIssueAction"
+                text="CodePal 反馈 / 报告问题"
+                description="提交反馈或报告 CodePal 插件的问题">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>

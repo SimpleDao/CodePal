@@ -1,0 +1,33 @@
+# Project exclude paths
+/.gradle/
+/.intellijPlatform/
+/build/
+/build/classes/java/main/
+/.skills/
+/idea/
+/mcp
+/mcp/
+/bin/
+/tasks/
+/.codebuddy
+/auto-dev-master/
+/github-copilot-source/
+/docs/
+/temp/
+/tmp_extract/
+
+# 插件签名密钥（绝不提交）
+private.pem
+chain.crt
+*.pem
+*.crt
+signing.env
+openssl_min.cnf
+
+# 本地构建/调试日志（不提交）
+build_sign.log
+toolchains.log
+*.log
+
+# 本地离线签名器 jar（从阿里云镜像获取，见 build.gradle.kts 注释，不提交）
+/libs/
