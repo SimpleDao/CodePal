@@ -4540,10 +4540,13 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
     }
 
-    /** 在附件条上加一个可移除的 chip（带真实缩略图） */
+    /**
+     * 附件数据已加入 pendingAttachments 后调用：重建附件条。
+     * chip 一律由 refreshAttachStrip() 从数据源重建，此处不再手动 add，
+     * 避免数据与 UI 两份容器不同步（旧图残留/累加）。
+     */
     private void addAttachmentChip(ChatMessage.Attachment a) {
         if (attachStrip == null || attachChips == null) return;
-        attachChips.add(new AttachmentChip(a));
         refreshAttachStrip();
     }
 
@@ -4611,7 +4614,6 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             remove.setVisible(false); // 收起态不可见，避免隐形 × 覆盖相邻缩略图拦截点击
             remove.addActionListener(e -> {
                 pendingAttachments.remove(a);
-                attachChips.remove(AttachmentChip.this);
                 refreshAttachStrip();
             });
 
@@ -4831,8 +4833,17 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     /** 无附件时隐藏附件条 */
+    /**
+     * 按 pendingAttachments 重建整条附件条（唯一真源）。
+     * 之前只切可见性、不清 chip，导致发送后旧 chip 残留在容器里，
+     * 下一轮粘贴时旧图会重新显示并逐轮累加。
+     */
     private void refreshAttachStrip() {
-        if (attachStrip == null) return;
+        if (attachStrip == null || attachChips == null) return;
+        attachChips.removeAll();
+        for (ChatMessage.Attachment a : pendingAttachments) {
+            attachChips.add(new AttachmentChip(a));
+        }
         attachStrip.setVisible(!pendingAttachments.isEmpty());
         attachStrip.revalidate();
         attachStrip.repaint();
