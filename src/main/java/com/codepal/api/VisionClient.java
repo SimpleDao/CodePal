@@ -33,10 +33,14 @@ public class VisionClient {
     private static final Gson GSON = new Gson();
     private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 
+    /**
+     * 视觉请求的超时需明显长于主模型客户端（DeepSeekClient/AnthropicClient 为 120s）：
+     * 视觉链路多了「图片压缩 + 大 base64 上传 + 视觉模型推理」，60s 会因推理慢而超时。
+     */
     private final OkHttpClient httpClient = new OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(180, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
             .build();
 
     /**
@@ -111,6 +115,7 @@ public class VisionClient {
         System.out.println("[VisionClient] 发起 HTTP 请求 url=" + url + " model=" + model.getName()
                 + " 累计耗时=" + (System.currentTimeMillis() - t0) + "ms");
         try (Response resp = httpClient.newCall(reqBuilder.build()).execute()) {
+            // 注意：OkHttp 超时会抛 SocketTimeoutException（IOException 子类），由调用方捕获
             System.out.println("[VisionClient] HTTP 请求完成 耗时=" + (System.currentTimeMillis() - t0)
                     + "ms HTTP=" + resp.code());
             if (!resp.isSuccessful() || resp.body() == null) {

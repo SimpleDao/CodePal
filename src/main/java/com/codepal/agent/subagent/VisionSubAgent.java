@@ -52,6 +52,10 @@ public class VisionSubAgent extends SubAgent<VisionSubAgent.VisionTask, AgentRes
                     .content("【视觉子智能体返回的图片内容】\n" + desc)
                     .addMetadata("imagePath", task.imagePath)
                     .build();
+        } catch (java.net.SocketTimeoutException e) {
+            // 超时单独提示：告诉用户是超时而非配置错误，并给出可操作建议
+            return AgentResult.error("查看图片超时（视觉模型响应超过 180 秒）。"
+                    + "请检查视觉模型的 apiBase 是否可达、模型是否支持视觉，或换用更快的视觉模型/更小的图片。");
         } catch (Exception e) {
             return AgentResult.error("查看图片失败：" + e.getMessage());
         }

@@ -15,6 +15,7 @@
 /docs/
 /temp/
 /tmp_extract/
+/org/
 
 # 插件签名密钥（绝不提交）
 private.pem
