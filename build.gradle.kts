@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.codepal"
-version = "2.1.8"
+version = "2.2.1"
 
 repositories {
     maven { url = uri("https://maven.aliyun.com/repository/public") }
@@ -87,6 +87,22 @@ tasks {
     }
 
     publishPlugin {
-        token.set(System.getenv("PUBLISH_TOKEN"))
+        // Token 读取顺序：环境变量 PUBLISH_TOKEN → 项目根目录 publish.properties。
+        // 后者是本地私密文件（已在 .gitignore 忽略），这样 IDEA Gradle 面板
+        // 双击 publishPlugin 就能直接发布，无需命令行设环境变量。
+        token.set(
+            providers.environmentVariable("PUBLISH_TOKEN")
+                .orElse(providers.provider {
+                    // 直接按 key=value 解析（build.gradle.kts 里 java.* 标识符有冲突，不用 Properties）
+                    val f = rootProject.file("publish.properties")
+                    if (f.exists()) {
+                        f.readLines()
+                            .firstOrNull { it.trim().startsWith("PUBLISH_TOKEN=") }
+                            ?.substringAfter("PUBLISH_TOKEN=")
+                            ?.trim()
+                            ?.takeIf { it.isNotEmpty() }
+                    } else null
+                })
+        )
     }
 }

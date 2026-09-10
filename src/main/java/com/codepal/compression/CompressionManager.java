@@ -31,8 +31,12 @@ import java.util.stream.Collectors;
  */
 public class CompressionManager {
 
-    /** 压缩 LLM 调用超时（秒）：关闭 thinking 后，纯生成 ~500token 远超足够 */
-    private static final long COMPRESS_TIMEOUT_SECONDS = 60;
+    /**
+     * 压缩 LLM 调用超时（秒）。不能设太短：压缩要把整段历史发给模型，
+     * 上下文越大 prefill 越久，再叠加模型生成时间（TPS 低的网关 8K 输出要 3 分钟+）。
+     * 300 秒对流式足够宽裕（HTTP readTimeout 120s 只限"无数据间隔"，不受总时长约束）。
+     */
+    private static final long COMPRESS_TIMEOUT_SECONDS = 300;
 
     private final Project project;
 
@@ -84,7 +88,7 @@ public class CompressionManager {
         long contextWindowTokens
     ) {
         int oldCount = messages.size();
-        statusConsumer.accept("正在分析对话历史...");
+        statusConsumer.accept("正在分析对话历史");
 
         // 1. 找出分割点：按 token 预算保留最近上下文（不看消息条数）
         SplitPlan plan = planSplit(messages, contextWindowTokens);
@@ -112,7 +116,7 @@ public class CompressionManager {
             return new CompressionResult(false, "没有可压缩的消息", oldCount, oldCount);
         }
 
-        statusConsumer.accept("正在生成对话摘要（约需5-15秒）...");
+        statusConsumer.accept("正在生成对话摘要（约需5-15秒）");
 
         // 3. 调用 LLM 生成摘要（不降级，失败直接抛异常）
         String summary;
@@ -130,27 +134,37 @@ public class CompressionManager {
             throw new RuntimeException("LLM 返回的摘要中未找到有效的 <state_snapshot> 标签");
         }
 
-        // 4. 重建消息列表
+        // 4. 重建消息列表（先构建到本地，再做「防膨胀」校验，避免摘要反而更占 token）
         // 保留最近的消息
         List<ChatMessage> recentMessages = new ArrayList<>(messages.subList(splitPoint, messages.size()));
 
-        messages.clear();
-
+        List<ChatMessage> newMessages = new ArrayList<>();
         // 先加 system messages
         for (ChatMessage sysMsg : systemMessages) {
-            messages.add(sysMsg);
+            newMessages.add(sysMsg);
         }
-
         // LLM 摘要成功
         String fullSummary = CompressionPrompts.MEMORY_SUMMARY_PREFIX + summary;
-        messages.add(new ChatMessage("user", fullSummary));
-        statusConsumer.accept("摘要生成完成，正在重建上下文...");
-
+        newMessages.add(new ChatMessage("user", fullSummary));
+        statusConsumer.accept("摘要生成完成，正在重建上下文");
         // 加回最近的消息
-        messages.addAll(recentMessages);
+        newMessages.addAll(recentMessages);
+
+        // 防膨胀校验（参考 auto-dev ChatCompressionService 的 INFLATED_TOKEN_COUNT 保护）：
+        // 若压缩后 token 未减少，则放弃本次压缩、保留原历史，防止更差的快照雪上加霜。
+        long oldTokens = sumTokens(messages);
+        long newTokens = sumTokens(newMessages);
+        if (newTokens >= oldTokens) {
+            return new CompressionResult(false,
+                "压缩后 token 未减少（" + newTokens + " ≥ " + oldTokens + "），放弃本次压缩以免上下文更膨胀",
+                oldCount, oldCount);
+        }
+
+        messages.clear();
+        messages.addAll(newMessages);
 
         int newCount = messages.size();
-        String msg = "压缩完成：" + oldCount + " → " + newCount + " 条消息";
+        String msg = "压缩完成：" + oldCount + " → " + newCount + " 条消息（约 " + oldTokens + " → " + newTokens + " tokens）";
 
         // 找到第一条保留消息的 qaRound（用于 DB 标记压缩范围）
         int firstPreservedQaRound = 0;
@@ -255,7 +269,7 @@ public class CompressionManager {
      * 口径与 ChatPanel.estimateSessionTokens 一致（≈ 字符数 / 1.6），
      * 保证圆环显示的占用量与压缩切分用的是同一把尺子。
      */
-    private static long estimateMessageTokens(ChatMessage m) {
+    public static long estimateMessageTokens(ChatMessage m) {
         long chars = 0;
         if (m.getContent() != null) chars += m.getContent().length();
         if (m.getReasoning_content() != null) chars += m.getReasoning_content().length();
@@ -268,6 +282,26 @@ public class CompressionManager {
             }
         }
         return Math.max(0, chars / 16 * 10);
+    }
+
+    /** 估算整段消息列表的 token 总量（口径同 estimateMessageTokens） */
+    private static long sumTokens(List<ChatMessage> msgs) {
+        long total = 0;
+        for (ChatMessage m : msgs) total += estimateMessageTokens(m);
+        return total;
+    }
+
+    /** 用户是否请求取消当前压缩（压缩可能耗时数分钟，必须允许中止） */
+    private static final java.util.concurrent.atomic.AtomicBoolean COMPRESS_CANCELLED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** 当前压缩的 future，供取消时中断等待 */
+    private static volatile CompletableFuture<String> currentCompressFuture = null;
+
+    /** 取消正在进行的压缩：中断等待并置标志（底层 HTTP 流会被丢弃，不影响 UI 可用性） */
+    public static void cancelCompress() {
+        COMPRESS_CANCELLED.set(true);
+        CompletableFuture<String> f = currentCompressFuture;
+        if (f != null) f.cancel(true);
     }
 
     /**
@@ -300,6 +334,8 @@ public class CompressionManager {
         compressMessages.add(new ChatMessage("user", userPrompt));
 
         CompletableFuture<String> future = new CompletableFuture<>();
+        COMPRESS_CANCELLED.set(false);
+        currentCompressFuture = future;   // 注册，供 cancelCompress() 中断
         StringBuilder resultBuilder = new StringBuilder();
         AtomicReference<String> errorRef = new AtomicReference<>();
 
@@ -354,8 +390,16 @@ public class CompressionManager {
             return future.get(COMPRESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
             throw new RuntimeException("摘要生成超时（" + COMPRESS_TIMEOUT_SECONDS + "秒）", e);
+        } catch (java.util.concurrent.CancellationException e) {
+            // 用户点了停止：明确区分"主动取消"，避免显示成普通失败让用户以为出错
+            if (COMPRESS_CANCELLED.get()) {
+                throw new RuntimeException("已取消压缩", e);
+            }
+            throw new RuntimeException("摘要生成失败: 请求被取消", e);
         } catch (Exception e) {
             throw new RuntimeException("摘要生成失败: " + (errorRef.get() != null ? errorRef.get() : e.getMessage()), e);
+        } finally {
+            currentCompressFuture = null;
         }
     }
 

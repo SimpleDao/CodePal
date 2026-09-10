@@ -16,10 +16,10 @@ public final class CompressionPrompts {
      * <p>压缩完全由上下文占用量驱动，不再按消息条数切分：从最新消息往前累积，
      * 累计 token 达到该预算即停止，其之前的消息进入摘要。
      *
-     * <p>设为 0.35：压缩后最近上下文约占窗口 35%，加上摘要仍有充足余量，
-     * 避免压完立刻又逼近阈值。
+     * <p>设为 0.20：压缩后最近上下文约占窗口 20%，进一步压低保留区工具噪声上限，
+     * 多出的部分自动进入 LLM 摘要（无损提炼），且配合滑动窗口重触发，保留区不会无限增长。
      */
-    public static final double RECENT_CONTEXT_RATIO = 0.35;
+    public static final double RECENT_CONTEXT_RATIO = 0.20;
 
     /**
      * 保留的最近上下文，占「当前对话总 token」的比例上限。

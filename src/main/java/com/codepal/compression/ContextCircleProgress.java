@@ -78,6 +78,11 @@ public class ContextCircleProgress extends JButton {
     public void setMaxContextTokens(long maxTokens) {
         if (maxTokens > 0) {
             this.maxContextTokens = maxTokens;
+            // 分母变了必须按新分母重算占比并刷新绘制，否则切换模型后
+            // 圆环占比仍是按旧分母算出的值、且不会 repaint（看起来毫无变化）。
+            this.percentage = Math.min(1f, Math.max(0f, (float) currentTokens / maxContextTokens));
+            updateTooltip(currentTokens);
+            repaint();
         }
     }
 

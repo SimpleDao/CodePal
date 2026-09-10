@@ -329,7 +329,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // 上下文压缩
     private com.codepal.compression.ContextCircleProgress contextCircle;
     private com.codepal.compression.CompressionManager compressionManager;
-    private boolean compressionHintShown = false; // 阈值提示是否已显示过
+    private boolean compressionHintShown = false; // 阈值提示是否已弹出（冷却期内为 true）
+    private static final int COMPRESSION_HINT_COOLDOWN_ROUNDS = 5; // 点「否」或压缩后，需间隔多少轮才再次提示
+    private int compressionHintCooldown = 0; // 剩余冷却回合数
     private boolean taskWasInterrupted = false;    // 用户点击停止中断了任务，下次发送时插入上下文切换
     private String pendingLoadingMsgKey = "ai_loading"; // 下一轮 sendToApi 使用的轮播提示词分类
 
@@ -374,6 +376,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     private int    ctxEndLine     = -1;
 
     private boolean isCompressing      = false;
+    /** 用户主动取消了本次压缩（异步回调据此避免把"已取消"显示成失败） */
+    private boolean compressCancelled  = false;
 
     // 当前会话累计 token 用量（用于费用统计，每次请求都会把完整对话作为 prompt 重发，故应累加）
     private int sessionPromptTokens      = 0;
@@ -1645,19 +1649,16 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 禁用按钮，防止重复点击
         contextCircle.setEnabled(false);
 
-        // 压缩期间禁止发送按钮
+        // 压缩期间：发送按钮变"停止"（可点击中止），输入框保持可编辑
         isCompressing = true;
+        compressCancelled = false;
         if (sendBtn != null) {
             sendBtn.setIcon(stopIconGhost);
-            sendBtn.setToolTipText("对话压缩中...");
-        }
-        if (inputField != null) {
-            inputField.setEditable(false);
-            inputField.setBackground(inputFieldBg().darker());
+            sendBtn.setToolTipText("停止压缩");
         }
 
         // 在聊天区显示压缩进度卡片
-        chatWebView.showCompressCard("正在分析对话历史...");
+        chatWebView.showCompressCard("正在分析对话历史");
 
         // 后台执行压缩（异常直接提示到消息窗，让用户重试）
         final long myGen = streamRenderController.getStreamGeneration();
@@ -1695,6 +1696,13 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 restoreSendButton();
                 restoreInputField();
 
+                if (compressCancelled) {
+                    // 已由 cancelCompress() 提示过，这里不再覆盖成"压缩失败"
+                    compressCancelled = false;
+                    compressionHintShown = false;
+                    return;
+                }
+
                 if (result.success) {
                     // 持久化压缩状态到 DB
                     String sessionId = chatSessionManager.getCurrentSessionId();
@@ -1728,6 +1736,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     /**
+     * 中止正在进行的压缩：通知 CompressionManager 中断等待，并立即恢复 UI，
+     * 让用户能继续输入/发送，不必干等到超时（压缩最长 300 秒）。
+     */
+    private void cancelCompress() {
+        compressCancelled = true;
+        com.codepal.compression.CompressionManager.cancelCompress();
+        isCompressing = false;
+        if (contextCircle != null) {
+            contextCircle.setEnabled(true);
+        }
+        restoreSendButton();
+        restoreInputField();
+        chatWebView.updateCompressCard("已取消压缩", false, true);
+        if (contextCircle != null) {
+            contextCircle.setToolTipText("压缩已取消，点击重新压缩");
+        }
+    }
+
+    /**
      * 压缩成功 / 会话加载后刷新圆环。
      * 此时真实 usage 累计已失效（历史被裁剪/尚未累积），统一用 estimateSessionTokens() 兜底估算，
      * 与 onComplete 兜底刷新保持同一口径（~1.6 字符/token）。
@@ -1741,12 +1768,21 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * 检查是否需要提示用户压缩（超过阈值时提示一次）
      */
     private void checkCompressionHint() {
-        if (compressionHintShown) return;
         if (streamRenderController != null && streamRenderController.isReceiving()) return;
+        if (compressionHintShown) {
+            // 提示已弹出过：进入冷却期，避免点「否」后永久静音，也避免每轮都弹窗骚扰。
+            // 冷却回合递减，归零后重新武装，下次越过阈值会再次提示。
+            if (compressionHintCooldown > 0) {
+                compressionHintCooldown--;
+                return;
+            }
+            compressionHintShown = false;
+        }
         long used = usedContextTokens();
         long limit = contextCircle.getMaxContextTokens();
         if (compressionManager.shouldCompressByUsage(used, limit)) {
             compressionHintShown = true;
+            compressionHintCooldown = COMPRESSION_HINT_COOLDOWN_ROUNDS;
             int pct = limit > 0 ? (int) (used * 100 / limit) : 0;
             ApplicationManager.getApplication().invokeLater(() -> {
                 int choice = Messages.showYesNoDialog(project,
@@ -1759,6 +1795,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     // 已在此处确认过，跳过 handleCompress 内部的第二个确认框
                     handleCompress(true);
                 }
+                // 点「否」不重置 compressionHintShown：冷却结束后（且用量仍超阈值）会再次提示，
+                // 不再永久静音。
             });
         }
     }
@@ -1768,10 +1806,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // ─────────────────────────────────────────────────────────────────────────
 
     private void sendMessage() {
+        // 压缩期间的"停止"判断必须放在最前：若放在空文本检查之后，
+        // 输入框为空时 1797 行直接 return，停止按钮永远无效（上一轮的顺序错误）
+        if (isCompressing) {
+            cancelCompress();
+            return;
+        }
+
         String text = inputField.getText().trim();
         if (text.isEmpty() && (streamRenderController == null || !streamRenderController.isReceiving())) return;
-
-        if (isCompressing) return;  // 压缩期间禁止发送
 
         if (streamRenderController != null && streamRenderController.isReceiving()) {
             streamRenderController.setReceiving(false);
@@ -5003,9 +5046,14 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             String system = sys != null && sys.getContent() != null ? sys.getContent() : "";
             JsonArray history = new JsonArray();
             java.util.Set<Integer> qaRounds = new java.util.HashSet<>();
+            // 本次发送总 token（展示级估算，口径与圆环/压缩一致：字符数/16*10 ≈ /1.6）
+            long totalTokens = sys != null
+                    ? com.codepal.compression.CompressionManager.estimateMessageTokens(sys) : 0;
             for (com.codepal.model.ChatMessage m : conversationManager.getMessages()) {
                 if ("system".equals(m.getRole())) continue;
                 qaRounds.add(m.getQaRound());
+                // 按原始 content 估算（下方 c 是截断后的显示副本，不能用它算 token）
+                totalTokens += com.codepal.compression.CompressionManager.estimateMessageTokens(m);
                 String c = m.getContent();
                 if (c == null) c = "";
                 if (c.length() > 2000) c = c.substring(0, 2000) + " …(截断)";
@@ -5016,6 +5064,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             o.add("history", history);
             o.addProperty("userMessage", userText != null ? userText : "");
             o.addProperty("messageCount", qaRounds.size() + 1);
+            totalTokens += Math.max(0, (userText != null ? userText.length() : 0) / 16 * 10);
+            o.addProperty("totalTokens", totalTokens);
             outgoingPayloads.put(msgId, o.toString());
         } catch (Exception ignored) {
             // 不影响主对话流程
