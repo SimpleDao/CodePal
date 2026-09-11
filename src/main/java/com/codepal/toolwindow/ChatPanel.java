@@ -588,7 +588,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
         // 模型下拉框：底部"＋ 配置补全模型"和"＋ 配置自定义模型"选项
         // 使用自定义ModelComboBox，在setSelectedItem层面拦截添加项，防止其被选中
-        final String ADD_COMPLETION_ITEM = " 配置补全模型";
+        final String ADD_COMPLETION_ITEM = completionComboLabel();
         final String ADD_CHAT_ITEM = " 配置自定义模型";
         modelCombo = new ModelComboBox(buildModelComboItems(ADD_COMPLETION_ITEM, ADD_CHAT_ITEM, visionComboLabel()),
                 item -> {
@@ -1939,6 +1939,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         message.setQaRound(chatSessionManager.getCurrentQaRound());
         message.setCreatedAt(System.currentTimeMillis());
         message.setUpdatedAt(System.currentTimeMillis());
+        // 负载快照原样入库（captureOutgoingPayload 生成的同一份 JSON → token_usage 列），
+        // 重启加载会话时按 msgId 回填 outgoingPayloads，悬浮查看原样复现。
+        message.setTokenUsage(outgoingPayloads.get(userMsgId));
         com.codepal.model.MessagePartEntity userTextPart = com.codepal.model.MessagePartEntity.text(
                 message.getId(), chatSessionManager.getCurrentSessionId(), text, 0);
         chatSessionManager.persistMessageWithParts(message, java.util.Collections.singletonList(userTextPart));
@@ -3003,12 +3006,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 maybeDeferredSwitch();
                                 return;
                             }
+                            String assistantMsgId = null;
                             if (hasContent || hasReasoning) {
-                                persistPartialAssistant(sendSrc, sendConvMgr, sendSessionId);
+                                assistantMsgId = persistPartialAssistant(sendSrc, sendConvMgr, sendSessionId);
                             }
-                            // 挂上「本轮回答 token 消耗」到助手消息底部（finalize 之前，此时 lcStreamingMsgId 仍有效）
-                            sendWebView.attachTokenInfo(
-                                    buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens));
+                            // 挂上「本轮回答 token 消耗」到助手消息底部（finalize 之前，此时 lcStreamingMsgId 仍有效）。
+                            // 同一份 JSON 原样落库（messages.token_usage 单列 UPDATE，不触碰其它字段），
+                            // 重启后回放按此复现，保证看到的 chip 与当时完全一致。
+                            String answerTokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
+                            sendWebView.attachTokenInfo(answerTokenJson);
+                            if (assistantMsgId != null && answerTokenJson != null) {
+                                final String msgIdFinal = assistantMsgId; // lambda 要求事实最终变量
+                                ThreadHelper.executeAsync(project, () -> com.codepal.db.DBChatHistoryRepository
+                                        .updateTokenUsage(msgIdFinal, answerTokenJson), null);
+                            }
                             // ★ 根因修复：onComplete 此前漏调 finalizeAiMessage，导致 JS 气泡停留在最后一次
                             //   renderAiStream 的快照（库里完整 / 窗口截断 / 复制按钮不显示）。
                             //   必须放在 persistPartialAssistant 之后（已落库）、clearStreamRefs 之前
@@ -4071,11 +4082,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * 仅当有正文或思考内容时才落库——纯断线无内容时不硬塞空消息，避免污染下一轮上下文。
      * onComplete / onError / handleTurnTimeout 共用，消除「出错丢消息」不一致。
      */
-    private void persistPartialAssistant(StreamRenderController src, ConversationManager convMgr, String sessionId) {
+    /** @return 落库的助手消息 id（未落库返回 null），供调用方对 token_usage 做单列补写 */
+    private String persistPartialAssistant(StreamRenderController src, ConversationManager convMgr, String sessionId) {
         boolean hasContent = !src.getCurrentAiRawText().isEmpty();
         boolean hasReasoning = src.getCurrentReasoning().length() > 0;
-        if (!hasContent && !hasReasoning) return;
-
+        if (!hasContent && !hasReasoning) return null;
         ChatMessage assistant = new ChatMessage("assistant", src.getCurrentAiRawText());
         if (hasReasoning) {
             assistant.setReasoning_content(src.getCurrentReasoning().toString());
@@ -4104,6 +4115,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     src.getCurrentAiRawText(), finalPartSeq++));
         }
         chatSessionManager.persistMessageWithParts(finalMsgEntity, finalParts);
+        return finalMsgId;
     }
 
     /**
@@ -5933,6 +5945,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     || content.startsWith("[SYSTEM NUDDGE]")) return;
             chatWebView.resetAiStream();
             addHistoryUserMessage(content, rec.getQaRound(), rec.getId());
+            // 负载快照原样回填内存 Map（悬浮懒查按 msgId 取），重启后原样复现
+            if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+                outgoingPayloads.put(rec.getId(), rec.getTokenUsage());
+            }
             if (isCompressed) {
                 chatWebView.markLastMessageCompressed();
             }
@@ -6043,6 +6059,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             String content = parts != null ? getPartContent(parts, "text") : "";
             if (content.startsWith(com.codepal.session.IterationGuard.SYSTEM_AUTO_PREFIX)
                     || content.startsWith("[SYSTEM NUDDGE]")) return null;
+            // 滚动加载（prependHistoryRecords）路径的负载快照回填：悬浮懒查按 msgId 取
+            if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+                outgoingPayloads.put(rec.getId(), rec.getTokenUsage());
+            }
             JsonObject o = new JsonObject();
             o.addProperty("role", "user");
             o.addProperty("qaRound", rec.getQaRound());
@@ -6088,6 +6108,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             arr.add(po);
         }
         o.add("parts", arr);
+        // 本次回答 token 消耗原样复现：落库时的同一份 JSON 直接交给 JS 挂 chip
+        if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+            o.addProperty("tokenInfo", rec.getTokenUsage());
+        }
         return o.toString();
     }
 
@@ -7456,6 +7480,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         return " 配置视觉子智能体";
     }
 
+    /** 补全模型下拉项文案：已配置（且自身 key 非空，口径同视觉子智能体）则显示绿色对号样式，否则显示“配置补全模型” */
+    private String completionComboLabel() {
+        ModelConfig cm = CPSettings.getInstance().getEffectiveCompletionModel();
+        if (cm != null) {
+            return " 补全模型已配置 (" + cm.getName() + ")";
+        }
+        return " 配置补全模型";
+    }
+
     /** 按模型名称选中下拉框中的项 */
     private void selectModelComboByName(String name) {
         if (name == null) return;
@@ -7562,7 +7595,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             currentSelectedId = ((ModelComboItem) sel).id;
         }
 
-        final String ADD_COMPLETION_ITEM = " 配置补全模型";
+        final String ADD_COMPLETION_ITEM = completionComboLabel();
         final String ADD_CHAT_ITEM = " 配置自定义模型";
         modelCombo.removeAllItems();
         for (ModelConfig config : models) {

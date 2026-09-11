@@ -51,6 +51,7 @@ public class AddModelDialog extends JDialog {
     private boolean completionMode = false;
     private boolean visionMode = false;
     private JCheckBox supportsVisionCheck;
+    private JPanel supportsVisionRow; // 视觉能力整行（勾选框+提示文本），补全模式下整体隐藏
     private int selectedProvider = 0;
     private JCheckBox inlineEnableCheck;
     private JSlider delaySlider;
@@ -320,10 +321,15 @@ public class AddModelDialog extends JDialog {
             body.add(buildVisionEnableRow());
         }
         // 自定义/编辑模型时：部分主模型自带看图能力，勾选后无需依赖独立视觉子智能体。
-        // 放在温度字段下方、底部按钮上方。
-        if (!visionMode) {
+        // 放在温度字段下方、底部按钮上方。补全模式下不显示（由「是否启用补全模型」替代）。
+        if (!visionMode && !completionMode) {
             body.add(Box.createVerticalStrut(20));
             body.add(buildSupportsVisionRow());
+        }
+        // 内联补全设置（启用开关 + 延迟滑块）放在最下方、按钮上方，
+        // 编辑模式下隐藏模式选择器时仍可显示。
+        if (inlinePanel != null) {
+            body.add(inlinePanel);
         }
         body.add(Box.createVerticalStrut(24));
         body.add(buildFooter());
@@ -475,7 +481,7 @@ public class AddModelDialog extends JDialog {
         // 启用开关行
         JPanel enableRow = new JPanel(new BorderLayout(8, 0));
         enableRow.setOpaque(false);
-        inlineEnableCheck = new JCheckBox("启用内联代码补全 (Ghost Text)");
+        inlineEnableCheck = new JCheckBox("是否启用补全模型 (Ghost Text)");
         inlineEnableCheck.setFont(JBUI.Fonts.label(13));
         inlineEnableCheck.setForeground(textPrimary());
         inlineEnableCheck.setOpaque(false);
@@ -519,15 +525,12 @@ public class AddModelDialog extends JDialog {
 
         inlinePanel.add(delayRow);
 
-        // 将分段控件和内联设置放在 CENTER 区域
+        // 将分段控件放在 CENTER 区域（内联面板独立出 modeSectionContainer，避免编辑模式连带着被隐藏）
         JPanel centerPanel = new JPanel();
         centerPanel.setLayout(new BoxLayout(centerPanel, BoxLayout.Y_AXIS));
         centerPanel.setOpaque(false);
         segControl.setAlignmentX(Component.LEFT_ALIGNMENT);
-        inlinePanel.setAlignmentX(Component.LEFT_ALIGNMENT);
         centerPanel.add(segControl);
-        centerPanel.add(Box.createVerticalStrut(4));
-        centerPanel.add(inlinePanel);
 
         section.add(centerPanel, BorderLayout.CENTER);
 
@@ -572,6 +575,7 @@ public class AddModelDialog extends JDialog {
         hint.setForeground(textMuted());
         row.add(hint, BorderLayout.CENTER);
 
+        supportsVisionRow = row; // 保存引用，供补全模式下整体隐藏
         return row;
     }
 
@@ -587,6 +591,10 @@ public class AddModelDialog extends JDialog {
     private void updateInlinePanelVisibility() {
         if (inlinePanel != null) {
             inlinePanel.setVisible(completionMode);
+        }
+        // 补全模式下隐藏「模型自带视觉能力」整行（勾选框+提示文本），避免与「是否启用补全模型」重复出现
+        if (supportsVisionRow != null) {
+            supportsVisionRow.setVisible(!completionMode && !visionMode);
         }
         if (modeLabelRow != null) {
             Component hint = ((BorderLayout) modeLabelRow.getLayout()).getLayoutComponent(BorderLayout.EAST);
@@ -1098,10 +1106,15 @@ public class AddModelDialog extends JDialog {
         if (segControl != null) {
             segControl.setVisible(false);
         }
-        // 隐藏整个「配置用途」section（label + segControl + inlinePanel），
-        // 编辑/单一模式下不需要显示该段（避免 label 悬空看着空）
+        // 隐藏「配置用途」section 的标签与单选控件（编辑模式下模式不可切换）。
+        // 注意：inlinePanel 已独立于 modeSectionContainer，不受此隐藏影响，
+        // 补全模型的「是否启用补全模型」勾选框仍可正常显示。
         if (modeSectionContainer != null) {
             modeSectionContainer.setVisible(false);
+        }
+        // 补全模型编辑时，确保内联面板可见（用户需要看到启用开关）
+        if (inlinePanel != null && completionMode) {
+            inlinePanel.setVisible(true);
         }
     }
 

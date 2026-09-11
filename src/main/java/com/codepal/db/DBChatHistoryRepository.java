@@ -231,6 +231,22 @@ public class DBChatHistoryRepository {
         }
     }
 
+    /**
+     * 仅更新消息的 token_usage 列（原样入库 JSON：用户消息=负载快照 / 助手消息=本次回答 token 消耗）。
+     * 单列 UPDATE，不触碰其它任何字段（含 updated_at）。
+     */
+    public static void updateTokenUsage(String messageId, String tokenUsageJson) {
+        String sql = "UPDATE messages SET token_usage = ? WHERE id = ?";
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, tokenUsageJson);
+            ps.setString(2, messageId);
+            ps.executeUpdate();
+        } catch (Exception e) {
+            LOG.error("updateTokenUsage failed", e);
+        }
+    }
+
     /** 保存消息及其所有 parts（事务） */
     public static void saveMessageWithParts(ChatMessageEntity msg, List<MessagePartEntity> parts) {
         Connection conn = null;

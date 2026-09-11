@@ -523,6 +523,18 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         return m;
     }
 
+    /**
+     * 实际生效的补全模型：已配置且自身 API Key 非空时返回，否则 null。
+     * 口径与 {@link #getEffectiveVisionModel()} 一致：只认补全模型自己的 key，不继承聊天模型配置。
+     */
+    @Nullable
+    public ModelConfig getEffectiveCompletionModel() {
+        ModelConfig m = getCurrentCompletionModel();
+        if (m == null) return null;
+        if (m.getApiKey() == null || m.getApiKey().trim().isEmpty()) return null;
+        return m;
+    }
+
     public String getCompletionApiKey() {
         ModelConfig m = getCurrentCompletionModel();
         return m != null ? m.getApiKey() : "";
@@ -807,16 +819,14 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         return !getChatApiKey().trim().isEmpty();
     }
 
-    /** 获取实际生效的补全 API Key（优先用专用，否则继承聊天） */
+    /** 补全 API Key：只认补全模型自己的 key，不继承聊天模型（对齐视觉子智能体口径） */
     public String getEffectiveCompletionApiKey() {
-        String key = getCompletionApiKey();
-        return !key.trim().isEmpty() ? key : getChatApiKey();
+        return getCompletionApiKey();
     }
 
-    /** 获取实际生效的补全 API Base */
+    /** 补全 API Base：只认补全模型自己的 base，不继承聊天模型 */
     public String getEffectiveCompletionApiBase() {
-        String base = getCompletionApiBase();
-        return !base.trim().isEmpty() ? base : getChatApiBase();
+        return getCompletionApiBase();
     }
 
     private void ensureDefaultModels() {

@@ -38,11 +38,12 @@ public class CPBlockRenderer implements EditorCustomElementRenderer {
 
     @Override
     public int calcWidthInPixels(@NotNull Inlay inlay) {
-        FontMetrics fm = getFontMetrics();
-        if (fm == null) return 0;
+        Font font = getEditorFont();
+        if (font == null) return 0;
         int maxWidth = 0;
         for (String line : lines) {
-            maxWidth = Math.max(maxWidth, fm.stringWidth(line));
+            // 中文等编辑器字体缺字形的字符走回退字体计算，避免宽度算错被截断
+            maxWidth = Math.max(maxWidth, GhostTextPainter.stringWidth(editor.getComponent(), font, line));
         }
         return maxWidth;
     }
@@ -59,9 +60,7 @@ public class CPBlockRenderer implements EditorCustomElementRenderer {
                       @NotNull Rectangle targetRegion,
                       @NotNull TextAttributes textAttributes) {
         Font font = getEditorFont();
-        if (font != null) {
-            g.setFont(font);
-        }
+        if (font == null) return;
         g.setColor(getGhostColor());
 
         FontMetrics fm = g.getFontMetrics();
@@ -70,14 +69,9 @@ public class CPBlockRenderer implements EditorCustomElementRenderer {
 
         for (int i = 0; i < lines.length; i++) {
             int y = targetRegion.y + lineHeight * (i + 1) - fm.getDescent();
-            g.drawString(lines[i], x, y);
+            // 分段绘制：ASCII 段用编辑器字体，CJK 段用回退字体（否则中文字形缺失显示为方块）
+            GhostTextPainter.draw(g, editor.getComponent(), font, lines[i], x, y);
         }
-    }
-
-    private FontMetrics getFontMetrics() {
-        Font font = getEditorFont();
-        if (font == null) return null;
-        return editor.getComponent().getFontMetrics(font);
     }
 
     private Font getEditorFont() {

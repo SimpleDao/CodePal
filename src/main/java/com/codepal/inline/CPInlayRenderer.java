@@ -39,8 +39,10 @@ public class CPInlayRenderer implements EditorCustomElementRenderer {
 
     @Override
     public int calcWidthInPixels(@NotNull Inlay inlay) {
-        FontMetrics fm = getFontMetrics();
-        return fm != null ? fm.stringWidth(text) : 0;
+        Font font = getEditorFont();
+        if (font == null) return 0;
+        // 中文等编辑器字体缺字形的字符走回退字体计算，避免宽度算错被截断
+        return GhostTextPainter.stringWidth(editor.getComponent(), font, text);
     }
 
     @Override
@@ -49,22 +51,14 @@ public class CPInlayRenderer implements EditorCustomElementRenderer {
                       @NotNull Rectangle targetRegion,
                       @NotNull TextAttributes textAttributes) {
         Font font = getEditorFont();
-        if (font != null) {
-            g.setFont(font);
-        }
+        if (font == null) return;
         // 使用编辑器行注释颜色（通常是灰色），与 Copilot 幽灵文本视觉一致
         Color ghostColor = getGhostColor();
         g.setColor(ghostColor);
         FontMetrics fm = g.getFontMetrics();
         int baseline = targetRegion.y + targetRegion.height - fm.getDescent();
-        g.drawString(text, targetRegion.x, baseline);
-    }
-
-    private FontMetrics getFontMetrics() {
-        Font font = getEditorFont();
-        if (font == null) return null;
-        // 使用编辑器 JComponent 获取 FontMetrics
-        return editor.getComponent().getFontMetrics(font);
+        // 分段绘制：ASCII 段用编辑器字体，CJK 段用回退字体（否则中文字形缺失显示为方块）
+        GhostTextPainter.draw(g, editor.getComponent(), font, text, targetRegion.x, baseline);
     }
 
     private Font getEditorFont() {

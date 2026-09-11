@@ -628,6 +628,7 @@ public final class ChatHtmlTemplate {
                 + "finalizeReasoning(null);_flushToolGroup();"
                 + "if(lcStreamingMsgId){"
                 + "addMsgOps(lcStreamingMsgId);"
+                + "if(record.tokenInfo)attachTokenInfo(record.tokenInfo);"
                 + "if(record.timeStr){var tw=document.getElementById(lcStreamingMsgId);"
                 + "if(tw){var ts=tw.querySelector('.ts span');if(ts)ts.textContent=record.timeStr;}}"
                 + "lcStreamingMsgId=null;lcCurrentBubbleId=null;lcCurrentRsnId=null;lcStreamFinalized=false;}"
