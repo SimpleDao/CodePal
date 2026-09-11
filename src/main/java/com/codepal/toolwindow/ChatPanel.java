@@ -579,6 +579,14 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         final Icon planIcon   = IconLoader.getIcon("/icons/combo_plan.svg", ChatPanel.class);
         final Icon craftIcon  = IconLoader.getIcon("/icons/combo_craft.svg", ChatPanel.class);
         final Icon modelIcon  = IconLoader.getIcon("/icons/combo_model.svg", ChatPanel.class);
+        // ── 厂商图标：按模型 apiBase 域名/名称解析，同一厂商固定图标 ──
+        final int vIconSize = ComboStyle.iconSize();
+        final Icon vendorDeepSeek = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_deepseek.svg", ChatPanel.class), vIconSize, vIconSize);
+        final Icon vendorOpenAI   = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_openai.svg", ChatPanel.class), vIconSize, vIconSize);
+        final Icon vendorClaude   = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_claude.svg", ChatPanel.class), vIconSize, vIconSize);
+        final Icon vendorGlm      = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_glm.svg", ChatPanel.class), vIconSize, vIconSize);
+        final Icon vendorKimi     = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_kimi.svg", ChatPanel.class), vIconSize, vIconSize);
+        final Icon vendorGeneric  = new SizedIcon(IconLoader.getIcon("/icons/vendors/vendor_generic.svg", ChatPanel.class), vIconSize, vIconSize);
         final Icon addIcon    = IconLoader.getIcon("/icons/add_model.svg", ChatPanel.class);
         final Icon editIcon   = IconLoader.getIcon("/icons/edit_model.svg", ChatPanel.class); // SVG 已固定 fill=#FFFFFF（暗色主题纯白）
         final Icon checkIcon  = IconLoader.getIcon("/icons/check_vision.svg", ChatPanel.class); // 绿色对号，与 editIcon 同源机制
@@ -600,7 +608,23 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         addModel();
                     }
                 });
-        modelCombo.setRenderer(new ModelComboRenderer(modelIcon, addIcon, editIcon, checkIcon));
+        // 厂商图标解析：apiBase 域名优先（网关改名时仍准确），模型名前缀兜底，未命中走通用图标。
+        // 非模型行（新增/配置入口）返回 null → 渲染器回退原有内置图标逻辑。
+        final java.util.function.Function<ModelComboItem, Icon> vendorIconResolver = item -> {
+            if (item == null || item.id == null) return null; // 新增/配置入口行
+            ModelConfig m = CPSettings.getInstance().findChatModelById(item.id);
+            if (m == null) m = CPSettings.getInstance().getVisionModel();
+            String base = m != null && m.getApiBase() != null ? m.getApiBase().toLowerCase() : "";
+            String name = m != null && m.getName() != null ? m.getName().toLowerCase() : "";
+            if (base.contains("deepseek") || name.contains("deepseek")) return vendorDeepSeek;
+            if (base.contains("bigmodel.cn") || base.contains("zhipu") || name.contains("glm")) return vendorGlm;
+            if (base.contains("moonshot") || name.contains("kimi") || name.contains("moonshot")) return vendorKimi;
+            if (base.contains("anthropic") || name.startsWith("claude")) return vendorClaude;
+            if (base.contains("openai") || name.startsWith("gpt") || name.startsWith("o1")
+                    || name.startsWith("o3") || name.startsWith("o4") || name.startsWith("chatgpt")) return vendorOpenAI;
+            return vendorGeneric;
+        };
+        modelCombo.setRenderer(new ModelComboRenderer(modelIcon, addIcon, editIcon, checkIcon, vendorIconResolver));
 
         // ── 统一应用 CP 风格（自定义 UI → 圆角弹窗）──
         ComboStyle.apply(modeCombo);
@@ -7060,6 +7084,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // hover 模型行时，右侧出现一支编辑笔 SVG（无底色无边框，纯图标）；「＋ 配置...」项去图标块
     private static class ModelComboRenderer extends JComponent implements ListCellRenderer<ModelComboItem> {
         private final Icon modelIcon, addIcon, editIcon, checkIcon;
+        /** 厂商图标解析：按行返回该模型的厂商图标（null 则回退 modelIcon），聊天/新增/配置项返回 null */
+        private final java.util.function.Function<ModelComboItem, Icon> vendorIconResolver;
         private boolean isAdd = false;
         private boolean isAddChat = false;
         private boolean isSelectedItem = false;
@@ -7071,13 +7097,24 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         private ModelComboItem itemValue = null; // 存当前单元格值，绘制时据此重算，避免单例复用污染
         private boolean renderingAsList = false;
 
-        ModelComboRenderer(Icon modelIcon, Icon addIcon, Icon editIcon, Icon checkIcon) {
+        ModelComboRenderer(Icon modelIcon, Icon addIcon, Icon editIcon, Icon checkIcon,
+                           java.util.function.Function<ModelComboItem, Icon> vendorIconResolver) {
             this.modelIcon = modelIcon;
             this.addIcon = addIcon;
             this.editIcon = editIcon;
             this.checkIcon = checkIcon;
+            this.vendorIconResolver = vendorIconResolver;
             setOpaque(false);
             setBorder(null);
+        }
+
+        /** 当前行应绘制的模型图标：优先厂商图标（按 apiBase/模型名解析），否则通用 modelIcon */
+        private Icon resolveModelIcon() {
+            if (vendorIconResolver != null && itemValue != null) {
+                Icon v = vendorIconResolver.apply(itemValue);
+                if (v != null) return v;
+            }
+            return modelIcon;
         }
 
         /** 直接读取列表上记录的鼠标 Point，计算当前行是否 hover / 是否在编辑笔上（不调用 locationToIndex 以避免递归）。 */
@@ -7166,10 +7203,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     int textY = (h - fm.getHeight()) / 2 + fm.getAscent();
                     g2.drawString(addVisible, textX, textY);
                 } else {
-                    // 去掉图标阴影框：直接绘制图标
-                    int mx = iconX + (iconSize - modelIcon.getIconWidth()) / 2;
-                    int my = iconY + (iconSize - modelIcon.getIconHeight()) / 2;
-                    modelIcon.paintIcon(this, g2, mx, my);
+                    // 去掉图标阴影框：直接绘制图标（按行解析厂商图标）
+                    // 与底部 + 号行完全一致的左对齐方式（iconX 左边缘贴齐），避免居中偏移导致图标比 + 号偏右
+                    Icon rowIcon = resolveModelIcon();
+                    int mx = iconX - 1; // 向左偏移 1px，与 + 号行视觉对齐
+                    int my = iconY + (iconSize - rowIcon.getIconHeight()) / 2;
+                    rowIcon.paintIcon(this, g2, mx, my);
 
                     g2.setFont(JBUI.Fonts.label(13).deriveFont(Font.PLAIN));
                     g2.setColor(isSelectedItem ? Color.WHITE : ComboStyle.textPrimary());
@@ -7217,10 +7256,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 int iconSize = ComboStyle.iconSize();
                 int iconY = (h - iconSize) / 2;
                 int iconX = 8; // 与 getPreferredSize 的 leftPad(8) 对齐
-                // 去掉图标阴影框：直接绘制图标
-                int mx = iconX + (iconSize - modelIcon.getIconWidth()) / 2;
-                int my = iconY + (iconSize - modelIcon.getIconHeight()) / 2;
-                modelIcon.paintIcon(this, g2, mx, my);
+                // 去掉图标阴影框：直接绘制图标（按行解析厂商图标）
+                // 左对齐（与展开态模型行、+ 号行一致），避免居中偏移导致视觉偏右
+                Icon rowIcon = resolveModelIcon();
+                int mx = iconX - 1; // 向左偏移 1px，与 + 号行视觉对齐
+                int my = iconY + (iconSize - rowIcon.getIconHeight()) / 2;
+                rowIcon.paintIcon(this, g2, mx, my);
 
                 g2.setFont(JBUI.Fonts.label(13).deriveFont(Font.PLAIN));
                 g2.setColor(UIUtil.getLabelForeground());
