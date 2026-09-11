@@ -266,6 +266,12 @@ public class DeepSeekClient {
      * @param callback    流式回调
      * @return 可立即调用 cancel() 的 OkHttp Call
      */
+    /**
+     * FIM 补全的 max_tokens 硬上限。幽灵文本片段无需长输出（原始设计 256）；
+     * 补全模型配置里的 maxOutput 可能沿用聊天级 8192，不设上限会导致一次补全写完整个代码块。
+     */
+    private static final int FIM_MAX_TOKENS = 512;
+
     public Call streamFIM(String before, String after, FIMCallback callback) {
         CPSettings s = CPSettings.getInstance();
 
@@ -273,21 +279,28 @@ public class DeepSeekClient {
         String apiBase = s.getEffectiveCompletionApiBase();
         String model   = s.getCompletionModelName();
 
-        String fimPrompt = "<｜fim▁begin｜>" + before
-                + "<｜fim▁hole｜>"
-                + "<｜fim▁end｜>" + (after != null ? after : "");
-
+        // DeepSeek beta FIM：prompt/suffix 分开传参，FIM 标记由服务端插入。
+        // 旧实现把 <｜fim▁begin｜> 等标记手工拼进 prompt 且未传 suffix，当前 API 返回 200 空内容。
         CompletionRequest req = new CompletionRequest();
         req.setModel(model);
-        req.setPrompt(fimPrompt);
+        req.setPrompt(before);
+        req.setSuffix(after == null ? "" : after);
         req.setStream(true);
-        req.setMax_tokens(s.getCompletionMaxTokens());
+        req.setMax_tokens(Math.min(s.getCompletionMaxTokens(), FIM_MAX_TOKENS));
         req.setTemperature(s.getCompletionTemperature());
-        req.setLogRequests(true);
-        req.setLogResponses(true);
+        // 注意：不要添加非标准字段（如旧的 logRequests/logResponses）——
+        // DeepSeek 忽略未知字段，但 OpenAI 官方 API 对未知参数直接 400，会破坏兼容性
         req.setStop(Arrays.asList("<｜fim▁begin｜>", "<｜fim▁hole｜>", "<｜fim▁end｜>", "<｜end▁of▁sentence｜>"));
 
         RequestBody body = RequestBody.create(GSON.toJson(req), JSON);
+        // 诊断：FIM 空响应排查（模型名/长度/suffix 头部一次看全）
+        System.out.println("[FIM] req model=" + model
+                + " maxTokens=" + req.getMax_tokens()
+                + " before=" + before.length() + "ch"
+                + " after=" + (after == null ? 0 : after.length()) + "ch"
+                + " temp=" + req.getTemperature());
+        System.out.println("[FIM] suffixHead=[" + (after == null ? ""
+                : after.substring(0, Math.min(80, after.length()))) + "]");
         // FIM 端点拼接容错（与 streamChat 同策略，正则识别任意 vN 版本段）：
         // 避免 .../v4/v1/completions 这类重复拼接 404
         String fimBase = (apiBase == null || apiBase.isBlank()) ? "https://api.deepseek.com" : apiBase;
@@ -309,12 +322,15 @@ public class DeepSeekClient {
 
         Call call = httpClient.newCall(httpReq);
 
+        // onComplete 幂等：finish_reason 与 [DONE] 各触发一次，只放行首次
+        java.util.concurrent.atomic.AtomicBoolean doneFired = new java.util.concurrent.atomic.AtomicBoolean(false);
+
         EventSource.Factory factory = EventSources.createFactory(httpClient);
         factory.newEventSource(httpReq, new EventSourceListener() {
             @Override
             public void onEvent(EventSource eventSource, String id, String type, String data) {
                 if ("[DONE]".equals(data)) {
-                    callback.onComplete();
+                    if (doneFired.compareAndSet(false, true)) callback.onComplete();
                     return;
                 }
                 try {
@@ -324,9 +340,13 @@ public class DeepSeekClient {
                         String token = choice.getText();
                         if (token != null && !token.isEmpty()) {
                             callback.onToken(token);
+                        } else if (choice.getFinish_reason() != null) {
+                            // 诊断：模型 200 但零产出（常见于非 FIM 模型收到 FIM 标记、或模型判定 hole 无需填充）
+                            System.out.println("[FIM] 空响应 finish_reason=" + choice.getFinish_reason()
+                                    + " model=" + req.getModel() + "（若持续出现，请核对补全模型是否为 FIM 能力模型）");
                         }
                         if (choice.getFinish_reason() != null) {
-                            callback.onComplete();
+                            if (doneFired.compareAndSet(false, true)) callback.onComplete();
                         }
                     }
                 } catch (Exception e) {

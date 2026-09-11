@@ -10,13 +10,13 @@ import java.util.List;
  */
 public class CompletionRequest {
     private String       model;
-    /** FIM 格式的完整 prompt：<|fim_prefix|>...before...<|fim_suffix|>...after...<|fim_middle|> */
+    /** FIM 前缀（光标前代码）。FIM 标记由服务端负责插入，客户端不要手工拼接 */
     private String       prompt;
+    /** FIM 后缀（光标后代码，可选）。DeepSeek beta FIM 要求 prompt/suffix 分开传参 */
+    private String       suffix;
     private boolean      stream = true;
     private Integer      max_tokens;
     private Double       temperature;
-    private Boolean logRequests;
-    private Boolean logResponses;
     /** 停止 token，防止模型输出超出补全范围 */
     private List<String> stop;
 
@@ -25,6 +25,9 @@ public class CompletionRequest {
 
     public String getPrompt()                  { return prompt; }
     public void   setPrompt(String prompt)     { this.prompt = prompt; }
+
+    public String getSuffix()                  { return suffix; }
+    public void   setSuffix(String suffix)     { this.suffix = suffix; }
 
     public boolean isStream()                  { return stream; }
     public void    setStream(boolean stream)   { this.stream = stream; }
@@ -37,20 +40,4 @@ public class CompletionRequest {
 
     public List<String> getStop()              { return stop; }
     public void         setStop(List<String> s){ this.stop = s; }
-
-    public Boolean getLogRequests() {
-        return logRequests;
-    }
-
-    public void setLogRequests(Boolean logRequests) {
-        this.logRequests = logRequests;
-    }
-
-    public Boolean getLogResponses() {
-        return logResponses;
-    }
-
-    public void setLogResponses(Boolean logResponses) {
-        this.logResponses = logResponses;
-    }
 }

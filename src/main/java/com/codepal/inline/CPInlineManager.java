@@ -44,8 +44,10 @@ public class CPInlineManager {
 
     /** 光标前上下文最大字符数 */
     private static final int MAX_BEFORE = 600;
-    /** 光标后上下文最大字符数（FIM suffix 用） */
-    private static final int MAX_AFTER  = 200;
+    /** 光标后上下文最大字符数（FIM suffix 用）。太短时模型看不到后续已有代码，倾向于把整块补完 */
+    private static final int MAX_AFTER  = 750;
+    /** 幽灵文本最大行数（客户端兜底）：超过后截断/忽略，防止一次补全刷屏 */
+    private static final int MAX_GHOST_LINES = 12;
     /** 用于 appendToken 文档校验的前缀长度 */
     private static final int PREFIX_SNAPSHOT_LEN = 80;
 
@@ -306,6 +308,25 @@ public class CPInlineManager {
 
         // 6. 消灭导致渲染崩溃的 \r（回车符）
         String sanitizedToken = token.replace("\r", "");
+        // 6.5 行数封顶：幽灵文本最多 MAX_GHOST_LINES 行——已达上限则忽略后续 token；
+        // 未达上限但本 token 会跨过上限，则截断 token 内超出部分（防模型一次补全写整块刷屏）
+        int curLines = countLines(completionBuffer);
+        if (curLines >= MAX_GHOST_LINES) {
+            System.out.println("[CP] appendToken 已达 " + MAX_GHOST_LINES + " 行上限，忽略后续 token");
+            return;
+        }
+        int tokenLines = countLines(sanitizedToken); // token 从当前行末尾续写：合并行数 = curLines - 1 + tokenLines
+        if (curLines - 1 + tokenLines > MAX_GHOST_LINES) {
+            int allowedNewLines = MAX_GHOST_LINES - curLines; // token 内允许的 \n 数
+            int nl = 0;
+            for (int i = 0; i < sanitizedToken.length(); i++) {
+                if (sanitizedToken.charAt(i) == '\n' && ++nl > allowedNewLines) {
+                    System.out.println("[CP] appendToken 截断超出 " + MAX_GHOST_LINES + " 行上限的部分");
+                    sanitizedToken = sanitizedToken.substring(0, i);
+                    break;
+                }
+            }
+        }
         System.out.println("[CP] appendToken sanitizedToken=[" + sanitizedToken + "]");
         completionBuffer.append(sanitizedToken);
         activeOffset = offset;
@@ -482,6 +503,17 @@ public class CPInlineManager {
     private static String getPrefixSnapshot(Document doc, int offset) {
         int start = Math.max(0, offset - PREFIX_SNAPSHOT_LEN);
         return doc.getText(new TextRange(start, offset));
+    }
+
+    /**
+     * 统计字符序列的行数（\\n 个数 + 1，空串按 1 行计）
+     */
+    private static int countLines(CharSequence s) {
+        int n = 1;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) == '\n') n++;
+        }
+        return n;
     }
 
     private void cancelDebounce() {

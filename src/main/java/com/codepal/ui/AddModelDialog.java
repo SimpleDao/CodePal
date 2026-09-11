@@ -44,6 +44,7 @@ public class AddModelDialog extends JDialog {
     private JBTextField modelNameField;
     private JBTextField maxContextField;
     private JBTextField maxOutputField;
+    private JPanel tokenConfigRow; // 最大上下文/最大输出整行，补全模式下隐藏（FIM 请求不用这两个配置）
     private JSlider temperatureSlider;
     private JLabel temperatureValueLabel;
     private JRadioButton modeChatRadio;
@@ -596,6 +597,12 @@ public class AddModelDialog extends JDialog {
         if (supportsVisionRow != null) {
             supportsVisionRow.setVisible(!completionMode && !visionMode);
         }
+        // 补全模式下隐藏「最大上下文/最大输出」整行：FIM 请求固定 512 token 上限、不发送上下文参数，
+        // 这两个配置对补全无效；字段保留仅隐藏，编辑时预填值照常回写不丢数据。
+        // 视觉模式不隐藏（视觉请求真实使用 maxOutput）。
+        if (tokenConfigRow != null) {
+            tokenConfigRow.setVisible(!completionMode);
+        }
         if (modeLabelRow != null) {
             Component hint = ((BorderLayout) modeLabelRow.getLayout()).getLayoutComponent(BorderLayout.EAST);
             if (hint instanceof JLabel) {
@@ -630,7 +637,7 @@ public class AddModelDialog extends JDialog {
         modelNameField = createTextField("例如 deepseek-v4-flash");
         form.add(formRow("模型名称", modelNameField), gbc);
 
-        // 数字字段行（两列）
+        // 数字字段行（两列）——补全模式下整行隐藏（FIM 请求固定 512 上限、不发上下文参数，这两个配置无效）
         gbc.gridy = row++;
         JPanel numRow = new JPanel(new GridLayout(1, 2, 12, 0));
         numRow.setOpaque(false);
@@ -641,6 +648,7 @@ public class AddModelDialog extends JDialog {
         maxOutputField.setColumns(12);
         numRow.add(formRowInline("最大上下文", maxContextField, null));
         numRow.add(formRowInline("最大输出", maxOutputField, null));
+        tokenConfigRow = numRow; // 保存引用，供补全模式下隐藏（字段保留，编辑时值照常预填/回写）
         form.add(numRow, gbc);
 
         // 温度
