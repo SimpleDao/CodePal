@@ -24,6 +24,7 @@ public final class DBModelConfigRepository {
 
     public static final String TYPE_CHAT = "chat";
     public static final String TYPE_COMPLETION = "completion";
+    public static final String TYPE_COMPRESSION = "compression";
 
     private DBModelConfigRepository() {}
 

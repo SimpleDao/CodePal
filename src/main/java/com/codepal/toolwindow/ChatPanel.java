@@ -417,6 +417,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     private JLayeredPane centerLayer;
     private JComponent inputPanel;
 
+    /** 消息队列：AI 回复期间用户发送的消息暂存于此，本轮回复结束后自动按序发出 */
+    private MessageQueue messageQueue;
+    /** 队列浮动面板：叠加在 centerLayer（PALETTE 层），紧贴输入框上方，仅队列非空时可见 */
+    private QueuePanel queuePanel;
+
     private boolean isDark;
 
     // 历史会话面板组件
@@ -604,6 +609,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         addCompletionModel();
                     } else if (item.isConfigVision()) {
                         openVisionConfig();
+                    } else if (item.isConfigCompression()) {
+                        configureCompressionModel();
                     } else {
                         addModel();
                     }
@@ -846,6 +853,35 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         centerLayer.add(cardPanel, JLayeredPane.DEFAULT_LAYER);
         // 任务 + Diff Tab 面板：浮动叠加在聊天区域底部（PALETTE 层），紧贴输入框上方
         centerLayer.add(taskDiffTabPanel.getComponent(), JLayeredPane.PALETTE_LAYER);
+
+        // 消息队列面板：同层叠加（在任务/Diff 面板之上）。centerLayer.doLayout 会把
+        // PALETTE 层所有可见组件自底向上堆叠，两者同时可见时自动错开不遮挡。
+        messageQueue = new MessageQueue();
+        queuePanel = new QueuePanel(messageQueue, new QueuePanel.Callbacks() {
+            @Override public void onMoveToTop(String itemId) {
+                messageQueue.moveToFirst(itemId);
+                refreshQueuePanel();
+            }
+            @Override public void onEdit(String itemId) {
+                // ✎：把队列项写回输入框（含图片附件），并从队列移除
+                MessageQueue.QueueItem item = messageQueue.getById(itemId);
+                if (item == null) return;
+                messageQueue.removeById(itemId);
+                inputField.setText(item.text);
+                if (item.attachments != null && !item.attachments.isEmpty()) {
+                    pendingAttachments.addAll(item.attachments);
+                    refreshAttachStrip();
+                }
+                inputField.requestFocusInWindow();
+                refreshQueuePanel();
+            }
+            @Override public void onRemove(String itemId) {
+                messageQueue.removeById(itemId);
+                refreshQueuePanel();
+            }
+        });
+        queuePanel.setVisible(false);
+        centerLayer.add(queuePanel, JLayeredPane.PALETTE_LAYER);
 
         // 回到底部浮层按钮：置于 POPUP_LAYER（高于 PALETTE 层），浮于底部面板之上，不被遮挡
         scrollBottomBtn = new JButton() {
@@ -1841,6 +1877,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (text.isEmpty() && (streamRenderController == null || !streamRenderController.isReceiving())) return;
 
         if (streamRenderController != null && streamRenderController.isReceiving()) {
+            // ★ 生成中 + 输入框有内容 → 收集进消息队列，本轮回复结束后自动依次发出
+            if (!text.isEmpty()) {
+                messageQueue.enqueue(text, new ArrayList<>(pendingAttachments));
+                pendingAttachments.clear();
+                refreshAttachStrip();
+                inputField.setText("");
+                if (activeInputSessionId != null) inputDraftBySession.put(activeInputSessionId, "");
+                statusLabel.setText("已加入队列（" + messageQueue.size() + " 条待发）");
+                refreshQueuePanel();
+                return;
+            }
+            // 生成中 + 空输入 → 停止生成（原逻辑）
             streamRenderController.setReceiving(false);
             streamRenderController.incrementGeneration();      // 递增代数，使所有已排队的旧回调失效
             taskWasInterrupted = true; // 标记任务被中断，下次发消息时添加上下文切换提示
@@ -1898,6 +1946,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // ★ 重置流式渲染状态，否则下一轮 stream 的 appendStreamChunk 会因
             //   aiStreamStarted 仍为 true 而跳过 startAiStream()，导致 WebView 没有新 bubble
             clearStreamRefs();
+            // 一轮已结束：继续发送队列中排队的消息（用户停止不丢队列，可从面板移除）
+            drainMessageQueue();
             return;
         }
 
@@ -1978,6 +2028,37 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         autoFixAttempts = 0;
         iterationGuard.resetRoundCounters();
         sendToApi();
+    }
+
+    /** 刷新队列浮动面板：队列非空时显示并重绘，空时隐藏（不占布局空间） */
+    private void refreshQueuePanel() {
+        if (queuePanel == null || messageQueue == null) return;
+        queuePanel.setVisible(!messageQueue.isEmpty());
+        queuePanel.refresh();
+        refreshCenterLayout();
+    }
+
+    /**
+     * 一轮流结束（完成/出错/超时/停止/迭代超限）后的收尾钩子：
+     * 队列非空则弹出队首，恢复其文本与图片附件后走正常 sendMessage 流程，
+     * 链式驱动直到队列清空（每次调用只 pop 一条，下一条由该轮流结束再触发）。
+     * 必须在 EDT 且本轮 setReceiving(false) 之后调用。
+     */
+    private void drainMessageQueue() {
+        if (messageQueue == null || messageQueue.isEmpty()) {
+            refreshQueuePanel();
+            return;
+        }
+        MessageQueue.QueueItem next = messageQueue.popFirst();
+        refreshQueuePanel();
+        if (next == null) return;
+        // 队列项快照还原：文本写回输入框（sendMessage 从输入框取词），附件恢复到待发附件条
+        inputField.setText(next.text);
+        if (next.attachments != null && !next.attachments.isEmpty()) {
+            pendingAttachments.addAll(next.attachments);
+            refreshAttachStrip();
+        }
+        sendMessage();
     }
 
     private String extractFileReferences(String text) {
@@ -2362,6 +2443,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 statusLabel.setText("就绪");
                                 statusLabel.setForeground(JBColor.GRAY);
                                 clearStreamRefs();
+                                drainMessageQueue();
                                 return;
                             }
                             sendSrc.setResponseHadToolCalls(true);
@@ -2513,6 +2595,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                             statusLabel.setText("迭代超限已停止");
                                             statusLabel.setForeground(JBColor.ORANGE);
                                             clearStreamRefs();
+                                            drainMessageQueue();
                                         });
                                         break;
                                     }
@@ -3028,6 +3111,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 promoteReasoningAsAnswer(sendSrc.getCurrentReasoning().toString(), sendWebView, sendConvMgr, sendSessionId);
                                 clearStreamRefs();
                                 maybeDeferredSwitch();
+                                drainMessageQueue();
                                 return;
                             }
                             String assistantMsgId = null;
@@ -3083,6 +3167,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             }
                             // 流结束：执行被延迟的会话切换（用户在本轮流进行中点了其它会话标签）
                             maybeDeferredSwitch();
+                            // 一轮流彻底结束：弹出队首队列消息自动发送，直到队列清空
+                            drainMessageQueue();
                         });
                     }
 
@@ -3116,6 +3202,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             clearStreamRefs();
                             // 流结束：执行被延迟的会话切换
                             maybeDeferredSwitch();
+                            drainMessageQueue();
                             // 出错时不清除累积状态，已暂存的文件修改保留在面板中
                         });
                     }
@@ -4160,6 +4247,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             persistPartialAssistant(streamRenderController, conversationManager, chatSessionManager.getCurrentSessionId());
             streamRenderController.finalizeAiMessage(CARD_BG());
             clearStreamRefs();
+            drainMessageQueue();
         });
     }
 
@@ -6990,6 +7078,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         public static final int KIND_ADD_CHAT = 1;
         public static final int KIND_ADD_COMPLETION = 2;
         public static final int KIND_CONFIG_VISION = 3;
+        public static final int KIND_CONFIG_COMPRESSION = 4;
 
         public final String id;
         public final String name;
@@ -7016,11 +7105,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         static ModelComboItem configVisionItem(String label) {
             return new ModelComboItem(null, label, KIND_CONFIG_VISION);
         }
+        static ModelComboItem configCompressionItem(String label) {
+            return new ModelComboItem(null, label, KIND_CONFIG_COMPRESSION);
+        }
 
         boolean isAddItem() { return kind != KIND_MODEL; }
         boolean isAddChat() { return kind == KIND_ADD_CHAT; }
         boolean isAddCompletion() { return kind == KIND_ADD_COMPLETION; }
         boolean isConfigVision() { return kind == KIND_CONFIG_VISION; }
+        boolean isConfigCompression() { return kind == KIND_CONFIG_COMPRESSION; }
 
         @Override
         public String toString() { return name; }
@@ -7496,12 +7589,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         menu.show(list, me.getX(), me.getY());
     }
 
-    /** 构建模型下拉项数组（含底部三个入口：补全模型 / 聊天模型 / 配置视觉子智能体） */
+    /** 构建模型下拉项数组（含底部入口：聊天模型 / 补全模型 / 视觉子智能体 / 压缩模型） */
     private ModelComboItem[] buildModelComboItems(String addCompletionLabel, String addChatLabel, String configVisionLabel) {
         CPSettings.getInstance().reloadModelsFromDb();
         List<ModelConfig> models = CPSettings.getInstance().getChatModels();
         int modelCount = (models != null) ? models.size() : 0;
-        ModelComboItem[] items = new ModelComboItem[modelCount + 3];
+        ModelComboItem[] items = new ModelComboItem[modelCount + 4];
         for (int i = 0; i < modelCount; i++) {
             ModelConfig m = models.get(i);
             items[i] = new ModelComboItem(m.getId(), m.getName());
@@ -7509,6 +7602,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         items[modelCount] = ModelComboItem.addChatItem(addChatLabel);
         items[modelCount + 1] = ModelComboItem.addCompletionItem(addCompletionLabel);
         items[modelCount + 2] = ModelComboItem.configVisionItem(configVisionLabel);
+        items[modelCount + 3] = ModelComboItem.configCompressionItem(compressionComboLabel());
         return items;
     }
 
@@ -7528,6 +7622,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             return " 补全模型已配置 (" + cm.getName() + ")";
         }
         return " 配置补全模型";
+    }
+
+    /** 压缩模型下拉项文案：已配置（且自身 key 非空）则显示绿色对号样式，否则显示“配置压缩模型” */
+    private String compressionComboLabel() {
+        ModelConfig cm = CPSettings.getInstance().getEffectiveCompressionModel();
+        if (cm != null) {
+            return " 压缩模型已配置 (" + cm.getName() + ")";
+        }
+        return " 配置压缩模型";
     }
 
     /** 按模型名称选中下拉框中的项 */
@@ -7588,7 +7691,23 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
     }
 
-    /** 编辑指定模型（按UUID） */
+    /** 配置压缩模型：有则编辑，无则新增（MODE_COMPRESSION 复用补全布局但隐藏补全专属内联面板） */
+    private void configureCompressionModel() {
+        Window parentWindow = getParentWindow();
+        if (parentWindow == null) return;
+        CPSettings settings = CPSettings.getInstance();
+        ModelConfig compModel = settings.getCurrentCompressionModel();
+        AddModelDialog dialog;
+        if (compModel != null) {
+            dialog = new AddModelDialog(project, parentWindow, compModel);
+        } else {
+            dialog = new AddModelDialog(project, parentWindow, AddModelDialog.MODE_COMPRESSION);
+        }
+        dialog.setVisible(true);
+        if (dialog.isSaved()) {
+            refreshModelCombo();
+        }
+    }
     private void editModel(String modelId) {
         if (modelId == null) return;
         CPSettings settings = CPSettings.getInstance();
@@ -7645,12 +7764,13 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         modelCombo.addItem(ModelComboItem.addChatItem(ADD_CHAT_ITEM));
         modelCombo.addItem(ModelComboItem.addCompletionItem(ADD_COMPLETION_ITEM));
         modelCombo.addItem(ModelComboItem.configVisionItem(visionComboLabel()));
+        modelCombo.addItem(ModelComboItem.configCompressionItem(compressionComboLabel()));
 
         if (currentSelectedId != null) {
             selectModelComboById(currentSelectedId);
         } else if (!models.isEmpty()) {
             int curIdx = CPSettings.getInstance().getCurrentChatModelIndex();
-            if (curIdx >= 0 && curIdx < modelCombo.getItemCount() - 2) {
+            if (curIdx >= 0 && curIdx < modelCombo.getItemCount() - 4) {
                 modelCombo.setSelectedIndex(curIdx);
             } else {
                 modelCombo.setSelectedIndex(0);

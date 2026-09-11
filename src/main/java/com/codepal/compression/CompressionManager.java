@@ -1,5 +1,6 @@
 package com.codepal.compression;
 
+import com.codepal.model.ModelConfig;
 import com.intellij.openapi.project.Project;
 import com.codepal.api.ModelLinkDispatcher;
 import com.codepal.model.ChatMessage;
@@ -340,8 +341,9 @@ public class CompressionManager {
         AtomicReference<String> errorRef = new AtomicReference<>();
 
         CPSettings settings = CPSettings.getInstance();
+        ModelConfig compressModelCfg = settings.getCompressionOrChatModel(); // 优先已配置压缩模型，否则回退聊天模型
         ChatRequest compressRequest = new ChatRequest();
-        compressRequest.setModel(settings.getChatModelName());
+        compressRequest.setModel(compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName());
         compressRequest.setMessages(compressMessages);
         compressRequest.setStream(true);
         // 摘要输出通常 500-2000 token，设 8192 留足余量防止截断
@@ -353,9 +355,9 @@ public class CompressionManager {
         // 而 OpenAI / DeepSeek 要求 tool_choice != none 时必须同时有 tools，否则 HTTP 400。
         compressRequest.setTool_choice(null);
 
-        // 使用流式调用，收集完整结果；按当前模型 apiFormat 选 OpenAI / Anthropic 链路
+        // 使用流式调用，收集完整结果；按当前压缩模型 apiFormat 选 OpenAI / Anthropic 链路
         ModelLinkDispatcher.streamChat(compressRequest, compressMessages, null,
-                settings.getCurrentChatModel(), new ModelLinkDispatcher.Relay() {
+                compressModelCfg, new ModelLinkDispatcher.Relay() {
             @Override
             public void onMessage(String content) {
                 if (content != null) {

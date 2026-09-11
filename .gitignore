@@ -25,6 +25,9 @@ chain.crt
 signing.env
 openssl_min.cnf
 
+# Marketplace 发布 token（本地私密配置，绝不提交）
+publish.properties
+
 # 本地构建/调试日志（不提交）
 build_sign.log
 toolchains.log

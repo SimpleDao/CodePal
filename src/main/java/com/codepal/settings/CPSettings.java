@@ -96,6 +96,12 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
     @Transient
     private String currentCompletionModelId = null;
 
+    // ── 压缩模型列表（同上，落库；压缩历史时优先使用，未配置则回退聊天模型）────
+    @Transient
+    private List<ModelConfig> compressionModels = new ArrayList<>();
+    @Transient
+    private String currentCompressionModelId = null;
+
     // ── 视觉模型（主模型通过 view_image 工具调用它看图）────────
     private boolean visionEnabled = false;
     private ModelConfig visionModel = null;
@@ -213,6 +219,9 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         // 当前选中项以 DB 的 is_current 为准（按 id，不用下标/序号）
         currentChatModelId = resolveCurrentId(DBModelConfigRepository.TYPE_CHAT, chatModels);
         currentCompletionModelId = resolveCurrentId(DBModelConfigRepository.TYPE_COMPLETION, completionModels);
+        List<ModelConfig> compz = DBModelConfigRepository.loadModels(DBModelConfigRepository.TYPE_COMPRESSION);
+        compressionModels = (compz != null) ? compz : new ArrayList<>();
+        currentCompressionModelId = resolveCurrentId(DBModelConfigRepository.TYPE_COMPRESSION, compressionModels);
     }
 
     /** 取当前选中 id；若 DB 里没有 is_current（例如刚删掉了它），自愈为第一条并落库 */
@@ -559,6 +568,86 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         ModelConfig m = getCurrentCompletionModel();
         return m != null ? m.getTemperature() : 0.0;
     }
+
+    // ── 压缩模型（镜像补全模型：独立 TYPE_COMPRESSION 表 + 当前 id）─────────
+    public int findCompressionModelIndexById(String id) {
+        if (id == null) return -1;
+        for (int i = 0; i < compressionModels.size(); i++) {
+            if (id.equals(compressionModels.get(i).getId())) return i;
+        }
+        return -1;
+    }
+
+    /** 新增压缩模型：插一行并设为当前选中 */
+    public void addCompressionModel(ModelConfig newModel) {
+        if (newModel == null) return;
+        if (newModel.getId() == null || newModel.getId().isEmpty()) {
+            newModel.setId(UUID.randomUUID().toString());
+        }
+        DBModelConfigRepository.insertModel(DBModelConfigRepository.TYPE_COMPRESSION, newModel);
+        DBModelConfigRepository.setCurrent(DBModelConfigRepository.TYPE_COMPRESSION, newModel.getId());
+        reloadModelsFromDb();
+        fireSettingsChanged();
+    }
+
+    /** 更新单个压缩模型：只改 DB 里那一行 */
+    public void updateCompressionModel(ModelConfig updated) {
+        if (updated == null || updated.getId() == null) return;
+        DBModelConfigRepository.updateModel(updated);
+        reloadModelsFromDb();
+        fireSettingsChanged();
+    }
+
+    /** 当前压缩模型：按 id 直接查库读整行（未配置返回 null） */
+    @Nullable
+    public ModelConfig getCurrentCompressionModel() {
+        if (currentCompressionModelId == null || currentCompressionModelId.isEmpty()) {
+            reloadModelsFromDb();
+        }
+        ModelConfig m = DBModelConfigRepository.loadModelById(DBModelConfigRepository.TYPE_COMPRESSION, currentCompressionModelId);
+        if (m == null && compressionModels != null && !compressionModels.isEmpty()) {
+            setCurrentCompressionModelId(compressionModels.get(0).getId());
+            m = DBModelConfigRepository.loadModelById(DBModelConfigRepository.TYPE_COMPRESSION, currentCompressionModelId);
+        }
+        return m;
+    }
+
+    /**
+     * 实际生效的压缩模型：已配置且自身 API Key 非空时返回，否则 null。
+     * 口径与 getEffectiveCompletionModel / getEffectiveVisionModel 一致：只认模型自己的 key。
+     */
+    @Nullable
+    public ModelConfig getEffectiveCompressionModel() {
+        ModelConfig m = getCurrentCompressionModel();
+        if (m == null) return null;
+        if (m.getApiKey() == null || m.getApiKey().trim().isEmpty()) return null;
+        return m;
+    }
+
+    /**
+     * 压缩实际使用的模型配置：优先已生效的压缩模型，否则回退当前聊天模型。
+     * 供 CompressionManager 发起压缩请求使用。
+     */
+    @Nullable
+    public ModelConfig getCompressionOrChatModel() {
+        ModelConfig m = getEffectiveCompressionModel();
+        if (m != null) return m;
+        return getCurrentChatModel();
+    }
+
+    /** 压缩模型名称（供日志/回退）；未配置压缩模型时返回聊天模型名 */
+    public String getCompressionModelName() {
+        ModelConfig m = getEffectiveCompressionModel();
+        return m != null ? m.getName() : getChatModelName();
+    }
+
+    public void setCurrentCompressionModelId(String id) {
+        if (id == null || id.isEmpty()) return;
+        currentCompressionModelId = id;
+        DBModelConfigRepository.setCurrent(DBModelConfigRepository.TYPE_COMPRESSION, id);
+    }
+
+    public List<ModelConfig> getCompressionModels() { return compressionModels; }
 
     // ── 视觉模型 getter/setter ────────────────────────────────
     public boolean isVisionEnabled() { return visionEnabled; }

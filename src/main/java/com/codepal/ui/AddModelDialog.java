@@ -28,6 +28,7 @@ public class AddModelDialog extends JDialog {
     public static final int MODE_CHAT = 0;
     public static final int MODE_COMPLETION = 1;
     public static final int MODE_VISION = 2;
+    public static final int MODE_COMPRESSION = 3;
 
     private final Project project;
     private final int forceMode;
@@ -45,12 +46,14 @@ public class AddModelDialog extends JDialog {
     private JBTextField maxContextField;
     private JBTextField maxOutputField;
     private JPanel tokenConfigRow; // 最大上下文/最大输出整行，补全模式下隐藏（FIM 请求不用这两个配置）
+    private JPanel temperatureRow; // 温度整行，补全/压缩模式下隐藏（温度在代码写死，禁止用户修改）
     private JSlider temperatureSlider;
     private JLabel temperatureValueLabel;
     private JRadioButton modeChatRadio;
     private JRadioButton modeCompletionRadio;
     private boolean completionMode = false;
     private boolean visionMode = false;
+    private boolean compressionMode = false; // 压缩模型：复用补全布局（隐藏视觉/令牌行），但不显示补全专属内联面板
     private JCheckBox supportsVisionCheck;
     private JPanel supportsVisionRow; // 视觉能力整行（勾选框+提示文本），补全模式下整体隐藏
     private int selectedProvider = 0;
@@ -161,6 +164,14 @@ public class AddModelDialog extends JDialog {
             prefillVision();
             lockModeForEditing();
             onModeChanged();
+        } else if (forceMode == MODE_COMPRESSION) {
+            // 压缩模型：复用补全布局（隐藏视觉能力行 + 最大上下文/最大输出行），
+            // 但不显示补全专属的「是否启用补全模型」内联面板（压缩与补全语义无关）。
+            compressionMode = true;
+            modeCompletionRadio.setSelected(true);
+            applyCompletionDefaults();
+            lockModeForEditing();
+            onModeChanged();
         }
         updateInlinePanelVisibility();
         pack();
@@ -218,14 +229,22 @@ public class AddModelDialog extends JDialog {
         CPSettings s = CPSettings.getInstance();
         int chatIdx = s.findChatModelIndexById(cfg.getId());
         int compIdx = s.findCompletionModelIndexById(cfg.getId());
+        int compZIdx = s.findCompressionModelIndexById(cfg.getId());
 
-        if (compIdx >= 0 && chatIdx < 0) {
+        if (compZIdx >= 0) {
+            modeCompletionRadio.setSelected(true);
+            completionMode = false;   // 不显示补全专属内联面板
+            compressionMode = true;
+            editingIndex = compZIdx;
+        } else if (compIdx >= 0 && chatIdx < 0) {
             modeCompletionRadio.setSelected(true);
             completionMode = true;
+            compressionMode = false;
             editingIndex = compIdx;
         } else {
             modeChatRadio.setSelected(true);
             completionMode = false;
+            compressionMode = false;
             editingIndex = chatIdx;
         }
 
@@ -590,18 +609,22 @@ public class AddModelDialog extends JDialog {
     }
 
     private void updateInlinePanelVisibility() {
+        // 仅纯补全模式显示「是否启用补全模型」面板；压缩模式必须隐藏（与补全语义无关）
         if (inlinePanel != null) {
-            inlinePanel.setVisible(completionMode);
+            inlinePanel.setVisible(completionMode && !compressionMode);
         }
-        // 补全模式下隐藏「模型自带视觉能力」整行（勾选框+提示文本），避免与「是否启用补全模型」重复出现
+        // 补全/压缩模式下隐藏「模型自带视觉能力」整行（勾选框+提示文本）
         if (supportsVisionRow != null) {
-            supportsVisionRow.setVisible(!completionMode && !visionMode);
+            supportsVisionRow.setVisible(!completionMode && !compressionMode && !visionMode);
         }
-        // 补全模式下隐藏「最大上下文/最大输出」整行：FIM 请求固定 512 token 上限、不发送上下文参数，
-        // 这两个配置对补全无效；字段保留仅隐藏，编辑时预填值照常回写不丢数据。
+        // 补全/压缩模式下隐藏「最大上下文/最大输出」整行：这两类模型不发送上下文参数、且 FIM 有固定上限。
         // 视觉模式不隐藏（视觉请求真实使用 maxOutput）。
         if (tokenConfigRow != null) {
-            tokenConfigRow.setVisible(!completionMode);
+            tokenConfigRow.setVisible(!completionMode && !compressionMode);
+        }
+        // 补全/压缩模式下隐藏「温度」滑块：温度在代码写死（补全 0.0），禁止用户修改
+        if (temperatureRow != null) {
+            temperatureRow.setVisible(!completionMode && !compressionMode);
         }
         if (modeLabelRow != null) {
             Component hint = ((BorderLayout) modeLabelRow.getLayout()).getLayoutComponent(BorderLayout.EAST);
@@ -674,6 +697,7 @@ public class AddModelDialog extends JDialog {
         sliderWrap.add(temperatureSlider, BorderLayout.CENTER);
         sliderWrap.add(temperatureValueLabel, BorderLayout.EAST);
         tempRow.add(sliderWrap, BorderLayout.CENTER);
+        temperatureRow = tempRow; // 保存引用，供补全/压缩模式下隐藏（温度代码写死）
         form.add(tempRow, gbc);
 
         return form;
@@ -1091,12 +1115,14 @@ public class AddModelDialog extends JDialog {
     }
 
     private void onModeChanged() {
-        completionMode = modeCompletionRadio.isSelected();
+        // 压缩模式复用「代码补全」radio 占位，但不能让 radio 状态把 completionMode 覆盖为 true
+        //（否则内联补全面板会错误显示——上一版勾选框漏出的根因）
+        completionMode = modeCompletionRadio.isSelected() && !compressionMode;
         if (editingConfig != null) {
             updateInlinePanelVisibility();
             return;
         }
-        if (completionMode) {
+        if (completionMode || compressionMode) {
             selectedProvider = 0;
             updateProviderCards();
             applyCompletionDefaults();
@@ -1185,6 +1211,14 @@ public class AddModelDialog extends JDialog {
         newCfg.setApiFormat(P_FORMATS[selectedProvider]);
         newCfg.setSupportsVision(supportsVisionCheck != null && supportsVisionCheck.isSelected());
 
+        // 仅压缩模型：上下文/输出/温度全部代码写死（表单中已隐藏对应行，用户不可配）。
+        // 补全模型保持原行为：读隐藏字段（新配置预填 8192/1M/0，旧配置编辑时原值保留，不重置）。
+        if (compressionMode) {
+            newCfg.setMaxTokens(COMPLETION_MAX_CTX);
+            newCfg.setMaxOutput(COMPLETION_MAX_OUT);
+            newCfg.setTemperature(COMPLETION_TEMP);
+        }
+
         if (visionMode) {
             // 视觉模型：写入独立的 visionModel 配置（进入该模式即视为启用）
             settings.setVisionModel(newCfg);
@@ -1197,11 +1231,15 @@ public class AddModelDialog extends JDialog {
 
         if (editingConfig != null) {
             newCfg.setId(editingConfig.getId());
-            if (completionMode) {
+            if (compressionMode) {
+                settings.updateCompressionModel(newCfg);
+            } else if (completionMode) {
                 settings.updateCompletionModel(newCfg);
             } else {
                 settings.updateChatModel(newCfg);
             }
+        } else if (compressionMode) {
+            settings.addCompressionModel(newCfg);
         } else if (completionMode) {
             settings.addCompletionModel(newCfg);
         } else {
@@ -1211,8 +1249,11 @@ public class AddModelDialog extends JDialog {
         saved = true;
         savedConfig = newCfg;
 
-        settings.setEnableSmartAutoComplete(inlineEnableCheck.isSelected());
-        settings.setCompletionDelayMs(delaySlider.getValue());
+        // 仅补全模式持久化「是否启用补全模型」开关与触发延迟；压缩/聊天模式下内联面板不显示，跳过以免误覆盖补全配置
+        if (completionMode) {
+            settings.setEnableSmartAutoComplete(inlineEnableCheck.isSelected());
+            settings.setCompletionDelayMs(delaySlider.getValue());
+        }
 
         dispose();
     }
