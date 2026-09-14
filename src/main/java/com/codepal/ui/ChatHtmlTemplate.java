@@ -469,6 +469,22 @@ public final class ChatHtmlTemplate {
                 + "padding:12px 8px;font-size:12px;color:" + toolFg + ";user-select:none;"
                 + "border-bottom:1px solid " + (isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.04)") + ";margin-bottom:2px}"
                 + ".history-loader.show{display:flex}"
+                // 已到最早的提示（区分"加载完了"与"卡住了"）
+                + ".history-end{display:none;text-align:center;font-size:12px;color:" + toolFg + ";"
+                + "padding:10px 8px;user-select:none}"
+                + ".history-end.show{display:block}"
+                // 历史对话摘要卡片（压缩摘要，可折叠）
+                + ".lc-summary{margin:12px 2px;border:1px solid " + (isDark ? "#3E4145" : "#E5E7EB") + ";"
+                + "border-radius:10px;background:" + (isDark ? "#2B2D30" : "#F7F8FA") + ";overflow:hidden}"
+                + ".lc-summary-hdr{display:flex;align-items:center;gap:8px;padding:10px 12px;"
+                + "cursor:pointer;font-size:12px;color:" + toolFg + ";user-select:none}"
+                + ".lc-summary-title{color:" + toolAcc + ";font-weight:600}"
+                + ".lc-summary-count{opacity:.75}"
+                + ".lc-summary-toggle{margin-left:auto;transition:transform .15s}"
+                + ".lc-summary.open .lc-summary-toggle{transform:rotate(180deg)}"
+                + ".lc-summary-body{display:none;padding:0 12px 12px;font-size:12px;line-height:1.6;"
+                + "white-space:pre-wrap;color:" + toolFg + "}"
+                + ".lc-summary.open .lc-summary-body{display:block}"
                 + ".history-loader-dot{width:8px;height:8px;border-radius:50%;"
                 + "background:" + toolAcc + ";animation:ldPulse 1.2s ease-in-out infinite}"
                 + "@keyframes ldPulse{0%,100%{opacity:0.3;transform:scale(0.8)}50%{opacity:1;transform:scale(1)}}"
@@ -479,6 +495,7 @@ public final class ChatHtmlTemplate {
                 + "<div id=\"chat\">"
                 + "<div id=\"history-loader\" class=\"history-loader\">"
                 + "<div class=\"history-loader-dot\"></div><span>加载更早的消息...</span></div>"
+                + "<div id=\"history-end\" class=\"history-end\">已经是最早的消息了</div>"
                 + "<div id=\"lc-hero\">"
                 + "<div class=\"lc-hero-title\">Hey,Brother!</div>"
                 + "<div class=\"lc-hero-subtitle\">以无法为有法 以无限为有限</div>"
@@ -495,7 +512,7 @@ public final class ChatHtmlTemplate {
                 + "var lcCtxTarget=null;var lcQaRound=0;"
                 // 新会话空态 hero：添加任何消息时一次性移除
                 + "function removeHero(){var h=document.getElementById('lc-hero');if(h)h.remove();}"
-                + "var lcHistoryLoading=false;var lcHasMoreHistory=false;"
+                + "var lcHistoryLoading=false;var lcHistoryExhausted=false;"
                 // payload 懒加载：cefQuery 异步回传通道（handler 回传 JS 调用此 resolver）
                 + "window.__lcPayloadResolvers = window.__lcPayloadResolvers || {};"
                 + "window.__lcPayloadNonce = window.__lcPayloadNonce || 0;"
@@ -508,6 +525,11 @@ public final class ChatHtmlTemplate {
                 + "function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}"
                 + "function now(){return new Date().toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'})}"
                 + "function getChat(){return document.getElementById('chat')}"
+                // ★ 渲染目标重定向：懒加载批次构建期间指向 #chat 内的隐藏容器（display:none）。
+                //   节点仍在文档中（getElementById 可查），但不产生布局盒、不被绘制 →
+                //   构建过程完全不可见，提交时单任务整体移到顶部。这是"不闪不黑"的关键。
+                + "var lcBuildTarget=null;"
+                + "function lcTarget(){return lcBuildTarget||getChat();}"
                 // 压缩状态卡片
                 + "var lcCompressCardId=null;"
                 + "function _showCompressCard(status){"
@@ -542,14 +564,30 @@ public final class ChatHtmlTemplate {
                 + "function scrollToBottom(){var c=getChat();if(!c)return;"
                 + "lcAutoScroll=true;"
                 + "c.scrollTop=c.scrollHeight;}"
+                // 触发向上懒加载。★ 关键：不能只挂在 scroll 事件上——视口已在 scrollTop=0 时，
+                // 再向上滚滚轮 scrollTop 不再变化 → 不产生 scroll 事件 → 永远不再触发（"滚顶没反应"根因）。
+                // 因此 scroll 与 wheel 两处都调用本函数。
+                // ★ 闸门语义：lcHistoryExhausted 只由 Java 明确回答"没有更多"时才置位；
+                //   任何其它情况（含 Java 暂时拒绝、异常）都必须保持可重试，绝不永久关闭。
+                + "var lcHistoryAskTs=0;"
+                + "function lcDiag(m){if(window.intellijScrollBottomBtn)window.intellijScrollBottomBtn('diag:'+m);}"
+                + "function lcTryLoadOlder(){var c=getChat();if(!c)return;"
+                + "if(c.scrollTop>=50)return;"
+                + "if(lcHistoryLoading||lcBatchBuilding)return;" // 在途或批次构建中不重复触发
+                + "if(!window.intellijLoadHistory)return;"
+                + "if(lcHistoryExhausted)return;"
+                + "var t=Date.now();if(t-lcHistoryAskTs<400)return;lcHistoryAskTs=t;" // 节流：避免滚轮高频
+                + "lcHistoryLoading=true;showHistoryLoading(true);"
+                + "lcDiag('ask offset='+c.scrollTop+' loaded-guard ok');"
+                + "window.intellijLoadHistory();"
+                // 兜底：Java 侧异常/无响应时不让闸门永久卡死，8 秒后自动复位允许重试
+                + "setTimeout(function(){if(lcHistoryLoading){lcHistoryLoading=false;showHistoryLoading(false);"
+                + "lcDiag('timeout-reset');}},8000);}"
                 // scroll tracking
                 + "getChat().addEventListener('scroll',function(){var c=getChat();"
                 + "var dist=c.scrollHeight-c.scrollTop-c.clientHeight;"
                 + "lcAutoScroll=dist<80;"
-                + "if(c.scrollTop<50&&!lcHistoryLoading&&lcHasMoreHistory&&window.intellijLoadHistory){"
-                + "lcHistoryLoading=true;showHistoryLoading(true);window.intellijLoadHistory();"
-                // 兜底：Java 侧静默失败（会话切换/异常）时不让闸门永久卡死，8 秒后自动复位允许重试
-                + "setTimeout(function(){if(lcHistoryLoading){lcHistoryLoading=false;showHistoryLoading(false);}},8000);}"
+                + "lcTryLoadOlder();"
                 + "if(window.intellijScrollBottomBtn){"
                 + "window.intellijScrollBottomBtn(dist>200?'show':'hide');}});"
                 // OSR 模式（setOffScreenRendering(true)）下 Chromium 接收不到 OS 原生平滑滚动，
@@ -559,7 +597,7 @@ public final class ChatHtmlTemplate {
                 + "if(e.deltaX!==0&&e.deltaY===0)return;"
                 + "var c=getChat();var d=e.deltaY;"
                 + "if(e.deltaMode===1){var lh=parseInt(getComputedStyle(c).lineHeight)||16;d=d*lh;}"
-                + "c.scrollTop+=d*2.5;e.preventDefault();},{passive:false});"
+                + "c.scrollTop+=d*2.5;e.preventDefault();lcTryLoadOlder();},{passive:false});"
                 // build message frame
                 + "function mkFrame(type,rawMd){"
                 + "var id='m'+(++lcMsgCount);lcRawCache[id]=rawMd||'';"
@@ -583,7 +621,7 @@ public final class ChatHtmlTemplate {
                 // 供加载占位/思考块在首个文本 token 之前就能挂到正确的消息里
                 + "function ensureAiFrame(){if(lcStreamingMsgId)return;"
                 + "removeHero();"
-                + "var f=mkFrame('ai','');lcStreamingMsgId=f.id;getChat().appendChild(f.wrapper);}"
+                + "var f=mkFrame('ai','');lcStreamingMsgId=f.id;lcTarget().appendChild(f.wrapper);}"
                 // addUserMessage
                 + "function addUserMessage(html,raw,msgId){lcQaRound++;removeHero();var f=mkFrame('user',raw);"
                 + "if(msgId)f.wrapper.setAttribute('data-msgid',msgId);"
@@ -593,14 +631,14 @@ public final class ChatHtmlTemplate {
                 // addHistoryUserMessage: 加载历史消息时使用 DB 原始 qaRound，不自增
                 + "function addHistoryUserMessage(html,raw,qaRound,msgId){lcQaRound=qaRound;removeHero();var f=mkFrame('user',raw);"
                 + "if(msgId)f.wrapper.setAttribute('data-msgid',msgId);"
-                + "f.bubble.innerHTML=html;getChat().appendChild(f.wrapper);addMsgOps(f.id);scrollDown();}"
+                + "f.bubble.innerHTML=html;lcTarget().appendChild(f.wrapper);addMsgOps(f.id);scrollDown();}"
                 // appendMessageHtml: 追加一条完整的历史消息 HTML（已含单帧结构，含唯一头像）。
                 // 用于回显：把合并后的 assistant 段整体渲染为单帧，避免工具调用拆分导致多个头像。
                 + "function appendMessageHtml(html){"
                 + "removeHero();"
                 + "var temp=el('div');temp.innerHTML=html;"
                 + "var node=temp.firstChild;"
-                + "while(temp.firstChild){getChat().appendChild(temp.firstChild);}"
+                + "while(temp.firstChild){lcTarget().appendChild(temp.firstChild);}"
                 + "if(node){node.id='m'+(++lcMsgCount);lcRawCache[node.id]=node.innerText;"
                 + "addMsgOps(node.id);highlightBlocks(node);addCodeCopyBtns(node);linkifyFilePaths(node);}"
                 + "scrollDown();}"
@@ -614,6 +652,7 @@ public final class ChatHtmlTemplate {
                 + "if(!record)return;"
                 + "if(record.role==='user'){"
                 + "addHistoryUserMessage(record.html||'',record.raw||'',record.qaRound||0,record.msgId||'');"
+                + "if(record.msgId)window.__lcLastRenderedEl=document.querySelector('[data-msgid=\"'+record.msgId+'\"]');"
                 + "if(record.compressed&&record.msgId){var uw=document.querySelector('[data-msgid=\"'+record.msgId+'\"]');if(uw)uw.classList.add('lc-compressed');}return;}"
                 + "if(record.role!=='assistant')return;"
                 + "var parts=record.parts||[];"
@@ -633,6 +672,7 @@ public final class ChatHtmlTemplate {
                 + "finalizeReasoning(null);_flushToolGroup();"
                 + "if(lcStreamingMsgId){"
                 + "addMsgOps(lcStreamingMsgId);"
+                + "window.__lcLastRenderedEl=document.getElementById(lcStreamingMsgId);"
                 + "if(record.compressed)document.getElementById(lcStreamingMsgId).classList.add('lc-compressed');"
                 + "if(record.tokenInfo)attachTokenInfo(record.tokenInfo);"
                 + "if(record.timeStr){var tw=document.getElementById(lcStreamingMsgId);"
@@ -646,7 +686,7 @@ public final class ChatHtmlTemplate {
                 + "var w=null;"
                 + "if(!lcStreamingMsgId){"
                 + "var f=mkFrame('ai',raw);lcStreamingMsgId=f.id;"
-                + "getChat().appendChild(f.wrapper);"
+                + "lcTarget().appendChild(f.wrapper);"
                 + "w=f.wrapper;"
                 + "}else{"
                 + "w=document.getElementById(lcStreamingMsgId);}"
@@ -947,7 +987,7 @@ public final class ChatHtmlTemplate {
                 // 平铺卡片若标题尚无锚点（历史回显路径传纯文本标题）也做一次链接化；已有 Java 内嵌锚点则跳过
                 + "var tnm=d.querySelector('.tool-card-name');if(!flat||!(tnm&&tnm.querySelector('a')))linkifyTitleFiles(tnm);"
                 + "if(detail&&!flat){updateToolCardDetail(d,detail);d.classList.add('open');}"
-                + "var target=getChat();"
+                + "var target=lcTarget();"
                 + "var ts=null;"
                 + "if(lcStreamingMsgId){"
                 + "var w=document.getElementById(lcStreamingMsgId);"
@@ -1064,7 +1104,7 @@ public final class ChatHtmlTemplate {
                 + "+'<button class=\"tcc-btn tcc-btn-approve '+btnClass+'\" onclick=\"approveToolConfirm(\\''+id+'\\',\\''+toolCallId+'\\')\">确认执行</button>'"
                 + "+'</div>'"
                 + "+trustHtml;"
-                + "var target=getChat();"
+                + "var target=lcTarget();"
                 + "var ts=null;"
                 + "if(lcStreamingMsgId){"
                 + "var w=document.getElementById(lcStreamingMsgId);"
@@ -1196,7 +1236,7 @@ public final class ChatHtmlTemplate {
                 + "var b=document.getElementById(lcCurrentBubbleId);if(!b)return;"
                 + "b.innerHTML=html;"
                 + "addCodeCopyBtns(b);highlightBlocks(b);linkifyFilePaths(b);scrollDown();}"
-                + "function clearMessages(){var c=getChat();c.innerHTML='';"
+                + "function clearMessages(){var c=getChat();c.innerHTML='';lcBuildTarget=null;lcBatchBuilding=false;"
                 + "var loader=el('div','history-loader');loader.id='history-loader';"
                 + "loader.innerHTML='<div class=\"history-loader-dot\"></div><span>加载更早的消息...</span>';"
                 + "c.appendChild(loader);"
@@ -1209,7 +1249,7 @@ public final class ChatHtmlTemplate {
                 + "lcStreamingRaw='';lcRawCache={};lcAutoScroll=true;"
                 + "lcTodoCardId=null;lcLastTodoJson='';lcPendingCards={};"
                 + "clearStatusTimer();"
-                + "lcHistoryLoading=false;lcHasMoreHistory=false;lcQaRound=0;}"
+                + "lcHistoryLoading=false;lcHistoryExhausted=false;lcQaRound=0;}"
 
 
                 // resetAiStream: 重置流式状态，下次startAiStream会创建新消息
@@ -1419,27 +1459,91 @@ public final class ChatHtmlTemplate {
                 // 顶部加载更早的历史消息
                 + "function showHistoryLoading(show){"
                 + "var loader=document.getElementById('history-loader');"
-                + "if(loader){if(show)loader.classList.add('show');else loader.classList.remove('show');}}"
-                // prependHistoryReplay: 懒加载更早历史，复用 replayHistory 实时渲染链路，
-                // 但把每条 record 产生的消息帧「前置」到 history-loader 之后（而非追加末尾），
-                // 并做滚动位置补偿（视口不跳动）。同时保护 lcQaRound 不被更早批次覆盖。
-                + "function prependHistoryReplay(recordsJson){"
-                + "var records=JSON.parse(recordsJson);"
-                + "if(!records||!records.length){lcHistoryLoading=false;showHistoryLoading(false);return;}"
-                + "var savedRound=lcQaRound;"
-                + "var oldH=getChat().scrollHeight;"
-                + "var loader=document.getElementById('history-loader');"
-                + "var ref=loader?loader.nextSibling:getChat().firstChild;"
-                + "for(var i=0;i<records.length;i++){"
-                + "var before=getChat().childElementCount;"
-                + "replayHistory(records[i]);"
-                + "var after=getChat().childElementCount;var moves=after-before;"
-                + "for(var k=0;k<moves;k++){var last=getChat().lastElementChild;if(last)getChat().insertBefore(last,ref);}}"
-                + "lcQaRound=savedRound;"
-                + "getChat().scrollTop=getChat().scrollHeight-oldH;"
-                + "lcHistoryLoading=false;showHistoryLoading(false);}"
-                + "function setHasMoreHistory(hasMore){lcHasMoreHistory=hasMore;"
-                + "if(!hasMore){lcHistoryLoading=false;showHistoryLoading(false);}}"
+                + "if(loader){if(show)loader.classList.add('show');else loader.classList.remove('show');"
+                // ★ 每次显示前把 loader 归位为 #chat 首子节点：插入锚点失效时会话可能出现
+                //   帧被追加到末尾、把 loader 拱到中间的情况，导致"加载中"根本看不见
+                + "if(show&&getChat().firstElementChild!==loader){getChat().insertBefore(loader,getChat().firstElementChild);}"
+                + "}}"
+                // 已到最早提示：hasMore=false 时展示，明确区分"加载完了"与"卡住了"
+                + "function showHistoryEnd(show){var e=document.getElementById('history-end');"
+                + "if(!e){e=el('div','history-end');e.id='history-end';e.textContent='已经是最早的消息了';"
+                + "var l=document.getElementById('history-loader');var c=getChat();"
+                + "if(l&&l.parentNode===c&&l.nextSibling)c.insertBefore(e,l.nextSibling);else c.insertBefore(e,c.firstElementChild);}"
+                + "if(show)e.classList.add('show');else e.classList.remove('show');}"
+                // ── 懒加载批次：离屏构建 + 原子提交 ──
+                // 构建阶段：Java 逐条调 renderMessageWithParts，全部 append 到 lcBuildTarget。
+                //   lcBuildTarget 挂在 #chat 内但 display:none —— 关键设计：
+                //   ① 节点在文档中 → 所有 document.getElementById(...) 查询照常工作
+                //      （finalizeAiMessage/appendReasoning/addMsgOps/insertToolCard 全靠它查帧）
+                //   ② display:none → 不产生布局盒、不绘制 → 构建过程中的一切中间态永不上屏
+                // 提交阶段：在【同一次 JS 任务】内把子节点整体移到 #chat 顶部并设好 scrollTop，
+                //   浏览器只在任务结束后绘制一次 → 不跳闪；全程没有隐藏/清空可见区 → 不会黑屏。
+                + "var lcBatchSavedRound=0,lcBatchAuto=true,lcBatchBuilding=false,lcBatchTimer=null;"
+                + "function beginHistoryBatch(){"
+                + "lcBatchBuilding=true;"
+                + "lcBatchSavedRound=lcQaRound;lcBatchAuto=lcAutoScroll;"
+                + "lcAutoScroll=false;" // 构建期间禁止自动滚底
+                + "var c=getChat();"
+                + "lcBuildTarget=el('div');lcBuildTarget.id='lc-batch-build';"
+                + "lcBuildTarget.style.display='none';"
+                + "c.appendChild(lcBuildTarget);"
+                + "if(lcBatchTimer)clearTimeout(lcBatchTimer);"
+                // 兜底：异常导致未提交时，10 秒后丢弃容器并复位状态
+                + "lcBatchTimer=setTimeout(function(){if(lcBatchBuilding){lcBatchBuilding=false;"
+                + "var f=document.getElementById('lc-batch-build');if(f)f.remove();lcBuildTarget=null;"
+                + "lcAutoScroll=lcBatchAuto;lcQaRound=lcBatchSavedRound;"
+                + "lcHistoryLoading=false;showHistoryLoading(false);lcDiag('batch-timeout-reset');}},10000);"
+                + "showHistoryEnd(false);}"
+                + "function lcPrependRef(){var c=getChat();"
+                + "var l=document.getElementById('history-loader');"
+                + "if(l&&l.parentNode===c){var n=l.nextSibling;"
+                + "while(n&&n.id==='lc-batch-build')n=n.nextSibling;" // 跳过构建容器自身
+                + "return n?n:c.firstChild;}"
+                + "return c.firstChild;}"
+                + "function commitHistoryBatch(){"
+                + "if(lcBatchTimer){clearTimeout(lcBatchTimer);lcBatchTimer=null;}"
+                + "lcBatchBuilding=false;"
+                + "var c=getChat();var frag=lcBuildTarget;lcBuildTarget=null;"
+                + "lcAutoScroll=lcBatchAuto;lcQaRound=lcBatchSavedRound;" // 还原构建期间被改写的轮次
+                + "if(!frag){lcHistoryLoading=false;showHistoryLoading(false);return;}"
+                + "var n=frag.childNodes.length;"
+                + "if(n>0){"
+                + "var oldH=c.scrollHeight,oldTop=c.scrollTop;" // 容器 display:none → 不计入 oldH
+                + "var ref=lcPrependRef();"
+                // 单任务内整体移动（顺序天然保持：frag.firstChild 依次插到 ref 之前）
+                + "while(frag.firstChild){c.insertBefore(frag.firstChild,ref);}"
+                // 一次补偿：新增内容在已加载内容之前 → 视口按新增高度下移，原消息位置不变
+                + "c.scrollTop=oldTop+(c.scrollHeight-oldH);"
+                + "lcHistoryExhausted=false;}"
+                + "if(frag.parentNode)frag.remove();" // 移除空的构建容器
+                + "lcHistoryLoading=false;showHistoryLoading(false);showHistoryEnd(false);"
+                + "lcDiag('commit nodes='+n);}"
+                // Java 对一次懒加载请求的明确回答：
+                //   hasMore=false → 确实没有更早消息，置 exhausted 停止请求
+                //   hasMore=true  → 还有（或 Java 只是暂时忙/出错）→ 复位闸门等下次重试
+                // 两种情况都必须复位 lcHistoryLoading，否则 JS 会永远挡住后续触发。
+                // 首屏渲染压缩消息后调用（此前调用的同名 JS 函数根本不存在 → 淡化一直无效）
+                + "function markLastMessageCompressed(){var e=window.__lcLastRenderedEl;"
+                + "if(e&&e.classList)e.classList.add('lc-compressed');}"
+                // 历史对话摘要卡片（此前 Java 一直在调 addSummaryCard，但本函数从未定义 → 摘要从未显示）
+                // 走 lcTarget()，因此首屏与懒加载批次都能正确渲染（批次内构建在隐藏容器，提交时一并出现）
+                + "function addSummaryCard(title,count,content){"
+                + "removeHero();"
+                + "var w=el('div','lc-summary');w.id='sm'+(++lcMsgCount);"
+                + "var hdr=el('div','lc-summary-hdr');"
+                + "hdr.innerHTML='<span class=\"lc-summary-title\">'+esc(title||'历史对话摘要')+'</span>'"
+                + "+'<span class=\"lc-summary-count\">'+(count||0)+' 条已压缩</span>'"
+                + "+'<span class=\"lc-summary-toggle\">&#9662;</span>';"
+                + "var body=el('div','lc-summary-body');body.textContent=content||'';"
+                + "hdr.onclick=function(){w.classList.toggle('open');};"
+                + "w.appendChild(hdr);w.appendChild(body);"
+                + "lcTarget().appendChild(w);"
+                + "window.__lcLastRenderedEl=w;}"
+                + "function setHasMoreHistory(hasMore){"
+                + "lcHistoryExhausted=!hasMore;"
+                + "lcHistoryLoading=false;showHistoryLoading(false);"
+                + "showHistoryEnd(!hasMore);"
+                + "lcDiag('answer hasMore='+hasMore);}"
                 // ── 轮播状态消息（shimmer 扫光驱动，动画结束后才切换下一条）──
                 + "var lcStatusMsgs={};var lcStatusList=null;var lcStatusIdx=0;"
                 + "var lcStatusEl=null;var lcStatusTimer=null;var lcStatusAnimEnd=null;"
@@ -1461,7 +1565,7 @@ public final class ChatHtmlTemplate {
                 + "var elId=(id||'tmp-status')+'-status';"
                 + "var st=document.getElementById(elId);"
                 + "if(!st){st=el('div');st.id=elId;st.className='lc-status';"
-                + "if(ts){bw.insertBefore(st,ts);}else if(w){w.appendChild(st);}else{getChat().appendChild(st);}}"
+                + "if(ts){bw.insertBefore(st,ts);}else if(w){w.appendChild(st);}else{lcTarget().appendChild(st);}}"
                 + "lcStatusEl=st;return st;}"
                 + "function showAndShimmer(st,text){"
                 + "stopShimmerOn(st);"

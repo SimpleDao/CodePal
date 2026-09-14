@@ -5944,24 +5944,27 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     @Override
-    public void prependHistoryRecords(java.util.Map<ChatMessageEntity, java.util.List<com.codepal.model.MessagePartEntity>> records) {
+    public void renderHistoryBatch(java.util.Map<ChatMessageEntity, java.util.List<com.codepal.model.MessagePartEntity>> records) {
         if (records == null || records.isEmpty()) return;
-        // 构造 replay 记录 JSON 数组，交给 JS prependHistoryReplay 复用实时渲染链路前置插入
-        StringBuilder sb = new StringBuilder("[");
-        boolean first = true;
+        // ★ 离屏构建 + 原子插入：beginHistoryBatch 让 JS 把渲染目标切到游离容器（未 attach → 不上屏），
+        //   逐条 renderMessageWithParts 全部写进该容器；commitHistoryBatch 在单次 JS 任务内
+        //   整体插入聊天区顶部并一次补偿滚动位置。全程无"清空重建"、无隐藏 → 不跳闪、不黑屏。
+        chatWebView.beginHistoryBatch();
         for (java.util.Map.Entry<ChatMessageEntity, java.util.List<com.codepal.model.MessagePartEntity>> entry : records.entrySet()) {
-            String recJson = buildReplayRecordJson(entry.getKey(), entry.getValue());
-            if (recJson == null || recJson.isEmpty()) continue;
-            if (!first) sb.append(",");
-            sb.append(recJson);
-            first = false;
+            renderMessageWithParts(entry.getKey(), entry.getValue());
         }
-        sb.append("]");
-        chatWebView.prependHistoryReplay(sb.toString());
+        chatWebView.commitHistoryBatch();
+        // 加载完成：恢复状态栏（生成中不改，避免覆盖流式状态）
+        if (statusLabel != null
+                && (streamRenderController == null || !streamRenderController.isReceiving())) {
+            statusLabel.setText("就绪");
+            statusLabel.setForeground(JBColor.GRAY);
+        }
     }
 
     @Override
     public void setHasMoreHistory(boolean hasMore) {
+        System.out.println("[HistoryLoad] → JS hasMore=" + hasMore);
         chatWebView.setHasMoreHistory(hasMore);
     }
 
@@ -6222,6 +6225,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             } else if ("text".equals(kind)) {
                 String c = p.getContent() != null ? p.getContent() : "";
                 po.addProperty("kind", "text");
+                // raw 是复制按钮数据源（lcRawCache），不截断以保复制保真
                 po.addProperty("raw", c);
                 po.addProperty("bodyHtml", MarkdownUtil.toHtmlFragment(c));
             } else if ("tool".equals(kind)) {
@@ -6291,6 +6295,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * 滚动到顶部时触发，从 DB 加载更早的消息并向前插入。
      */
     private void loadMoreHistory() {
+        // 重放期间聊天区被 JS 隐藏（防跳闪），用底部状态栏给用户反馈
+        if (chatSessionManager.canLoadMoreHistory() && statusLabel != null
+                && (streamRenderController == null || !streamRenderController.isReceiving())) {
+            statusLabel.setText("正在加载更早的消息…");
+            statusLabel.setForeground(JBColor.GRAY);
+        }
         chatSessionManager.loadMoreHistory();
     }
 

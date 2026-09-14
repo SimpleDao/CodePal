@@ -465,10 +465,24 @@ public class DBChatHistoryRepository {
         }
     }
 
-    /** 分页获取消息 + parts：返回合并后条目（供 UI 渲染）与合并前 DB 行数（供分页 offset/total 计算） */
+    /** 分页获取消息 + parts：返回合并后条目（供 UI 渲染）与合并前 DB 行数（供分页 offset/total 计算）。
+     *  ★ 轮次对齐：批次的最早一行若不是 user 行（说明取在了某轮的中段），继续向更早追加同一轮的
+     *    剩余行直到该轮 user 行。否则一轮的行被前后两个批次拆开 → 各自合并渲染出两个 L 头像。
+     *    对齐后每批的最早一行恒为轮首（user 行），一轮必属且只属一个批次。 */
     public static HistoryPage getSessionPage(String sessionId, int limit, int offset) {
-        Map<ChatMessageEntity, List<MessagePartEntity>> result = new LinkedHashMap<>();
         List<ChatMessageEntity> messages = getRecentMessages(sessionId, limit, offset);
+        int cursor = offset + messages.size();
+        int guard = 0;
+        while (!messages.isEmpty() && guard++ < 50) {
+            String oldestRole = messages.get(0).getRole();
+            // user 行 = 轮首；system 行（含压缩摘要）也视为安全边界。assistant/tool 行 = 轮次中段，需向前补
+            if ("user".equals(oldestRole) || "system".equals(oldestRole)) break;
+            List<ChatMessageEntity> more = getRecentMessages(sessionId, 80, cursor);
+            if (more.isEmpty()) break; // 已到会话最早端
+            cursor += more.size();
+            messages.addAll(0, more); // more 为时间正序，且都早于当前批最早行 → 头插
+        }
+        Map<ChatMessageEntity, List<MessagePartEntity>> result = new LinkedHashMap<>();
         for (ChatMessageEntity msg : messages) {
             List<MessagePartEntity> parts = getMessageParts(msg.getId());
             result.put(msg, parts);
@@ -477,37 +491,31 @@ public class DBChatHistoryRepository {
         // 拆成多条 messages 行，回显时每条都会渲染成独立帧（出现多个 L 头像）。这里把同轮连续的
         // assistant 段合并为单条，保证历史回显只有一个头像、parts 按时间序排列。
         Map<ChatMessageEntity, List<MessagePartEntity>> merged = new LinkedHashMap<>();
-        ChatMessageEntity last = null;
+        ChatMessageEntity last = null;            // 当前已合并条目的最后一条消息
+        ChatMessageEntity lastAssistant = null;   // 该条目内的 assistant 消息（用于吸收同轮 tool 行）
         for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : result.entrySet()) {
             ChatMessageEntity rec = entry.getKey();
             List<MessagePartEntity> parts = entry.getValue();
-            if (last != null && "assistant".equals(rec.getRole()) && "assistant".equals(last.getRole())
-                    && rec.getQaRound() == last.getQaRound()) {
-                merged.get(last).addAll(parts);
+            String role = rec.getRole();
+            // 同一 qa_round 内连续的 assistant 行合并为一条（工具调用边界产生的多行 = 一轮完整回复）
+            if (lastAssistant != null && "assistant".equals(role)
+                    && rec.getQaRound() == lastAssistant.getQaRound()) {
+                merged.get(lastAssistant).addAll(parts);
+                last = rec;
+                continue;
+            }
+            // 旧版本数据的独立 tool 行：吸收进同轮 assistant 条目，避免多出一个空帧
+            if (lastAssistant != null && "tool".equals(role)
+                    && rec.getQaRound() == lastAssistant.getQaRound()) {
+                merged.get(lastAssistant).addAll(parts);
+                last = rec;
                 continue;
             }
             merged.put(rec, parts);
             last = rec;
+            lastAssistant = "assistant".equals(role) ? rec : null;
         }
         return new HistoryPage(merged, messages.size());
-    }
-
-    public static int getMessagesCount(String sessionId) {
-        // ★ 与 getRecentMessages 同口径：不再过滤压缩消息（UI 全量展示，分页计数才不会错位）
-        String sql = """
-            SELECT COUNT(*) AS cnt FROM messages
-            WHERE session_id = ?
-            """;
-        try (Connection conn = SqliteDatabaseManager.getConnection();
-             PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, sessionId);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) return rs.getInt("cnt");
-            }
-        } catch (Exception e) {
-            LOG.error("getMessagesCount failed", e);
-        }
-        return 0;
     }
 
     /** 按 QA 轮次删除消息 — 无外键，手动按 message_id 级联清理 parts */

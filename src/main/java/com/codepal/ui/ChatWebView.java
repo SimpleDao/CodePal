@@ -174,6 +174,11 @@ public final class ChatWebView {
 
         scrollBottomQuery = JBCefJSQuery.create((JBCefBrowserBase) browser);
         scrollBottomQuery.addHandler((params) -> {
+            // diag: 前缀为历史懒加载诊断日志（JS 侧状态上报），不能落进可见性分支
+            if (params != null && params.startsWith("diag:")) {
+                System.out.println("[HistoryLoad-JS] " + params.substring(5));
+                return null;
+            }
             if (scrollBottomCallback != null && params != null) {
                 scrollBottomCallback.onVisibilityChanged("show".equals(params));
             }
@@ -528,14 +533,17 @@ public final class ChatWebView {
 
     // ── 历史懒加载 ──
 
-    /** 向顶部前置插入更早的历史消息（复用实时 replay 链路；recordsJson = [{record},...]） */
-    public void prependHistoryReplay(String recordsJson) {
-        executeJs("prependHistoryReplay(" + recordsJson + ")");
+    /**
+     * 懒加载批次开始：JS 切到「离屏构建目标」（隐藏容器），此后所有消息渲染都写进该容器，
+     * 不会上屏。配合 {@link #commitHistoryBatch()} 实现"原子提交"，避免插入过程的跳闪。
+     */
+    public void beginHistoryBatch() {
+        executeJs("beginHistoryBatch()");
     }
 
-    /** 显示/隐藏顶部加载指示器 */
-    public void showHistoryLoading(boolean show) {
-        executeJs("showHistoryLoading(" + (show ? "true" : "false") + ")");
+    /** 懒加载批次提交：JS 在单次任务内把离屏内容整体插入聊天区顶部并一次补偿滚动位置 */
+    public void commitHistoryBatch() {
+        executeJs("commitHistoryBatch()");
     }
 
     /** 通知前端是否还有更早的历史可加载 */

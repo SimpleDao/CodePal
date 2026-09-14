@@ -52,17 +52,33 @@ public class ChatSessionManager {
     private String currentSessionId;
     private String currentSessionTitle;
     private int currentQaRound;
-    private int historyLoadedCount;
-    private int historyTotalCount;
     private boolean isLoadingHistory;
     private boolean loadingSessionConfig;
+    /** 已计入 conversationManager 的行 id（懒加载重查时用于计算增量，避免上下文重复/丢失） */
+    private final java.util.Set<String> contextIds = new java.util.HashSet<>();
+
+    // ── 「展示」与「上下文」解耦（2026-09-14）──────────────────────────────
+    // 背景：此前用同一个行数同时决定"读多少进模型上下文"和"UI 展示多少"，
+    // 于是缩小展示条数会连带削掉模型记忆（连压缩摘要都会丢）。
+    // 现在：上下文按 CONTEXT_ROWS 预载（模型记忆不变），UI 默认只展示末尾 DISPLAY_ENTRIES 条；
+    // 向上滚动优先从已加载条目里翻（不查库），翻完再向 DB 取更早一批。
+    /** 已从 DB 加载的条目（时间正序，含正文/思考/工具 parts） */
+    private final java.util.LinkedHashMap<ChatMessageEntity, List<MessagePartEntity>> loadedEntries =
+            new java.util.LinkedHashMap<>();
+    /** loadedEntries 覆盖的 DB 行数（= 向 DB 取更早数据的 offset） */
+    private int loadedRows = 0;
+    /** loadedEntries 末尾已展示给用户的条目数（展示窗口 = 末尾 displayedCount 条） */
+    private int displayedCount = 0;
+    /** 上一次向 DB 取数是否取满一页（true = 库里可能还有更早数据） */
+    private boolean dbMaybeMore = false;
 
     public interface UiCallbacks {
         void clearMessages();
         void clearTodoList();
         void clearAllSessionState();
-        /** 懒加载：前置插入更早的历史批次（已合并同轮），含消息头 + 所有 parts，由 UI 层复用 replay 链路渲染 */
-        void prependHistoryRecords(java.util.Map<ChatMessageEntity, List<MessagePartEntity>> records);
+        /** 懒加载：渲染一批更早的历史（已合并同轮，按时间正序）。
+         *  UI 层须在"离屏容器"里构建，最后原子插入顶部 —— 避免中间态上屏（跳闪）与清空重建（黑屏）。 */
+        void renderHistoryBatch(java.util.Map<ChatMessageEntity, List<MessagePartEntity>> records);
         void setHasMoreHistory(boolean hasMore);
         void removeMessagesByRound(int qaRound);
         void setQaRound(int qaRound);
@@ -170,14 +186,6 @@ public class ChatSessionManager {
         currentQaRound++;
     }
 
-    public int getHistoryLoadedCount() {
-        return historyLoadedCount;
-    }
-
-    public int getHistoryTotalCount() {
-        return historyTotalCount;
-    }
-
     public boolean isLoadingHistory() {
         return isLoadingHistory;
     }
@@ -223,10 +231,10 @@ public class ChatSessionManager {
         currentSessionTitle = "新会话";
         if (uiCallbacks != null) uiCallbacks.onActivateSession(null, currentSessionTitle);
         currentQaRound = 0;
-        historyLoadedCount = 0;
-        historyTotalCount = 0;
         isLoadingHistory = false;
         loadingSessionConfig = false;
+        contextIds.clear();
+        resetLoadedState();
 
         if (uiCallbacks != null) uiCallbacks.clearAllSessionState();
 
@@ -263,8 +271,8 @@ public class ChatSessionManager {
         currentSessionTitle = DBChatHistoryRepository.getSessionTitle(sessionId);
         if (uiCallbacks != null) uiCallbacks.onActivateSession(currentSessionId, currentSessionTitle);
         currentQaRound = 0;
-        historyLoadedCount = 0;
-        historyTotalCount = 0;
+        contextIds.clear();
+        resetLoadedState();
         isLoadingHistory = true;  // 历史加载期间阻止发送（避免上下文为空）
         loadingSessionConfig = false;
 
@@ -276,62 +284,71 @@ public class ChatSessionManager {
         conversationManager.getMessages().clear();
         if (systemMsg != null) conversationManager.getMessages().add(systemMsg);
 
-        // 首次加载尽量多（最近 500 行），超长历史再靠 loadMoreHistory 补全。
-        // ★ 查询不过滤压缩消息：UI 全量展示；conversationManager 侧按 meta 跳过已压缩消息
-        //   （压缩语义 = 精简模型上下文，不是删除用户聊天记录）。
+        // 首屏：读入 CONTEXT_ROWS 行进模型上下文（模型记忆/压缩摘要都不缩水），
+        // 但 UI 只展示末尾 DISPLAY_ENTRIES 条（展示与上下文解耦）。
+        // ★ 查询不过滤压缩消息：聊天记录全量可见；conversationManager 侧按 meta 跳过已压缩消息。
         ThreadHelper.executeAsync(project,
-                () -> DBChatHistoryRepository.getSessionPage(sessionId, 500, 0),
+                () -> {
+                    try {
+                        return DBChatHistoryRepository.getSessionPage(sessionId, CONTEXT_ROWS, 0);
+                    } catch (Exception e) {
+                        // 同 loadMoreHistory：dbTask 抛异常时 uiTask 回调不会执行，isLoadingHistory 永久 true
+                        System.err.println("[HistoryLoad] 首屏查询异常: " + e);
+                        e.printStackTrace();
+                        return null;
+                    }
+                },
                 page -> {
-                    var result = page != null ? page.merged : null;
-                    if (result == null || result.isEmpty()) {
-                        isLoadingHistory = false;
-                        if (uiCallbacks != null) uiCallbacks.onHistoryLoaded();
-                        return;
-                    }
-                    System.out.println("uiMsgs = " + result.keySet());
-                    // ★ 分页口径：必须用合并前 DB 行数（OFFSET/LIMIT/COUNT 都是行数口径），
-                    //   用合并后条目数当 offset 会与未合并行集合错位 → 重复加载/hasMore 误判
-                    historyLoadedCount = page.dbRowCount;
-
-                    if (uiCallbacks != null) uiCallbacks.clearMessages();
-
-                    for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : result.entrySet()) {
-                        ChatMessageEntity rec = entry.getKey();
-                        List<MessagePartEntity> parts = entry.getValue();
-
-                        // 压缩的普通消息（meta 含 compressed 且非 summary）：只渲染 UI，不进模型上下文
-                        if (!isSummaryMessage(rec) && isCompressedMessage(rec)) {
-                            if (uiCallbacks != null) uiCallbacks.renderMessageWithParts(rec, parts);
-                            continue;
+                    try {
+                        var result = page != null ? page.merged : null;
+                        if (result == null || result.isEmpty()) {
+                            if (uiCallbacks != null) uiCallbacks.onHistoryLoaded();
+                            return;
                         }
 
-                        List<ChatMessage> builtMsgs = buildChatMessagesFromParts(rec, parts);
-                        conversationManager.getMessages().addAll(builtMsgs);
+                        loadedEntries.clear();
+                        loadedEntries.putAll(result);
+                        loadedRows = page.dbRowCount;
+                        dbMaybeMore = page.dbRowCount >= CONTEXT_ROWS;
+                        displayedCount = 0;
+                        System.out.println("[HistoryLoad] 首屏预载 " + loadedEntries.size()
+                                + " 条（DB 行 " + loadedRows + "），展示 "
+                                + Math.min(DISPLAY_ENTRIES, loadedEntries.size()) + " 条");
 
-                        // 渲染 UI
-                        if (uiCallbacks != null) {
-                            uiCallbacks.renderMessageWithParts(rec, parts);
+                        contextIds.clear();
+                        // ① 上下文：全部预载条目（压缩消息除外，摘要保留）
+                        for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : loadedEntries.entrySet()) {
+                            ChatMessageEntity rec = entry.getKey();
+                            contextIds.add(rec.getId());
+                            if (!isSummaryMessage(rec) && isCompressedMessage(rec)) continue;
+                            conversationManager.getMessages().addAll(
+                                    buildChatMessagesFromParts(rec, entry.getValue()));
                         }
-                    }
 
-                    if (!result.isEmpty()) {
-                        int maxRound = result.keySet().stream()
+                        // ② UI：清空后只渲染末尾 DISPLAY_ENTRIES 条（与懒加载同一套批次渲染机制）
+                        if (uiCallbacks != null) uiCallbacks.clearMessages();
+                        int show = Math.min(DISPLAY_ENTRIES, loadedEntries.size());
+                        renderBeforeDisplayed(show);
+                        displayedCount = show;
+
+                        int maxRound = loadedEntries.keySet().stream()
                                 .mapToInt(ChatMessageEntity::getQaRound).max().orElse(0);
                         currentQaRound = maxRound;
                         if (uiCallbacks != null) uiCallbacks.setQaRound(maxRound);
+                        if (uiCallbacks != null) uiCallbacks.onHistoryLoaded();
+                    } catch (Throwable t) {
+                        // ★ 关键防御：此循环内任何异常若逃逸，isLoadingHistory 会永久 true
+                        //   （UI 正常但向上懒加载永久静默失败），且总数回调不会发出。
+                        System.err.println("[HistoryLoad] 首屏渲染异常: " + t);
+                        t.printStackTrace();
+                    } finally {
+                        isLoadingHistory = false;
+                        boolean hasMore = hasMoreAvailable();
+                        System.out.println("[HistoryLoad] 首屏完成 loadedRows=" + loadedRows
+                                + " entries=" + loadedEntries.size() + " shown=" + displayedCount
+                                + " hasMore=" + hasMore);
+                        if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
                     }
-                    if (uiCallbacks != null) uiCallbacks.onHistoryLoaded();
-                    isLoadingHistory = false;
-
-                    ThreadHelper.executeAsync(project,
-                            () -> DBChatHistoryRepository.getMessagesCount(sessionId),
-                            total -> {
-                                historyTotalCount = total;
-                                if (uiCallbacks != null) {
-                                    uiCallbacks.setHasMoreHistory(historyLoadedCount < total);
-                                }
-                            }
-                    );
                 }
         );
     }
@@ -405,45 +422,155 @@ public class ChatSessionManager {
         }
     }
 
+    /** 上下文预载行数：打开会话时读入模型上下文的规模（与"展示条数"解耦，保证模型记忆不缩水） */
+    private static final int CONTEXT_ROWS = 500;
+    /** 默认展示的最大条数（条 = 一条用户消息 或 一轮完整模型回复） */
+    private static final int DISPLAY_ENTRIES = 20;
+    /** 每次向上滚动展示的条数 */
+    private static final int SCROLL_ENTRIES = 20;
+    /** 内存窗口翻完后，每次向 DB 取更早数据的行数 */
+    private static final int LAZY_PAGE_SIZE = 80;
+
     public boolean canLoadMoreHistory() {
-        return !isLoadingHistory && historyLoadedCount < historyTotalCount && currentSessionId != null;
+        if (isLoadingHistory || currentSessionId == null) return false;
+        return hasMoreAvailable();
+    }
+
+    /** 是否还有可展示的更早内容（内存里有未展示的，或库里可能还有） */
+    private boolean hasMoreAvailable() {
+        return (loadedEntries.size() > displayedCount) || dbMaybeMore;
+    }
+
+    /** 清空「已加载但可能未展示」的历史状态（切换/新建会话时调用） */
+    private void resetLoadedState() {
+        loadedEntries.clear();
+        loadedRows = 0;
+        displayedCount = 0;
+        dbMaybeMore = false;
+    }
+
+    /** 渲染 loadedEntries 中紧邻「已展示区」之前的 take 条（把展示窗口向上扩展 take 条）。
+     *  仅渲染，不改上下文（内存路径不查库、不碰模型上下文）。 */
+    private void renderBeforeDisplayed(int take) {
+        if (uiCallbacks == null || take <= 0) return;
+        int size = loadedEntries.size();
+        int end = size - displayedCount;
+        int start = Math.max(0, end - take);
+        if (start >= end) return;
+        uiCallbacks.renderHistoryBatch(slice(start, end));
+    }
+
+    /** 取 loadedEntries 的 [start, end) 区间为一个有序 Map */
+    private java.util.LinkedHashMap<ChatMessageEntity, List<MessagePartEntity>> slice(int start, int end) {
+        java.util.LinkedHashMap<ChatMessageEntity, List<MessagePartEntity>> out =
+                new java.util.LinkedHashMap<>();
+        int i = 0;
+        for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> e : loadedEntries.entrySet()) {
+            if (i >= end) break;
+            if (i >= start) out.put(e.getKey(), e.getValue());
+            i++;
+        }
+        return out;
+    }
+
+    /** 把更早的一批条目头插进 loadedEntries（保持时间正序） */
+    private void prependLoaded(java.util.Map<ChatMessageEntity, List<MessagePartEntity>> older) {
+        if (older == null || older.isEmpty()) return;
+        java.util.LinkedHashMap<ChatMessageEntity, List<MessagePartEntity>> merged =
+                new java.util.LinkedHashMap<>(older);
+        merged.putAll(loadedEntries);
+        loadedEntries.clear();
+        loadedEntries.putAll(merged);
     }
 
     public void loadMoreHistory() {
+        int undisplayed = loadedEntries.size() - displayedCount;
+
+        // ① 内存快路径：已加载但尚未展示的条目直接渲染（不查库、不动模型上下文）
+        if (!isLoadingHistory && currentSessionId != null && undisplayed > 0) {
+            int take = Math.min(undisplayed, SCROLL_ENTRIES);
+            System.out.println("[HistoryLoad] 内存路径：展示更早 " + take + " 条（未展示 "
+                    + undisplayed + " 条）");
+            renderBeforeDisplayed(take);
+            displayedCount += take;
+            if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMoreAvailable());
+            return;
+        }
+
         if (!canLoadMoreHistory()) {
-            if (uiCallbacks != null && historyLoadedCount >= historyTotalCount) {
-                uiCallbacks.setHasMoreHistory(false);
-            }
+            System.out.println("[HistoryLoad] 拒绝加载：isLoading=" + isLoadingHistory
+                    + " loadedRows=" + loadedRows + " entries=" + loadedEntries.size()
+                    + " shown=" + displayedCount + " dbMaybeMore=" + dbMaybeMore);
+            // ★ 拒绝也必须给 JS 明确回答，否则闸门一直挂着，后续滚顶全被挡掉
+            if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMoreAvailable());
             return;
         }
 
         isLoadingHistory = true;
-        final int offset = historyLoadedCount;
+        // ② 内存窗口翻完 → 向 DB 取更早一批（80 行，轮次对齐在 getSessionPage 内保证）
+        final int offset = loadedRows;
+        final String sid = currentSessionId;
+        System.out.println("[HistoryLoad] 取更早一批：offset=" + offset
+                + " pageSize=" + LAZY_PAGE_SIZE);
 
         ThreadHelper.executeAsync(project,
-                () -> DBChatHistoryRepository.getSessionPage(currentSessionId, 80, offset),
+                () -> {
+                    try {
+                        return DBChatHistoryRepository.getSessionPage(sid, LAZY_PAGE_SIZE, offset);
+                    } catch (Exception e) {
+                        // ★ 关键防御：ThreadHelper 的 uiTask 回调在 dbTask 抛异常时不会执行，
+                        //   isLoadingHistory 会永久卡 true（之后每次滚顶都静默失效）。
+                        System.err.println("[HistoryLoad] 查询异常: " + e);
+                        e.printStackTrace();
+                        return null;
+                    }
+                },
                 page -> {
-                    isLoadingHistory = false;
-                    var result = page != null ? page.merged : null;
-                    if (result == null || result.isEmpty()) {
-                        if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(false);
-                        return;
+                    try {
+                        var result = page != null ? page.merged : null;
+                        if (result == null || result.isEmpty()) {
+                            System.out.println("[HistoryLoad] 无更早消息，停止懒加载");
+                            dbMaybeMore = false;
+                            if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(false);
+                            return;
+                        }
+
+                        // 模型上下文：只补本批新增（未被计入过的行），按时间正序插入 system 之后
+                        java.util.Map<ChatMessageEntity, List<MessagePartEntity>> delta =
+                                new java.util.LinkedHashMap<>();
+                        for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : result.entrySet()) {
+                            ChatMessageEntity rec = entry.getKey();
+                            if (contextIds.contains(rec.getId())) continue;
+                            contextIds.add(rec.getId());
+                            if (!isSummaryMessage(rec) && isCompressedMessage(rec)) continue;
+                            delta.put(rec, entry.getValue());
+                        }
+                        if (!delta.isEmpty()) insertHistoryBeforeExisting(delta);
+
+                        // 头插进已加载集合（更早 → 放前面）
+                        prependLoaded(result);
+                        loadedRows += page.dbRowCount;
+                        dbMaybeMore = page.dbRowCount >= LAZY_PAGE_SIZE;
+                        System.out.println("[HistoryLoad] 取到 " + result.size() + " 条（DB 行 "
+                                + page.dbRowCount + "），loadedRows=" + loadedRows);
+
+                        // UI：只展示这批里最新的 SCROLL_ENTRIES 条，其余留在内存供后续滚动瞬时展开
+                        int n = result.size();
+                        int take = Math.min(n, SCROLL_ENTRIES);
+                        if (uiCallbacks != null) uiCallbacks.renderHistoryBatch(slice(n - take, n));
+                        displayedCount += take;
+
+                        boolean hasMore = hasMoreAvailable();
+                        System.out.println("[HistoryLoad] 批次完成 shown=" + displayedCount
+                                + " hasMore=" + hasMore);
+                        if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
+                    } catch (Throwable t) {
+                        System.err.println("[HistoryLoad] 批次回调异常: " + t);
+                        t.printStackTrace();
+                        if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(true);
+                    } finally {
+                        isLoadingHistory = false;
                     }
-
-                    historyLoadedCount += page.dbRowCount;
-
-                    // ★ 关键修复：加载的历史必须真正加入 conversationManager，
-                    // 否则 UI 上能看到、模型上下文里却没有 → 模型失忆。
-                    // result 是更早批次（offset 递增），插入到 system 之后、现有消息之前。
-                    insertHistoryBeforeExisting(result);
-
-                    // 直接把合并后的 records 交给 UI 层，由 UI 复用 replay 实时渲染链路前置插入
-                    if (uiCallbacks != null) {
-                        uiCallbacks.prependHistoryRecords(result);
-                    }
-
-                    boolean hasMore = historyLoadedCount < historyTotalCount;
-                    if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
                 }
         );
     }
@@ -475,6 +602,8 @@ public class ChatSessionManager {
         }
 
         uiCallbacks.removeMessagesByRound(qaRound);
+        // 同步内存窗口：删除的轮次不能留在 loadedEntries 里，否则后续向上滚动会把已删消息再渲染出来
+        loadedEntries.keySet().removeIf(rec -> rec.getQaRound() == qaRound);
 
         System.out.println("[Delete] 删除前消息列表 (qaRound):");
         synchronized (conversationManager.getMessages()) {
@@ -684,7 +813,7 @@ public class ChatSessionManager {
     public void resetConversation(String systemPrompt) {
         conversationManager.reset(systemPrompt);
         currentQaRound = 0;
-        historyLoadedCount = 0;
-        historyTotalCount = 0;
+        contextIds.clear();
+        resetLoadedState();
     }
 }
