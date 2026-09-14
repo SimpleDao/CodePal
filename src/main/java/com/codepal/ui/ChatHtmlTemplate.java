@@ -94,6 +94,8 @@ public final class ChatHtmlTemplate {
                 + ";letter-spacing:0.3px;line-height:1.6;}"
                 + ".msg{display:flex;flex-direction:column;margin-bottom:8px;animation:fadeIn 0.2s ease;width:100%}"
                 + ".msg-user{align-items:flex-end}.msg-ai{align-items:flex-start}"
+                // 已压缩出模型上下文的普通消息：聊天记录仍完整可见，仅视觉淡化以区分
+                + ".lc-compressed{opacity:.45}"
                 + "@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}"
                 + ".avatar{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;"
                 + "font-size:12px;font-weight:bold;flex-shrink:0;margin-top:2px}"
@@ -545,7 +547,9 @@ public final class ChatHtmlTemplate {
                 + "var dist=c.scrollHeight-c.scrollTop-c.clientHeight;"
                 + "lcAutoScroll=dist<80;"
                 + "if(c.scrollTop<50&&!lcHistoryLoading&&lcHasMoreHistory&&window.intellijLoadHistory){"
-                + "lcHistoryLoading=true;showHistoryLoading(true);window.intellijLoadHistory();}"
+                + "lcHistoryLoading=true;showHistoryLoading(true);window.intellijLoadHistory();"
+                // 兜底：Java 侧静默失败（会话切换/异常）时不让闸门永久卡死，8 秒后自动复位允许重试
+                + "setTimeout(function(){if(lcHistoryLoading){lcHistoryLoading=false;showHistoryLoading(false);}},8000);}"
                 + "if(window.intellijScrollBottomBtn){"
                 + "window.intellijScrollBottomBtn(dist>200?'show':'hide');}});"
                 // OSR 模式（setOffScreenRendering(true)）下 Chromium 接收不到 OS 原生平滑滚动，
@@ -609,7 +613,8 @@ public final class ChatHtmlTemplate {
                 + "function replayHistory(record){"
                 + "if(!record)return;"
                 + "if(record.role==='user'){"
-                + "addHistoryUserMessage(record.html||'',record.raw||'',record.qaRound||0,record.msgId||'');return;}"
+                + "addHistoryUserMessage(record.html||'',record.raw||'',record.qaRound||0,record.msgId||'');"
+                + "if(record.compressed&&record.msgId){var uw=document.querySelector('[data-msgid=\"'+record.msgId+'\"]');if(uw)uw.classList.add('lc-compressed');}return;}"
                 + "if(record.role!=='assistant')return;"
                 + "var parts=record.parts||[];"
                 + "ensureAiFrame();" // 兜底：纯工具轮/纯思考轮也要有 L 帧，否则工具卡片会脱离消息帧
@@ -628,6 +633,7 @@ public final class ChatHtmlTemplate {
                 + "finalizeReasoning(null);_flushToolGroup();"
                 + "if(lcStreamingMsgId){"
                 + "addMsgOps(lcStreamingMsgId);"
+                + "if(record.compressed)document.getElementById(lcStreamingMsgId).classList.add('lc-compressed');"
                 + "if(record.tokenInfo)attachTokenInfo(record.tokenInfo);"
                 + "if(record.timeStr){var tw=document.getElementById(lcStreamingMsgId);"
                 + "if(tw){var ts=tw.querySelector('.ts span');if(ts)ts.textContent=record.timeStr;}}"
@@ -780,7 +786,11 @@ public final class ChatHtmlTemplate {
                 + "function fmtTok(n){n=n||0;return (''+n).replace(/\\B(?=(\\d{3})+(?!\\d))/g,',');}"
                 + "function attachTokenInfo(json){var mid=lcStreamingMsgId;if(!mid)return;var m=document.getElementById(mid);if(!m)return;var ts=m.querySelector('.ts');if(!ts)return;var info=null;try{info=JSON.parse(json);}catch(e){return;}"
                 + "if(ts.querySelector('.ts-token'))return;var chip=el('span','ts-token');chip.innerHTML='<svg class=\\\"tk-ico\\\" viewBox=\\\"0 0 24 24\\\" fill=\\\"none\\\" stroke=\\\"currentColor\\\" stroke-width=\\\"2\\\" stroke-linecap=\\\"round\\\" stroke-linejoin=\\\"round\\\"><path d=\\\"M18 20V10\\\"/><path d=\\\"M12 20V4\\\"/><path d=\\\"M6 20v-6\\\"/></svg>';"
-                + "chip.title='本次回答 token 消耗';ts.appendChild(chip);chip.addEventListener('mouseenter',function(){showTokenPop(info,chip);});chip.addEventListener('mouseleave',scheduleHideTokenPop);}"
+                + "chip.title='本次回答 token 消耗';"
+                // 固定插入位置：chip 恒在复制图标（.ts-copy）左侧，不依赖实时/回显两条路径的调用时序
+                // （实时=chip先copy后；回显=parts渲染时copy已先入，收尾才挂chip，appendChild会跑到右侧）
+                + "var copyBtn=ts.querySelector('.ts-copy');if(copyBtn)ts.insertBefore(chip,copyBtn);else ts.appendChild(chip);"
+                + "chip.addEventListener('mouseenter',function(){showTokenPop(info,chip);});chip.addEventListener('mouseleave',scheduleHideTokenPop);}"
                 + "function showTokenPop(info,anchor){cancelHideTokenPop();var p=ensureTokenPop();"
                 + "var inp=info.input||0,out=info.output||0,ch=info.cacheHit||0,cm=info.cacheMiss||0,tot=info.total||(inp+out),cost=info.cost||'';"
                 + "var sys=info.system||0,conv=info.conversation||0,toolsT=info.toolsTotal||0,subT=info.subagentsTotal||0;"

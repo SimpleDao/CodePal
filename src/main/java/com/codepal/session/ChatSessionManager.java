@@ -276,23 +276,34 @@ public class ChatSessionManager {
         conversationManager.getMessages().clear();
         if (systemMsg != null) conversationManager.getMessages().add(systemMsg);
 
-        // 首次加载尽量多（最近 500 条），超长历史再靠 loadMoreHistory 补全
+        // 首次加载尽量多（最近 500 行），超长历史再靠 loadMoreHistory 补全。
+        // ★ 查询不过滤压缩消息：UI 全量展示；conversationManager 侧按 meta 跳过已压缩消息
+        //   （压缩语义 = 精简模型上下文，不是删除用户聊天记录）。
         ThreadHelper.executeAsync(project,
-                () -> DBChatHistoryRepository.getSessionMessagesWithParts(sessionId, 500, 0),
-                result -> {
+                () -> DBChatHistoryRepository.getSessionPage(sessionId, 500, 0),
+                page -> {
+                    var result = page != null ? page.merged : null;
                     if (result == null || result.isEmpty()) {
                         isLoadingHistory = false;
                         if (uiCallbacks != null) uiCallbacks.onHistoryLoaded();
                         return;
                     }
                     System.out.println("uiMsgs = " + result.keySet());
-                    historyLoadedCount = result.size();
+                    // ★ 分页口径：必须用合并前 DB 行数（OFFSET/LIMIT/COUNT 都是行数口径），
+                    //   用合并后条目数当 offset 会与未合并行集合错位 → 重复加载/hasMore 误判
+                    historyLoadedCount = page.dbRowCount;
 
                     if (uiCallbacks != null) uiCallbacks.clearMessages();
 
                     for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : result.entrySet()) {
                         ChatMessageEntity rec = entry.getKey();
                         List<MessagePartEntity> parts = entry.getValue();
+
+                        // 压缩的普通消息（meta 含 compressed 且非 summary）：只渲染 UI，不进模型上下文
+                        if (!isSummaryMessage(rec) && isCompressedMessage(rec)) {
+                            if (uiCallbacks != null) uiCallbacks.renderMessageWithParts(rec, parts);
+                            continue;
+                        }
 
                         List<ChatMessage> builtMsgs = buildChatMessagesFromParts(rec, parts);
                         conversationManager.getMessages().addAll(builtMsgs);
@@ -410,15 +421,16 @@ public class ChatSessionManager {
         final int offset = historyLoadedCount;
 
         ThreadHelper.executeAsync(project,
-                () -> DBChatHistoryRepository.getSessionMessagesWithParts(currentSessionId, 80, offset),
-                result -> {
+                () -> DBChatHistoryRepository.getSessionPage(currentSessionId, 80, offset),
+                page -> {
                     isLoadingHistory = false;
+                    var result = page != null ? page.merged : null;
                     if (result == null || result.isEmpty()) {
                         if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(false);
                         return;
                     }
 
-                    historyLoadedCount += result.size();
+                    historyLoadedCount += page.dbRowCount;
 
                     // ★ 关键修复：加载的历史必须真正加入 conversationManager，
                     // 否则 UI 上能看到、模型上下文里却没有 → 模型失忆。
@@ -434,6 +446,18 @@ public class ChatSessionManager {
                     if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
                 }
         );
+    }
+
+    /** meta 含 compressed 标记（普通压缩消息与摘要消息都命中） */
+    private static boolean isCompressedMessage(ChatMessageEntity rec) {
+        String meta = rec != null ? rec.getMeta() : null;
+        return meta != null && meta.contains("compressed");
+    }
+
+    /** 摘要消息（compressed_summary=true）：进上下文也进 UI，不算"被压缩出上下文的普通消息" */
+    private static boolean isSummaryMessage(ChatMessageEntity rec) {
+        String meta = rec != null ? rec.getMeta() : null;
+        return meta != null && meta.contains("compressed_summary");
     }
 
     public void deleteQaMessages(int qaRound) {

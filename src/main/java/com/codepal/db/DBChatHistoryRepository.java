@@ -367,7 +367,9 @@ public class DBChatHistoryRepository {
     // Query
     // ═══════════════════════════════════════════════════════════════
 
-    /** 获取会话消息头列表（不含 parts） */
+    /** 获取会话消息头列表（不含 parts）。
+     *  ★ 不过滤压缩消息：压缩只影响「发给模型的上下文」，不影响用户回看聊天记录。
+     *    conversationManager 侧由调用方按 meta 自行过滤。 */
     public static List<ChatMessageEntity> getRecentMessages(String sessionId, int limit, int offset) {
         List<ChatMessageEntity> list = new ArrayList<>();
         String sql = """
@@ -375,7 +377,6 @@ public class DBChatHistoryRepository {
                    created_at, updated_at, token_usage, meta
             FROM messages
             WHERE session_id = ?
-              AND (meta IS NULL OR meta LIKE '%compressed_summary%' OR meta NOT LIKE '%compressed%')
             ORDER BY created_at DESC
             LIMIT ? OFFSET ?
             """;
@@ -451,6 +452,21 @@ public class DBChatHistoryRepository {
     /** 获取会话所有消息 + parts（Map 结构，用于渲染历史） */
     public static Map<ChatMessageEntity, List<MessagePartEntity>> getSessionMessagesWithParts(
             String sessionId, int limit, int offset) {
+        return getSessionPage(sessionId, limit, offset).merged;
+    }
+
+    /** 会话分页结果：合并后的渲染条目 + 合并前的 DB 行数（分页 offset 必须用行数口径） */
+    public static class HistoryPage {
+        public final Map<ChatMessageEntity, List<MessagePartEntity>> merged;
+        public final int dbRowCount;
+        HistoryPage(Map<ChatMessageEntity, List<MessagePartEntity>> merged, int dbRowCount) {
+            this.merged = merged;
+            this.dbRowCount = dbRowCount;
+        }
+    }
+
+    /** 分页获取消息 + parts：返回合并后条目（供 UI 渲染）与合并前 DB 行数（供分页 offset/total 计算） */
+    public static HistoryPage getSessionPage(String sessionId, int limit, int offset) {
         Map<ChatMessageEntity, List<MessagePartEntity>> result = new LinkedHashMap<>();
         List<ChatMessageEntity> messages = getRecentMessages(sessionId, limit, offset);
         for (ChatMessageEntity msg : messages) {
@@ -473,14 +489,14 @@ public class DBChatHistoryRepository {
             merged.put(rec, parts);
             last = rec;
         }
-        return merged;
+        return new HistoryPage(merged, messages.size());
     }
 
     public static int getMessagesCount(String sessionId) {
+        // ★ 与 getRecentMessages 同口径：不再过滤压缩消息（UI 全量展示，分页计数才不会错位）
         String sql = """
             SELECT COUNT(*) AS cnt FROM messages
             WHERE session_id = ?
-              AND (meta IS NULL OR meta LIKE '%compressed_summary%' OR meta NOT LIKE '%compressed%')
             """;
         try (Connection conn = SqliteDatabaseManager.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {

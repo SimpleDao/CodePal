@@ -393,6 +393,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // 最新一次请求的缓存命中/未命中快照（token 面板"本次回答"口径，不累加）
     private long lastCacheHitTokens   = 0;
     private long lastCacheMissTokens  = 0;
+    // 本轮流是否已收到 usage 帧（usage 与 finish_reason 同为流末帧）：
+    // 中途出错/被掐断时未收到，lastPromptTokens 还是上一轮旧值，不得用于本轮 chip
+    private boolean usageReceivedThisRound = false;
 
     // 「本轮发送给模型的完整上下文」快照：key=用户消息 DB id，value=JSON（system/history/userMessage/messageCount）。
     // 仅内存、不落库；重载会话后自然清空（悬浮查看时提示"未记录"，与桌面端一致）。
@@ -2134,6 +2137,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             return;
         }
         streamRenderController.setResponseHadToolCalls(false);
+        usageReceivedThisRound = false; // 新一轮开始：usage 未到，防止误用上一轮旧值
         // 重置流式写入可视化状态（每轮请求都是新的工具调用流）
         writeStreamCardActive = false;
         streamWriteCardIndex = -1;
@@ -3108,7 +3112,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             // 提升为正文，避免：(1) 正文误显示到「深度思考」面板；(2) 下一轮 assistant 消息
                             // content 为空被 buildChatMessagesFromParts 跳过 → 上下文丢失（见上一轮 400 根因）。
                             if (!hasContent && hasReasoning) {
-                                promoteReasoningAsAnswer(sendSrc.getCurrentReasoning().toString(), sendWebView, sendConvMgr, sendSessionId);
+                                String promotedId = promoteReasoningAsAnswer(sendSrc.getCurrentReasoning().toString(), sendWebView, sendConvMgr, sendSessionId);
+                                // ★ 修复：reasoning-only 轮此前漏挂/漏存 token chip（usage 已到达但早退路径没走 onComplete 挂载逻辑）
+                                attachAndPersistTokenInfo(promotedId, sendWebView);
                                 clearStreamRefs();
                                 maybeDeferredSwitch();
                                 drainMessageQueue();
@@ -3121,13 +3127,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             // 挂上「本轮回答 token 消耗」到助手消息底部（finalize 之前，此时 lcStreamingMsgId 仍有效）。
                             // 同一份 JSON 原样落库（messages.token_usage 单列 UPDATE，不触碰其它字段），
                             // 重启后回放按此复现，保证看到的 chip 与当时完全一致。
-                            String answerTokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
-                            sendWebView.attachTokenInfo(answerTokenJson);
-                            if (assistantMsgId != null && answerTokenJson != null) {
-                                final String msgIdFinal = assistantMsgId; // lambda 要求事实最终变量
-                                ThreadHelper.executeAsync(project, () -> com.codepal.db.DBChatHistoryRepository
-                                        .updateTokenUsage(msgIdFinal, answerTokenJson), null);
-                            }
+                            attachAndPersistTokenInfo(assistantMsgId, sendWebView);
                             // ★ 根因修复：onComplete 此前漏调 finalizeAiMessage，导致 JS 气泡停留在最后一次
                             //   renderAiStream 的快照（库里完整 / 窗口截断 / 复制按钮不显示）。
                             //   必须放在 persistPartialAssistant 之后（已落库）、clearStreamRefs 之前
@@ -3178,6 +3178,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         ApplicationManager.getApplication().invokeLater(() -> {
                             if (!sendSrc.isCurrentGeneration(myGen)) return;
                             updateTokenStats(usage);
+                            usageReceivedThisRound = true; // 本轮 usage 已到达
                         });
                     }
 
@@ -3197,7 +3198,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             sendWebView.clearStatusTimer();
                             sendSrc.appendError(error.getMessage());
                             // ★ 持久化：与 onComplete 一致，避免「出错丢失消息」（错误信息已拼进 rawText 随 text part 落库）
-                            persistPartialAssistant(sendSrc, sendConvMgr, sendSessionId);
+                            String errMsgId = persistPartialAssistant(sendSrc, sendConvMgr, sendSessionId);
+                            // ★ 修复：出错轮此前漏挂/漏存 token chip。usage 已到达（如 finish_reason=length 帧自带）
+                            //   则正常挂上；流中途网络断开未收到 usage 时由 usageReceivedThisRound 守卫跳过（防挂上一轮旧值）
+                            attachAndPersistTokenInfo(errMsgId, sendWebView);
                             sendSrc.finalizeAiMessage(CARD_BG());
                             clearStreamRefs();
                             // 流结束：执行被延迟的会话切换
@@ -3214,7 +3218,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * 将 reasoning 内容提升为 assistant 的正式 content（既正确显示，又保住下一轮上下文）。
      * 同时把「深度思考」面板的内容移动到正文气泡。
      */
-    private void promoteReasoningAsAnswer(String reasoningText,
+    private String promoteReasoningAsAnswer(String reasoningText,
                                          ChatWebView webView,
                                          ConversationManager convMgr,
                                          String sessionId) {
@@ -3235,6 +3239,23 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         chatSessionManager.persistMessageWithParts(entity, parts);
 
         webView.promoteReasoningToAnswer(MarkdownUtil.toHtmlFragment(reasoningText), reasoningText);
+        return msgId;
+    }
+
+    /**
+     * 统一收尾：本轮 usage 已到达时，把「本次回答 token 消耗」挂到助手消息底部并原样落库
+     * （messages.token_usage 单列 UPDATE，不触碰其它字段；重启回放按此复现）。
+     * usageReceivedThisRound 守卫：流中途出错/被掐断时 usage 未到达，lastPromptTokens 还是
+     * 上一轮旧值——此时不挂 chip（宁缺勿错）。调用须在 clearStreamRefs 之前（JS 端
+     * attachTokenInfo 依赖 lcStreamingMsgId 仍指向该助手消息）。
+     */
+    private void attachAndPersistTokenInfo(String msgId, ChatWebView webView) {
+        if (msgId == null || !usageReceivedThisRound) return;
+        String answerTokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
+        if (answerTokenJson == null) return;
+        webView.attachTokenInfo(answerTokenJson);
+        ThreadHelper.executeAsync(project, () -> com.codepal.db.DBChatHistoryRepository
+                .updateTokenUsage(msgId, answerTokenJson), null);
     }
 
     /**
@@ -6182,6 +6203,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             o.addProperty("html", content);
             o.addProperty("raw", content);
             o.addProperty("msgId", rec.getId());
+            addCompressedFlag(o, rec);
             return o.toString();
         }
         if (!Constant.ROLE_assistant.equals(rec.getRole())) return null;
@@ -6224,7 +6246,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
             o.addProperty("tokenInfo", rec.getTokenUsage());
         }
+        addCompressedFlag(o, rec);
         return o.toString();
+    }
+
+    /** 已压缩出模型上下文的普通消息：record 标记 compressed=true，JS 渲染淡化样式（聊天记录仍完整可见） */
+    private static void addCompressedFlag(JsonObject o, ChatMessageEntity rec) {
+        String meta = rec.getMeta();
+        if (meta == null || meta.contains("compressed_summary")) return;
+        try {
+            com.google.gson.JsonObject metaObj = com.google.gson.JsonParser.parseString(meta).getAsJsonObject();
+            if (metaObj.has("compressed") && metaObj.get("compressed").getAsBoolean()) {
+                o.addProperty("compressed", true);
+            }
+        } catch (Exception ignored) {}
     }
 
     /** @deprecated use renderMessageWithParts */
