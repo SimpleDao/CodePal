@@ -316,11 +316,12 @@ public class ChatSessionManager {
                                 + Math.min(DISPLAY_ENTRIES, loadedEntries.size()) + " 条");
 
                         contextIds.clear();
-                        // ① 上下文：全部预载条目（压缩消息除外，摘要保留）
+                        // ① 上下文：全部预载条目。压缩过滤**只**由 buildChatMessagesFromParts 决定
+                        //   （它内部解析 meta，压缩消息返回空列表 = 不进上下文，摘要保留）——
+                        //   避免在两处维护同一判断而分叉。
                         for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : loadedEntries.entrySet()) {
                             ChatMessageEntity rec = entry.getKey();
                             contextIds.add(rec.getId());
-                            if (!isSummaryMessage(rec) && isCompressedMessage(rec)) continue;
                             conversationManager.getMessages().addAll(
                                     buildChatMessagesFromParts(rec, entry.getValue()));
                         }
@@ -535,14 +536,16 @@ public class ChatSessionManager {
                             return;
                         }
 
-                        // 模型上下文：只补本批新增（未被计入过的行），按时间正序插入 system 之后
+                        // 模型上下文：只补本批新增（未被计入过的行），按时间正序插入 system 之后。
+                        // 压缩过滤同样交给 buildChatMessagesFromParts（唯一来源）。
+                        // 注意：即使本批全是压缩消息，也把 id 记入 contextIds（表示"已处理过"），
+                        // 避免后续重复计算；insertHistoryBeforeExisting 内部对空结果会自动跳过。
                         java.util.Map<ChatMessageEntity, List<MessagePartEntity>> delta =
                                 new java.util.LinkedHashMap<>();
                         for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : result.entrySet()) {
                             ChatMessageEntity rec = entry.getKey();
                             if (contextIds.contains(rec.getId())) continue;
                             contextIds.add(rec.getId());
-                            if (!isSummaryMessage(rec) && isCompressedMessage(rec)) continue;
                             delta.put(rec, entry.getValue());
                         }
                         if (!delta.isEmpty()) insertHistoryBeforeExisting(delta);
@@ -573,18 +576,6 @@ public class ChatSessionManager {
                     }
                 }
         );
-    }
-
-    /** meta 含 compressed 标记（普通压缩消息与摘要消息都命中） */
-    private static boolean isCompressedMessage(ChatMessageEntity rec) {
-        String meta = rec != null ? rec.getMeta() : null;
-        return meta != null && meta.contains("compressed");
-    }
-
-    /** 摘要消息（compressed_summary=true）：进上下文也进 UI，不算"被压缩出上下文的普通消息" */
-    private static boolean isSummaryMessage(ChatMessageEntity rec) {
-        String meta = rec != null ? rec.getMeta() : null;
-        return meta != null && meta.contains("compressed_summary");
     }
 
     public void deleteQaMessages(int qaRound) {

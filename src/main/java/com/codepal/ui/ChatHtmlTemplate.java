@@ -276,7 +276,10 @@ public final class ChatHtmlTemplate {
                 + "border:1px solid " + (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)") + ";"
                 + "border-radius:6px;font-family:'JetBrains Mono',Consolas,monospace;font-size:12px;"
                 + "color:" + (isDark ? "#D4D4D4" : "#374151") + ";white-space:pre-wrap;word-break:break-word;"
-                + "line-height:1.55;max-height:260px;overflow:auto;}"
+                // ★ 不再让 <pre> 自己滚动：此前 .tool-card-body(max-height:300) 与 pre(max-height:260)
+                //   形成【双层嵌套滚动条】，而内层每次更新都会被重置到顶部。
+                //   统一由外层 .tool-card-body 作唯一滚动容器。
+                + "line-height:1.55;}"
                 // tool-group: 连续 ≥3 次工具调用自动折叠为一个组
                 + ".tool-group{margin:2px 0;padding:0;border:none;background:transparent;width:100%;box-sizing:border-box}"
                 + ".tool-group-hdr{display:flex;align-items:center;gap:6px;padding:2px 0 2px 10px;cursor:pointer;"
@@ -572,10 +575,13 @@ public final class ChatHtmlTemplate {
                 + "var lcHistoryAskTs=0;"
                 + "function lcDiag(m){if(window.intellijScrollBottomBtn)window.intellijScrollBottomBtn('diag:'+m);}"
                 + "function lcTryLoadOlder(){var c=getChat();if(!c)return;"
-                + "if(c.scrollTop>=50)return;"
+                + "if(c.scrollTop>=50)return;" // 只有滚到顶（用户确实在往上翻）才继续
                 + "if(lcHistoryLoading||lcBatchBuilding)return;" // 在途或批次构建中不重复触发
                 + "if(!window.intellijLoadHistory)return;"
-                + "if(lcHistoryExhausted)return;"
+                + "if(lcHistoryExhausted){"
+                // 用户已在顶部继续往上翻、且确认没有更早内容 → 此时才提示（此前一直是静默）
+                + "var te=Date.now();if(te-lcHistoryAskTs<800)return;lcHistoryAskTs=te;"
+                + "showHistoryEnd(true);return;}"
                 + "var t=Date.now();if(t-lcHistoryAskTs<400)return;lcHistoryAskTs=t;" // 节流：避免滚轮高频
                 + "lcHistoryLoading=true;showHistoryLoading(true);"
                 + "lcDiag('ask offset='+c.scrollTop+' loaded-guard ok');"
@@ -729,16 +735,30 @@ public final class ChatHtmlTemplate {
                 + "var ref=ts;"
                 + "if(lcCurrentBubbleId){var b=document.getElementById(lcCurrentBubbleId);if(b)ref=b;}"
                 + "bw.insertBefore(r,ref);}"
-                + "r.querySelector('.rsn-body').textContent+=chunk;scrollDown();}"
+                // ★ 追加思考内容：必须用 appendChild(文本节点)，不能用 textContent+=chunk。
+                //   textContent+= 会「替换全部子节点」，浏览器在替换时把该元素的 scrollTop 重置为 0
+                //   → 每来一个 token 视口就被弹回顶部，表现为"最旧的思考永远在最上面"。
+                //   同时 textContent+= 是 O(n) 全量重建（n 个 token → O(n²)），改 appendChild 后为 O(1)。
+                + "var _rb=r.querySelector('.rsn-body');"
+                + "_rb.appendChild(document.createTextNode(chunk));"
+                // 自动跟随最新内容：仅在面板展开、且用户没有手动上翻时
+                + "if(_rb.classList.contains('open')&&_rb._lcFollow!==false){_rb.scrollTop=_rb.scrollHeight;}"
+                + "scrollDown();}"
                 + "function buildRsnBlock(){"
                 + "var d=el('div','rsn');d.id='rsn'+(++lcMsgCount);"
                 + "var h=el('div','rsn-hdr');"
                 + "h.onclick=function(){var b=d.querySelector('.rsn-body');var a=d.querySelector('.rsn-arrow');"
-                + "var o=b.classList.toggle('open');a.classList.toggle('open',o);};"
+                + "var o=b.classList.toggle('open');a.classList.toggle('open',o);"
+                // 展开时直接定位到最新（实时思考场景下用户的意图就是看最新）
+                + "if(o){b._lcFollow=true;b.scrollTop=b.scrollHeight;}};"
                 + "h.innerHTML='<span class=\"rsn-label thinking\">深度思考</span>'"
                 + "+'<span class=\"rsn-arrow\"><svg viewBox=\"0 0 1024 1024\" xmlns=\"http://www.w3.org/2000/svg\">"
                 + "<path d=\"M676.1 512L232.3 116.1l57.9-51.7L791.7 512 290.2 959.6l-57.9-51.7L676.1 512z\" p-id=\"1683\"></path></svg></span>';"
-                + "var b=el('div','rsn-body');d.appendChild(h);d.appendChild(b);return d;}"
+                + "var b=el('div','rsn-body');"
+                // 用户手动上翻（离开底部 >30px）则暂停自动跟随；回到底部自动恢复
+                + "b.addEventListener('scroll',function(){"
+                + "var dist=b.scrollHeight-b.scrollTop-b.clientHeight;b._lcFollow=dist<30;});"
+                + "d.appendChild(h);d.appendChild(b);return d;}"
                 + "function finalizeReasoning(msgId){"
                 + "var w=document.getElementById(msgId||lcStreamingMsgId);if(!w)return;"
                 + "var r=lcCurrentRsnId?document.getElementById(lcCurrentRsnId):null;"
@@ -1016,20 +1036,32 @@ public final class ChatHtmlTemplate {
                 + "body.innerHTML=html;linkifyFilePaths(card);"
                 + "}"
                 + "function _lastPendingCard(){var keys=Object.keys(lcPendingCards);for(var i=keys.length-1;i>=0;i--){var c=document.getElementById(keys[i]);if(c)return c;delete lcPendingCards[keys[i]];}return null;}"
+                // ── 工具卡片详情区的「跟随最新」辅助（与深度思考面板同一套思路）──
+                // 背景：详情区是 max-height:300px 的滚动容器，流式更新时此前用 innerHTML/textContent
+                // 整体替换 → 浏览器把 scrollTop 重置为 0 → 用户永远看到最旧的内容（与思考面板同一 bug）。
+                + "function lcIsAtBottom(el){return !el||(el.scrollHeight-el.scrollTop-el.clientHeight)<30;}"
+                + "function lcBindFollow(el){if(!el||el._lcFollowBound)return;el._lcFollowBound=true;"
+                + "el.addEventListener('scroll',function(){el._lcFollow=(el.scrollHeight-el.scrollTop-el.clientHeight)<30;});}"
+                + "function lcFollowScroll(el){if(!el)return;lcBindFollow(el);"
+                + "if(el._lcFollow!==false)el.scrollTop=el.scrollHeight;}"
                 + "function appendToPendingToolCard(text){"
                 + "var card=_lastPendingCard();if(!card)return;"
                 + "var body=card.querySelector('.tool-card-body');"
                 + "if(!body)return;"
-                + "body.innerHTML=esc(body.textContent+text);"
+                // 追加文本节点（不重建）→ 保留滚动位置 + O(1)
+                + "body.appendChild(document.createTextNode(text));"
                 + "card.classList.add('open');"
+                + "lcFollowScroll(body);"
                 + "scrollDown();linkifyFilePaths(card);"
                 + "}"
                 + "function appendHtmlToPendingToolCard(html){"
                 + "var card=_lastPendingCard();if(!card)return;"
                 + "var body=card.querySelector('.tool-card-body');"
                 + "if(!body)return;"
-                + "body.innerHTML=body.innerHTML+html;"
+                // insertAdjacentHTML 追加：不像 innerHTML+= 那样重建全部子节点（会重置 scrollTop）
+                + "body.insertAdjacentHTML('beforeend',html);"
                 + "card.classList.add('open');"
+                + "lcFollowScroll(body);"
                 + "scrollDown();linkifyFilePaths(card);"
                 + "}"
                 + "function streamPendingToolCardText(text){"
@@ -1038,8 +1070,23 @@ public final class ChatHtmlTemplate {
                 + "if(!body)return;"
                 + "card.classList.add('open');"
                 + "var pre=body.querySelector('pre.tc-content');"
-                + "if(!pre){pre=document.createElement('pre');pre.className='tc-content';body.innerHTML='';body.appendChild(pre);}"
+                + "if(!pre){pre=document.createElement('pre');pre.className='tc-content';"
+                + "while(body.firstChild)body.removeChild(body.firstChild);"
+                + "body.appendChild(pre);pre._lcPrev='';}"
+                // ★ 增量追加：内容单调增长（旧文本仍是新文本的前缀）时只 append 新片段。
+                //   旧实现 `pre.textContent=text` 每帧整体替换：既把滚动重置到顶部，
+                //   又是 O(n) 重建（长文件流式写入时累计 O(n²) 卡顿）。
+                + "var prev=pre._lcPrev||'';"
+                + "if(text.length>=prev.length&&text.indexOf(prev)===0){"
+                + "var dlt=text.substring(prev.length);if(dlt)pre.appendChild(document.createTextNode(dlt));"
+                + "}else{"
+                // 内容被改写（非单调）：全量替换，但保留用户原滚动位置
+                + "var atBottom=lcIsAtBottom(body),top=body.scrollTop;"
                 + "pre.textContent=text;"
+                + "if(!atBottom)body.scrollTop=top;"
+                + "}"
+                + "pre._lcPrev=text;"
+                + "lcFollowScroll(body);"
                 + "scrollDown();"
                 + "}"
                 + "function updateWriteCardStats(name,added,removed){"
@@ -1055,12 +1102,14 @@ public final class ChatHtmlTemplate {
                 + "function finalizePendingToolCardHtml(html){"
                 + "var card=_lastPendingCard();if(!card)return;"
                 + "var body=card.querySelector('.tool-card-body');"
-                + "if(body)body.innerHTML=body.innerHTML+html;"
+                // 追加而非 innerHTML+=（后者重建全部子节点 → 滚动位置被重置，用户被弹回顶部）
+                + "if(body)body.insertAdjacentHTML('beforeend',html);"
                 + "card.classList.add('completed');"
                 + "card.classList.remove('pending');"
                 + "var sts=card.querySelector('.tool-card-status');"
                 + "if(sts)sts.textContent='已完成';"
                 + "for(var k in lcPendingCards){if(k===card.id)delete lcPendingCards[k];}"
+                + "if(body)lcFollowScroll(body);"
                 + "scrollDown();linkifyFilePaths(card);"
                 + "}"
                 // replacePendingToolCardBody: 与 finalizePendingToolCardHtml 类似，
@@ -1464,12 +1513,16 @@ public final class ChatHtmlTemplate {
                 //   帧被追加到末尾、把 loader 拱到中间的情况，导致"加载中"根本看不见
                 + "if(show&&getChat().firstElementChild!==loader){getChat().insertBefore(loader,getChat().firstElementChild);}"
                 + "}}"
-                // 已到最早提示：hasMore=false 时展示，明确区分"加载完了"与"卡住了"
+                // 已到最早提示：**仅在用户主动向上翻找更早内容时**展示（不在打开会话时冒出来）。
+                // 位置固定在顶部 loader 之后，且保证 loader 恒为首元素。
                 + "function showHistoryEnd(show){var e=document.getElementById('history-end');"
-                + "if(!e){e=el('div','history-end');e.id='history-end';e.textContent='已经是最早的消息了';"
-                + "var l=document.getElementById('history-loader');var c=getChat();"
-                + "if(l&&l.parentNode===c&&l.nextSibling)c.insertBefore(e,l.nextSibling);else c.insertBefore(e,c.firstElementChild);}"
-                + "if(show)e.classList.add('show');else e.classList.remove('show');}"
+                + "if(show){var c=getChat();var l=document.getElementById('history-loader');"
+                + "if(l&&l.parentNode===c&&c.firstElementChild!==l)c.insertBefore(l,c.firstElementChild);"
+                + "if(!e){e=el('div','history-end');e.id='history-end';e.textContent='已经是最早的消息了';}"
+                // 每次显示都把提示归位到 loader 紧后面（内容可能已被清空重建过）
+                + "if(l&&l.parentNode===c)c.insertBefore(e,l.nextSibling);else c.insertBefore(e,c.firstElementChild);"
+                + "e.classList.add('show');return;}"
+                + "if(e)e.classList.remove('show');}"
                 // ── 懒加载批次：离屏构建 + 原子提交 ──
                 // 构建阶段：Java 逐条调 renderMessageWithParts，全部 append 到 lcBuildTarget。
                 //   lcBuildTarget 挂在 #chat 内但 display:none —— 关键设计：
@@ -1494,11 +1547,14 @@ public final class ChatHtmlTemplate {
                 + "lcAutoScroll=lcBatchAuto;lcQaRound=lcBatchSavedRound;"
                 + "lcHistoryLoading=false;showHistoryLoading(false);lcDiag('batch-timeout-reset');}},10000);"
                 + "showHistoryEnd(false);}"
+                // 插入基准：loader 存在时返回其下一个兄弟（可为 null=追加到末尾）。
+                // 关键：内容插到 loader **之后**，保证 loader 恒为 #chat 首元素（首屏刚渲染完、
+                // loader 还是末元素时，旧实现会返回 firstChild 从而把消息插到 loader 上方）。
                 + "function lcPrependRef(){var c=getChat();"
                 + "var l=document.getElementById('history-loader');"
                 + "if(l&&l.parentNode===c){var n=l.nextSibling;"
                 + "while(n&&n.id==='lc-batch-build')n=n.nextSibling;" // 跳过构建容器自身
-                + "return n?n:c.firstChild;}"
+                + "return n;}"
                 + "return c.firstChild;}"
                 + "function commitHistoryBatch(){"
                 + "if(lcBatchTimer){clearTimeout(lcBatchTimer);lcBatchTimer=null;}"
@@ -1511,12 +1567,14 @@ public final class ChatHtmlTemplate {
                 + "var oldH=c.scrollHeight,oldTop=c.scrollTop;" // 容器 display:none → 不计入 oldH
                 + "var ref=lcPrependRef();"
                 // 单任务内整体移动（顺序天然保持：frag.firstChild 依次插到 ref 之前）
-                + "while(frag.firstChild){c.insertBefore(frag.firstChild,ref);}"
+                + "while(frag.firstChild){if(ref)c.insertBefore(frag.firstChild,ref);else c.appendChild(frag.firstChild);}"
                 // 一次补偿：新增内容在已加载内容之前 → 视口按新增高度下移，原消息位置不变
                 + "c.scrollTop=oldTop+(c.scrollHeight-oldH);"
                 + "lcHistoryExhausted=false;}"
                 + "if(frag.parentNode)frag.remove();" // 移除空的构建容器
-                + "lcHistoryLoading=false;showHistoryLoading(false);showHistoryEnd(false);"
+                // 有新内容插入 → 收回"已到最早"提示（用户继续往上翻时再按需出现）
+                + "lcHistoryLoading=false;showHistoryLoading(false);"
+                + "if(n>0)showHistoryEnd(false);"
                 + "lcDiag('commit nodes='+n);}"
                 // Java 对一次懒加载请求的明确回答：
                 //   hasMore=false → 确实没有更早消息，置 exhausted 停止请求
@@ -1542,7 +1600,8 @@ public final class ChatHtmlTemplate {
                 + "function setHasMoreHistory(hasMore){"
                 + "lcHistoryExhausted=!hasMore;"
                 + "lcHistoryLoading=false;showHistoryLoading(false);"
-                + "showHistoryEnd(!hasMore);"
+                // ★ 不在这里展示"已到最早"提示：打开会话/自动加载时用户并未要求往上翻，
+                //   弹提示属噪音（用户反馈）。改为仅在用户主动上翻（lcTryLoadOlder 命中 exhausted）时出现。
                 + "lcDiag('answer hasMore='+hasMore);}"
                 // ── 轮播状态消息（shimmer 扫光驱动，动画结束后才切换下一条）──
                 + "var lcStatusMsgs={};var lcStatusList=null;var lcStatusIdx=0;"
