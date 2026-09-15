@@ -1318,9 +1318,10 @@ public final class ChatHtmlTemplate {
                 + "function addCodeCopyBtns(root){var ps=(root||document).querySelectorAll('pre');"
                 + "for(var i=0;i<ps.length;i++){var p=ps[i];if(p.querySelector('.code-copy'))continue;"
                 + "var btn=el('button','code-copy');btn.textContent='复制';"
-                + "btn.onclick=function(e){e.stopPropagation();var cd=this.parentNode.querySelector('code');"
-                + "var tx=cd?cd.textContent:this.parentNode.textContent;"
-                + "copyText(tx);btn.textContent='已复制';setTimeout(function(){btn.textContent='复制'},1500);};"
+                + "btn.onclick=function(e){e.stopPropagation();var b=this;"
+                + "var cd=b.parentNode.querySelector('code');"
+                + "var tx=cd?cd.textContent:b.parentNode.textContent;"
+                + "copyText(tx);b.textContent='已复制';setTimeout(function(){b.textContent='复制'},1500);};"
                 + "p.appendChild(btn);}}"
                 // 语法高亮：对未高亮的 pre code 调用 hljs（已高亮则跳过，避免重复包裹）
                 + "function highlightBlocks(root){if(typeof hljs==='undefined')return;"

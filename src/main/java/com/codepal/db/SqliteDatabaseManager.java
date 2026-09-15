@@ -156,7 +156,34 @@ public class SqliteDatabaseManager {
             """);
 
             // ─────────────────────────────────────────────
-            // 5. session_todos — 待办列表持久化（按会话维度）
+            // 5. model_pricing — 单模型计费配置表（按模型名维度，与 model_configs 解耦）
+            //    所有价格以「每 unit 个 token」计价，默认 unit=1,000,000。
+            //    计费是模型可选项，未配置/未启用时费用由 PricingCalculator 兜底单价估算。
+            // ─────────────────────────────────────────────
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS model_pricing (
+                    model_name VARCHAR(255) PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    currency VARCHAR(8) NOT NULL DEFAULT '¥',
+                    unit INTEGER NOT NULL DEFAULT 1000000,
+                    price_cache_hit REAL NOT NULL DEFAULT 0,
+                    price_cache_miss REAL NOT NULL DEFAULT 0,
+                    price_output REAL NOT NULL DEFAULT 0,
+                    peak_enabled INTEGER NOT NULL DEFAULT 0,
+                    peak_start_hour INTEGER NOT NULL DEFAULT 0,
+                    peak_start_minute INTEGER NOT NULL DEFAULT 0,
+                    peak_end_hour INTEGER NOT NULL DEFAULT 23,
+                    peak_end_minute INTEGER NOT NULL DEFAULT 0,
+                    peak_multiplier REAL NOT NULL DEFAULT 1.0
+                )
+            """);
+            // 旧库补列（已存在则忽略）：高峰起止的分钟位 + 多时段窗口 JSON
+            addColumnIfMissing(stmt, "model_pricing", "peak_start_minute", "INTEGER NOT NULL DEFAULT 0");
+            addColumnIfMissing(stmt, "model_pricing", "peak_end_minute", "INTEGER NOT NULL DEFAULT 0");
+            addColumnIfMissing(stmt, "model_pricing", "peak_windows", "TEXT");
+
+            // ─────────────────────────────────────────────
+            // 6. session_todos — 待办列表持久化（按会话维度）
             //    TodoManager 每次变更落库；会话激活/重启时读取回填。
             //    todos_json 为 TodoItem[] 的 JSON 数组文本。
             // ─────────────────────────────────────────────
@@ -190,6 +217,32 @@ public class SqliteDatabaseManager {
             stmt.execute("""
                 CREATE INDEX IF NOT EXISTS idx_data_sources_sort ON data_sources(sort_order, name)
             """);
+
+            // ─────────────────────────────────────────────
+            // 7. session_model_usage — 会话×模型 维度 token 用量（圆环"会话累计（按模型）"）
+            //    每次请求 usage 到达按当前模型原子增量 upsert；会话激活时整表回填。
+            // ─────────────────────────────────────────────
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS session_model_usage (
+                    session_id VARCHAR(64) NOT NULL,
+                    model_name VARCHAR(255) NOT NULL,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at BIGINT NOT NULL,
+                    PRIMARY KEY (session_id, model_name)
+                )
+            """);
+        }
+    }
+
+    /** 旧库补列：SQLite 无 ADD COLUMN IF NOT EXISTS，已存在时抛错直接忽略 */
+    private static void addColumnIfMissing(Statement stmt, String table, String column, String type) {
+        try {
+            stmt.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
+        } catch (Exception ignored) {
+            // 列已存在，忽略
         }
     }
 

@@ -281,6 +281,21 @@ public class SkillStore {
                 || Files.isRegularFile(userDir.resolve(name + FLAT_SKILL_SUFFIX));
     }
 
+    /**
+     * 是否出厂默认技能（jar 内 resources/skills/&lt;name&gt;.md 存在即视为出厂默认）。
+     * 注意：不能只看用户目录——ensureDefault 会把出厂技能拷贝到用户目录，
+     * 导致 isUserImported 对出厂技能也返回 true（删除图标误显示）。
+     */
+    public static boolean isFactoryDefault(String name) {
+        if (name == null || name.isBlank()) return false;
+        try (InputStream is = SkillStore.class.getClassLoader()
+                .getResourceAsStream(RESOURCE_ROOT + name + FLAT_SKILL_SUFFIX)) {
+            return is != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     // ──────────────── 文件夹操作工具 ────────────────
 
     private static boolean deleteRecursively(Path root) {

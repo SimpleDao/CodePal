@@ -8,6 +8,8 @@ import com.intellij.util.ui.UIUtil;
 import com.intellij.ui.components.JBTextField;
 import com.intellij.util.ui.JBUI;
 import com.codepal.model.ModelConfig;
+import com.codepal.model.ModelPricing;
+import com.codepal.db.ModelPricingRepository;
 import com.codepal.settings.CPSettings;
 
 import javax.swing.*;
@@ -41,7 +43,7 @@ public class AddModelDialog extends JDialog {
     // ── 表单字段 ──
     private ProviderCard[] providerCards;
     private JBTextField baseurlField;
-    private JPasswordField apiKeyField;
+    private com.intellij.ui.components.JBPasswordField apiKeyField;
     private JBTextField modelNameField;
     private JBTextField maxContextField;
     private JBTextField maxOutputField;
@@ -64,6 +66,23 @@ public class AddModelDialog extends JDialog {
     private JPanel segControl;
     private JPanel modeLabelRow;
     private JPanel modeSectionContainer;
+
+    // ── 计费配置（按模型名维度，落库 model_pricing）──
+    private JCheckBox billingEnabledCheck;
+    private JCheckBox peakEnabledCheck;
+    private JRadioButton currencyCnyRadio;
+    private JRadioButton currencyUsdRadio;
+    private JBTextField priceHitField;
+    private JBTextField priceMissField;
+    private JBTextField priceOutField;
+    private JBTextField peakStart1Field;
+    private JBTextField peakEnd1Field;
+    private JBTextField peakStart2Field;
+    private JBTextField peakEnd2Field;
+    private JCheckBox peakWeekdayOnlyCheck;
+    private JBTextField peakMultField;
+    private JPanel billingDetailPanel;
+    private JPanel peakFieldsPanel;
 
     // ── 接口数据格式（只保留两种）──
     private static final String[] PROVIDERS = {"兼容 OpenAI", "兼容 Anthropic"};
@@ -259,6 +278,7 @@ public class AddModelDialog extends JDialog {
         selectedProvider = matched;
         updateProviderCards();
         if (supportsVisionCheck != null) supportsVisionCheck.setSelected(cfg.isSupportsVision());
+        prefillBilling(cfg);
         lockModeForEditing();
         updateInlinePanelVisibility();
     }
@@ -315,11 +335,13 @@ public class AddModelDialog extends JDialog {
             }
         };
         root.setOpaque(true);
-        // 左右 40px 内边距：留出与 14px 圆角的安全距离，避免标题/底部文字贴在圆角边缘发紧
-        root.setBorder(JBUI.Borders.empty(32, 40, 22, 40));
+        // 仅保留上下内边距；左右边距移入 body（scrollPane 内部），让滚动条贴着弹窗边缘
+        root.setBorder(JBUI.Borders.empty(32, 0, 22, 0));
 
         // ── 头部：图标 + 标题 + 描述 ──
         JPanel header = buildHeader();
+        // header 单独加左右内边距（root 的左右 padding 已清零让 scrollPane 贴边）
+        header.setBorder(JBUI.Borders.empty(0, 40, 0, 40));
         root.add(header, BorderLayout.NORTH);
         // undecorated 下：标题区可拖动弹框
         attachDragListener(header);
@@ -328,7 +350,8 @@ public class AddModelDialog extends JDialog {
         JPanel body = new JPanel();
         body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
         body.setOpaque(false);
-        body.setBorder(JBUI.Borders.empty(20, 0, 0, 0));
+        // 左右内边距放在 body 上（在 scrollPane 内部），这样滚动条可以贴着弹窗边缘
+        body.setBorder(JBUI.Borders.empty(20, 40, 0, 40));
 
         body.add(buildProviderSection());
         body.add(Box.createVerticalStrut(20));
@@ -351,10 +374,33 @@ public class AddModelDialog extends JDialog {
         if (inlinePanel != null) {
             body.add(inlinePanel);
         }
+        // 计费配置：按模型名维度的可选单价，与模型主配置解耦
+        body.add(Box.createVerticalStrut(20));
+        body.add(buildBillingSection());
         body.add(Box.createVerticalStrut(24));
         body.add(buildFooter());
 
         root.add(body, BorderLayout.CENTER);
+
+        // 主体内容较长时（尤其计费区展开后）需要滚动，否则底部被截断。
+        // 用 JScrollPane 包裹 body，滚动条透明/无描边，与弹窗深色背景融合。
+        // 关键：宽度用 body 自然首选宽度（横向不滚动、不被挤压），仅给高度封顶，
+        // 内容超过可用屏幕高度时才出现纵向滚动条。
+        JScrollPane scrollPane = new JScrollPane(body,
+                ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        scrollPane.setOpaque(false);
+        scrollPane.getViewport().setOpaque(false);
+        scrollPane.setBorder(BorderFactory.createEmptyBorder());
+        scrollPane.getVerticalScrollBar().setUnitIncrement(16);
+        // 整体窗口比上一步的“增宽 30%”更紧凑：宽度回到内容自然宽度（撤掉增宽），
+        // 高度封顶收紧到屏幕 70%，整体明显变小且不会挤压字段。
+        int maxBodyH = (int) (Toolkit.getDefaultToolkit().getScreenSize().getHeight() * 0.70);
+        Dimension bodyPref = body.getPreferredSize();
+        int w = bodyPref.width;
+        scrollPane.getViewport().setPreferredSize(
+                new Dimension(w, Math.min(bodyPref.height, maxBodyH)));
+        root.add(scrollPane, BorderLayout.CENTER);
         setContentPane(root);
 
         selectedProvider = 0;
@@ -650,9 +696,10 @@ public class AddModelDialog extends JDialog {
 
         // API Key
         gbc.gridy = row++;
-        apiKeyField = new JPasswordField();
+        // 密码框同样改用平台默认占位符 API（JBPasswordField.getEmptyText()）
+        apiKeyField = new com.intellij.ui.components.JBPasswordField();
         styleTextField(apiKeyField);
-        apiKeyField.putClientProperty("JTextField.placeholderText", "可选，留空使用全局 API Key");
+        apiKeyField.getEmptyText().setText("可选，留空使用全局 API Key");
         form.add(formRow("API Key", apiKeyField), gbc);
 
         // 模型名称
@@ -749,6 +796,297 @@ public class AddModelDialog extends JDialog {
         return footer;
     }
 
+    // ── 计费配置分区（按模型名维度，可选）──
+    private JPanel buildBillingSection() {
+        // 外层用 BorderLayout 保证横向撑满（与上方 GridBagLayout 的 formSection 对齐），
+        // 内层仍用 BoxLayout 做纵向堆叠。
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.setOpaque(false);
+
+        JPanel section = new JPanel();
+        section.setLayout(new BoxLayout(section, BoxLayout.Y_AXIS));
+        section.setOpaque(false);
+
+        section.add(sectionLabel("计费配置"));
+        section.add(Box.createVerticalStrut(10));
+
+        // 启用行
+        JPanel enableRow = new JPanel(new BorderLayout(8, 0));
+        enableRow.setOpaque(false);
+        enableRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        billingEnabledCheck = new JCheckBox("启用自定义计费");
+        styleCheck(billingEnabledCheck);
+        JLabel enableHint = new JLabel("按本模型单价估算每次对话费用");
+        enableHint.setFont(JBUI.Fonts.label(11));
+        enableHint.setForeground(textMuted());
+        enableRow.add(billingEnabledCheck, BorderLayout.WEST);
+        enableRow.add(enableHint, BorderLayout.EAST);
+        section.add(enableRow);
+        section.add(Box.createVerticalStrut(4));
+
+        // 勾选框下方小字：DeepSeek 计费示例（空闲时段单价，高峰时段为其 2 倍）
+        JLabel billingExample = new JLabel(
+                "<html>示例参考 DeepSeek-V4.1-Flash：空闲时段 命中 0.02 / 未命中 1 / 输出 4（元/百万 tokens），高峰时段为其 2 倍</html>");
+        billingExample.setFont(JBUI.Fonts.label(11));
+        billingExample.setForeground(textMuted());
+        billingExample.setAlignmentX(Component.LEFT_ALIGNMENT);
+        section.add(billingExample);
+        section.add(Box.createVerticalStrut(12));
+
+        // 详情面板（受启用态控制显隐）
+        billingDetailPanel = new JPanel();
+        billingDetailPanel.setLayout(new BoxLayout(billingDetailPanel, BoxLayout.Y_AXIS));
+        billingDetailPanel.setOpaque(false);
+        billingDetailPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        // 币种：单选 ¥ / $
+        currencyCnyRadio = new JRadioButton("¥", true);
+        currencyUsdRadio = new JRadioButton("$");
+        styleCheck(currencyCnyRadio);
+        styleCheck(currencyUsdRadio);
+        ButtonGroup currencyGroup = new ButtonGroup();
+        currencyGroup.add(currencyCnyRadio);
+        currencyGroup.add(currencyUsdRadio);
+        JPanel currencyWrap = new JPanel(new FlowLayout(FlowLayout.LEADING, 12, 0));
+        currencyWrap.setOpaque(false);
+        currencyWrap.add(currencyCnyRadio);
+        currencyWrap.add(currencyUsdRadio);
+        billingDetailPanel.add(billingRow("币种", currencyWrap, null));
+        billingDetailPanel.add(Box.createVerticalStrut(10));
+
+        priceHitField = createNumberField("0.02", 10);
+        billingDetailPanel.add(billingRow("输入·缓存命中 (每百万)", priceHitField, "元/百万"));
+        billingDetailPanel.add(Box.createVerticalStrut(10));
+
+        priceMissField = createNumberField("1", 10);
+        billingDetailPanel.add(billingRow("输入·缓存未命中 (每百万)", priceMissField, "元/百万"));
+        billingDetailPanel.add(Box.createVerticalStrut(10));
+
+        priceOutField = createNumberField("4", 10);
+        billingDetailPanel.add(billingRow("输出 (每百万)", priceOutField, "元/百万"));
+        billingDetailPanel.add(Box.createVerticalStrut(12));
+
+        // 高峰时段：分两行
+        // 第1行：勾选框 —— 不加 84px 占位，直接贴左，与上方 币种/输入·缓存命 标签左对齐
+        peakEnabledCheck = new JCheckBox("高峰时段加价");
+        styleCheck(peakEnabledCheck);
+        JPanel peakCheckRow = new JPanel(new BorderLayout());
+        peakCheckRow.setOpaque(false);
+        peakCheckRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        peakCheckRow.add(peakEnabledCheck, BorderLayout.WEST);
+        billingDetailPanel.add(peakCheckRow);
+        billingDetailPanel.add(Box.createVerticalStrut(8));
+
+        // 第2部分：高峰窗口（随勾选切换显隐）。支持两个时段 + 限定星期，
+        // 对齐 DeepSeek 官方口径：工作日 09:00-12:00、14:00-18:00
+        peakFieldsPanel = new JPanel();
+        peakFieldsPanel.setLayout(new BoxLayout(peakFieldsPanel, BoxLayout.Y_AXIS));
+        peakFieldsPanel.setOpaque(false);
+        peakFieldsPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        peakStart1Field = createNumberField("09:00", 6);
+        peakEnd1Field = createNumberField("12:00", 6);
+        peakFieldsPanel.add(billingRow("时段1", timeWrap(peakStart1Field, peakEnd1Field, null), null));
+        peakFieldsPanel.add(Box.createVerticalStrut(8));
+
+        peakStart2Field = createNumberField("14:00", 6);
+        peakEnd2Field = createNumberField("18:00", 6);
+        peakFieldsPanel.add(billingRow("时段2", timeWrap(peakStart2Field, peakEnd2Field, "可留空"), null));
+        peakFieldsPanel.add(Box.createVerticalStrut(8));
+
+        peakWeekdayOnlyCheck = new JCheckBox("仅周一至周五");
+        styleCheck(peakWeekdayOnlyCheck);
+        peakFieldsPanel.add(billingRow("适用日", peakWeekdayOnlyCheck, null));
+        peakFieldsPanel.add(Box.createVerticalStrut(8));
+
+        peakMultField = createNumberField("2", 6);
+        peakFieldsPanel.add(billingRow("系数 ×", peakMultField, null));
+
+        JPanel peakFieldsRow = new JPanel(new BorderLayout());
+        peakFieldsRow.setOpaque(false);
+        peakFieldsRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        peakFieldsRow.add(peakFieldsPanel, BorderLayout.CENTER);
+        billingDetailPanel.add(peakFieldsRow);
+
+        section.add(billingDetailPanel);
+
+        // 默认隐藏详情；按启用/高峰态切换（切换后重新 pack 以调整弹窗高度，圆角随 componentResized 重绘）
+        billingDetailPanel.setVisible(false);
+        billingEnabledCheck.addActionListener(e -> {
+            billingDetailPanel.setVisible(billingEnabledCheck.isSelected());
+            pack();
+        });
+        peakEnabledCheck.addActionListener(e -> {
+            updatePeakFieldsVisibility();
+            pack();
+        });
+        updatePeakFieldsVisibility();
+
+        wrapper.add(section, BorderLayout.CENTER);
+        return wrapper;
+    }
+
+    /** 紧凑标签：无固定宽度，紧贴输入框（用于起/止/系数 × 这类行内小标签） */
+    private JLabel compactLabel(String text) {
+        JLabel l = new JLabel(text);
+        l.setFont(JBUI.Fonts.label(12));
+        l.setForeground(textSecondary());
+        return l;
+    }
+
+    /** 一行时段组合：起 [HH:mm] 止 [HH:mm]（可选尾部灰字提示） */
+    private JPanel timeWrap(JBTextField start, JBTextField end, String hint) {
+        JPanel w = new JPanel(new FlowLayout(FlowLayout.LEADING, 0, 0));
+        w.setOpaque(false);
+        w.add(compactLabel("起"));
+        w.add(Box.createRigidArea(new Dimension(4, 0)));
+        w.add(start);
+        w.add(Box.createRigidArea(new Dimension(12, 0)));
+        w.add(compactLabel("止"));
+        w.add(Box.createRigidArea(new Dimension(4, 0)));
+        w.add(end);
+        if (hint != null) {
+            w.add(Box.createRigidArea(new Dimension(8, 0)));
+            JLabel h = new JLabel(hint);
+            h.setFont(JBUI.Fonts.label(11));
+            h.setForeground(textMuted());
+            w.add(h);
+        }
+        return w;
+    }
+
+    /** 标签左、[输入框 + 后缀] 右（复用 formLabel 的 84px 固定宽度，与上方表单对齐） */
+    private JPanel billingRow(String labelText, JComponent field, String suffix) {
+        JPanel row = new JPanel(new BorderLayout(12, 0));
+        row.setOpaque(false);
+        // BoxLayout.Y_AXIS 默认按 CENTER 对齐子项，窄行会被推右；统一 LEFT 保证各行左边缘一致
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.add(formLabel(labelText), BorderLayout.WEST);
+        if (suffix != null) {
+            JPanel wrap = new JPanel(new BorderLayout(6, 0));
+            wrap.setOpaque(false);
+            wrap.add(field, BorderLayout.CENTER);
+            JLabel s = new JLabel(suffix);
+            s.setFont(JBUI.Fonts.label(11));
+            s.setForeground(textMuted());
+            wrap.add(s, BorderLayout.EAST);
+            row.add(wrap, BorderLayout.CENTER);
+        } else {
+            row.add(field, BorderLayout.CENTER);
+        }
+        return row;
+    }
+
+    /** 复选框/单选框统一样式 */
+    private void styleCheck(AbstractButton cb) {
+        cb.setFont(JBUI.Fonts.label(13));
+        cb.setForeground(textPrimary());
+        cb.setOpaque(false);
+        cb.setFocusable(false);
+        cb.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+    }
+
+    private JBTextField createNumberField(String placeholder, int cols) {
+        JBTextField f = createTextField(placeholder);
+        f.setColumns(cols);
+        return f;
+    }
+
+    private double parseDoubleOr(String s, double fallback) {
+        try { return Double.parseDouble(s.trim().replace(",", "").replace(" ", "")); }
+        catch (Exception e) { return fallback; }
+    }
+
+    /** 解析 "HH:mm"（也兼容纯小时 "9"）为当天分钟数；非法返回 fallback */
+    private int parseTimeToMinutes(String s, int fallback) {
+        if (s == null) return fallback;
+        s = s.trim();
+        if (s.isEmpty()) return fallback;
+        try {
+            int colon = s.indexOf(':');
+            int h, m;
+            if (colon >= 0) {
+                h = Integer.parseInt(s.substring(0, colon).trim());
+                m = Integer.parseInt(s.substring(colon + 1).trim());
+            } else {
+                h = Integer.parseInt(s);
+                m = 0;
+            }
+            h = Math.max(0, Math.min(23, h));
+            m = Math.max(0, Math.min(59, m));
+            return h * 60 + m;
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private void updatePeakFieldsVisibility() {
+        if (peakFieldsPanel != null) peakFieldsPanel.setVisible(peakEnabledCheck.isSelected());
+    }
+
+    /** 编辑已有模型时，从 DB 载入其计费配置回填表单 */
+    private void prefillBilling(ModelConfig cfg) {
+        ModelPricing p = ModelPricingRepository.load(cfg.getName());
+        boolean enabled = p != null && p.isEnabled();
+        billingEnabledCheck.setSelected(enabled);
+        // 仅当已启用时回填真实数值；未启用/未配置时留空，让输入框显示 DeepSeek 示例占位符
+        ModelPricing src = enabled ? p : null;
+        boolean usd = src != null && "$".equals(src.getCurrency());
+        currencyUsdRadio.setSelected(usd);
+        currencyCnyRadio.setSelected(!usd);
+        priceHitField.setText(src != null ? String.valueOf(src.getPriceCacheHit()) : "");
+        priceMissField.setText(src != null ? String.valueOf(src.getPriceCacheMiss()) : "");
+        priceOutField.setText(src != null ? String.valueOf(src.getPriceOutput()) : "");
+        peakEnabledCheck.setSelected(src != null && src.isPeakEnabled());
+        java.util.List<com.codepal.model.PeakWindow> wins =
+                src != null ? src.getPeakWindows() : java.util.Collections.emptyList();
+        com.codepal.model.PeakWindow w1 = wins.size() > 0 ? wins.get(0) : null;
+        com.codepal.model.PeakWindow w2 = wins.size() > 1 ? wins.get(1) : null;
+        peakStart1Field.setText(w1 != null ? com.codepal.model.PeakWindow.formatTime(w1.getStartMinutes()) : "");
+        peakEnd1Field.setText(w1 != null ? com.codepal.model.PeakWindow.formatTime(w1.getEndMinutes()) : "");
+        peakStart2Field.setText(w2 != null ? com.codepal.model.PeakWindow.formatTime(w2.getStartMinutes()) : "");
+        peakEnd2Field.setText(w2 != null ? com.codepal.model.PeakWindow.formatTime(w2.getEndMinutes()) : "");
+        peakWeekdayOnlyCheck.setSelected(w1 != null && w1.isWeekdayOnly());
+        peakMultField.setText(src != null ? String.valueOf(src.getPeakMultiplier()) : "");
+        billingDetailPanel.setVisible(enabled);
+        updatePeakFieldsVisibility();
+    }
+
+    /** 保存时把表单计费配置落库（模型改名则迁移旧行）；未启用则不落库，保持表干净 */
+    private void persistBilling(ModelConfig cfg, String oldName) {
+        // 模型改名：迁移旧行
+        if (oldName != null && !oldName.equals(cfg.getName())) {
+            ModelPricingRepository.delete(oldName);
+        }
+        // 未启用自定义计费：删除该模型计费行，下次打开显示示例占位符
+        if (!billingEnabledCheck.isSelected()) {
+            ModelPricingRepository.delete(cfg.getName());
+            return;
+        }
+        ModelPricing p = new ModelPricing(cfg.getName());
+        p.setEnabled(true);
+        p.setCurrency(currencyUsdRadio.isSelected() ? "$" : "¥");
+        p.setUnit(ModelPricing.UNIT_PER_MILLION);
+        p.setPriceCacheHit(parseDoubleOr(priceHitField.getText(), 0));
+        p.setPriceCacheMiss(parseDoubleOr(priceMissField.getText(), 0));
+        p.setPriceOutput(parseDoubleOr(priceOutField.getText(), 0));
+        p.setPeakEnabled(peakEnabledCheck.isSelected());
+        // 高峰窗口：最多两个时段，可限定仅周一至周五
+        //（DeepSeek 官方口径：工作日 09:00-12:00、14:00-18:00，高峰价为空闲 2 倍）
+        p.getPeakWindows().clear();
+        java.util.Set<Integer> days = peakWeekdayOnlyCheck.isSelected()
+                ? new java.util.LinkedHashSet<>(java.util.List.of(1, 2, 3, 4, 5))
+                : new java.util.LinkedHashSet<>();
+        int s1 = parseTimeToMinutes(peakStart1Field.getText(), -1);
+        int e1 = parseTimeToMinutes(peakEnd1Field.getText(), -1);
+        if (s1 >= 0 && e1 >= 0) p.getPeakWindows().add(new com.codepal.model.PeakWindow(days, s1, e1));
+        int s2 = parseTimeToMinutes(peakStart2Field.getText(), -1);
+        int e2 = parseTimeToMinutes(peakEnd2Field.getText(), -1);
+        if (s2 >= 0 && e2 >= 0) p.getPeakWindows().add(new com.codepal.model.PeakWindow(days, s2, e2));
+        p.setPeakMultiplier(parseDoubleOr(peakMultField.getText(), 1.0));
+        ModelPricingRepository.upsert(p);
+    }
+
     // 圆角按钮：JButton 默认方角，这里自绘 8px 圆角背景（实心/描边两态）
     private class RoundButton extends JButton {
         private final int radius;
@@ -805,7 +1143,9 @@ public class AddModelDialog extends JDialog {
     private JBTextField createTextField(String placeholder) {
         JBTextField f = new JBTextField();
         styleTextField(f);
-        f.putClientProperty("JTextField.placeholderText", placeholder);
+        // 根因修正：JBTextField 不支持 "JTextField.placeholderText"（JTextField 无此 API），
+        // 平台默认占位符 API 是 getEmptyText().setText(...)（官方 SDK 文档推荐）。
+        if (placeholder != null) f.getEmptyText().setText(placeholder);
         return f;
     }
 
@@ -1180,6 +1520,7 @@ public class AddModelDialog extends JDialog {
     }
 
     private void onSave() {
+        String oldName = (editingConfig != null) ? editingConfig.getName() : null;
         String name = modelNameField.getText().trim();
         if (name.isEmpty()) {
             showError("请输入模型名称");
@@ -1223,6 +1564,7 @@ public class AddModelDialog extends JDialog {
             // 视觉模型：写入独立的 visionModel 配置（进入该模式即视为启用）
             settings.setVisionModel(newCfg);
             settings.setVisionEnabled(true);
+            persistBilling(newCfg, oldName);
             saved = true;
             savedConfig = newCfg;
             dispose();
@@ -1248,6 +1590,9 @@ public class AddModelDialog extends JDialog {
 
         saved = true;
         savedConfig = newCfg;
+
+        // 计费配置按模型名维度落库（与模型主配置解耦，改名时迁移旧行）
+        persistBilling(newCfg, oldName);
 
         // 仅补全模式持久化「是否启用补全模型」开关与触发延迟；压缩/聊天模式下内联面板不显示，跳过以免误覆盖补全配置
         if (completionMode) {

@@ -267,22 +267,12 @@ public class CompressionManager {
 
     /**
      * 估算单条消息的 token 数（展示级精度）。
-     * 口径与 ChatPanel.estimateSessionTokens 一致（≈ 字符数 / 1.6），
-     * 保证圆环显示的占用量与压缩切分用的是同一把尺子。
+     * 统一委托 TokenEstimator（全插件唯一口径，系数对齐 DeepSeek 官方换算：
+     * 中文 0.6 token/字、其它 0.3 token/字符），保证圆环显示的占用量与压缩切分用的是同一把尺子。
+     * 注意：旧实现 chars/1.6 对中文高估约 2.7 倍 → 压缩预算虚高、触发过早；统一后压缩时机会相应变晚。
      */
     public static long estimateMessageTokens(ChatMessage m) {
-        long chars = 0;
-        if (m.getContent() != null) chars += m.getContent().length();
-        if (m.getReasoning_content() != null) chars += m.getReasoning_content().length();
-        if (m.getTool_calls() != null) {
-            for (ChatMessage.ToolCall tc : m.getTool_calls()) {
-                if (tc != null && tc.getFunction() != null
-                        && tc.getFunction().getArguments() != null) {
-                    chars += tc.getFunction().getArguments().length();
-                }
-            }
-        }
-        return Math.max(0, chars / 16 * 10);
+        return com.codepal.utils.TokenEstimator.estimateMessageTokens(m);
     }
 
     /** 估算整段消息列表的 token 总量（口径同 estimateMessageTokens） */

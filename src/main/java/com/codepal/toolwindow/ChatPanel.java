@@ -379,23 +379,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     /** 用户主动取消了本次压缩（异步回调据此避免把"已取消"显示成失败） */
     private boolean compressCancelled  = false;
 
-    // 当前会话累计 token 用量（用于费用统计，每次请求都会把完整对话作为 prompt 重发，故应累加）
-    private int sessionPromptTokens      = 0;
-    private int sessionCompletionTokens  = 0;
-    private int sessionCacheHitTokens    = 0;
-    private int sessionCacheMissTokens   = 0;
+    // 会话内按模型分组的累计 token 用量（插入序 = 首次使用顺序）。
+    // 只存 token 数；费用按各模型自己的单价在展示时实时计算（改单价即时生效）。
+    // 已落库 session_model_usage（会话×模型 原子增量），切会话/重启由 onActivateSession 回填。
+    private final java.util.LinkedHashMap<String, com.codepal.model.ModelTokenUsage> sessionModelUsage =
+            new java.util.LinkedHashMap<>();
 
     // 最新一次请求的上下文快照（用于圆环的"当前上下文窗口用量"）。
     // 关键：每次请求都把完整对话历史作为 prompt 发往后端，usage.prompt_tokens 即"整个当前上下文"的大小，
     // 绝不可累加（否则同一份上下文会被数倍重复计数，几轮后圆环虚假爆满）。这里只记录最近一次，不累加。
-    private long lastPromptTokens     = 0;
-    private long lastCompletionTokens = 0;
+    // volatile：usage 在解析线程同步写入，onComplete/EDT 收尾读取（消除 chip 挂载的可见性/时序竞态）。
+    private volatile long lastPromptTokens     = 0;
+    private volatile long lastCompletionTokens = 0;
     // 最新一次请求的缓存命中/未命中快照（token 面板"本次回答"口径，不累加）
-    private long lastCacheHitTokens   = 0;
-    private long lastCacheMissTokens  = 0;
+    private volatile long lastCacheHitTokens   = 0;
+    private volatile long lastCacheMissTokens  = 0;
     // 本轮流是否已收到 usage 帧（usage 与 finish_reason 同为流末帧）：
-    // 中途出错/被掐断时未收到，lastPromptTokens 还是上一轮旧值，不得用于本轮 chip
-    private boolean usageReceivedThisRound = false;
+    // 中途出错/被掐断时未收到，lastPromptTokens 还是上一轮旧值，不得用于本轮 chip。
+    // volatile：在解析线程同步置位（见 onUsage），EDT 的 onComplete 收尾读取
+    private volatile boolean usageReceivedThisRound = false;
 
     // 「本轮发送给模型的完整上下文」快照：key=用户消息 DB id，value=JSON（system/history/userMessage/messageCount）。
     // 仅内存、不落库；重载会话后自然清空（悬浮查看时提示"未记录"，与桌面端一致）。
@@ -676,6 +678,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         skillList.setCellRenderer(skillComboRenderer);
         skillList.setFixedCellHeight(ComboStyle.rowHeight());
         skillList.setVisibleRowCount(12);
+        // ★ 与数据源弹层对齐：列表项均为可点击项，整表手型光标。
+        //  （Swing 光标由鼠标命中的最深子组件决定，只给按钮设没用，list 必须自己持有 HAND_CURSOR）
+        skillList.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         skillList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         skillList.setOpaque(false);
         skillList.setBackground(new Color(0, 0, 0, 0));
@@ -759,6 +764,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     contextCircle.setMaxContextTokens(settings.getChatMaxTokens());
                 }
                 if (agentBackendManager != null) agentBackendManager.refreshCurrentBackend();
+                // 切换模型：按模型分桶的累计各自保留（互不干扰），仅即时刷新展示
+                // （圆环"实时费用"改按新模型单价折算当前上下文）
+                refreshTokenStatsDisplay();
             }
             if (!chatSessionManager.isLoadingSessionConfig()) saveSessionConfig();
             // 切换模型后，收起态宽度需随新模型名重新自适应（触发父容器重新布局）
@@ -980,11 +988,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             todoCompletionSummaryAppended = false;
             if (streamRenderController != null) streamRenderController.resetAll();
             if (conversationManager != null) conversationManager.reset(CPSettings.getInstance().getSystemPrompt(project, craftMode));
-            // 重置 token 统计
-            sessionPromptTokens     = 0;
-            sessionCompletionTokens = 0;
-            sessionCacheHitTokens   = 0;
-            sessionCacheMissTokens  = 0;
+            // 重置 token 统计（按模型分桶一并清空）
+            sessionModelUsage.clear();
             lastPromptTokens     = 0;
             lastCompletionTokens = 0;
             lastCacheHitTokens   = 0;
@@ -3136,29 +3141,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             clearStreamRefs();
 
                             // 输出完毕兜底刷新圆环：
-                            // 口径与 updateTokenStats 统一——优先用真实 usage 累计（>0 说明收到过 usage，精确），
-                            // 仅当后端完全不回 usage（realUsed=0，如本地 sglang 网关）时才退化为会话内容估算。
-                            if (contextCircle != null) {
-                                long usedCtx = usedContextTokens();
-                                contextCircle.setTokens(usedCtx);
-                                String tip = String.format(
-                                    "<html>当前上下文：%s / %s（%.0f%%）<br><br>" +
-                                        "<b>会话累计：</b><br>" +
-                                        "输入：%s（命中 %s / 未命中 %s）<br>" +
-                                        "输出：%s<br>" +
-                                        "预估费用：%s<br><br>" +
-                                        "<small>点击压缩对话历史</small></html>",
-                                    formatTokenCount(usedCtx),
-                                    formatTokenCount(contextCircle.getMaxContextTokens()),
-                                    usedCtx * 100.0 / Math.max(1, contextCircle.getMaxContextTokens()),
-                                    formatTokenCount(sessionPromptTokens),
-                                    formatTokenCount(sessionCacheHitTokens),
-                                    formatTokenCount(sessionCacheMissTokens),
-                                    formatTokenCount(sessionCompletionTokens),
-                                    computeCostStr(sessionCacheHitTokens, sessionCacheMissTokens,
-                                        sessionCompletionTokens, selectedModelName()));
-                                contextCircle.setToolTipText(tip);
-                            }
+                            // 口径与 updateTokenStats 统一——实时上下文 + 按模型分组的会话累计费用
+                            refreshTokenStatsDisplay();
 
                             // Craft 模式：agent 已完成所有工作（无 tool_calls 的最终回复），展示累积的所有 diff
                             if (planCollecting && !planFileStates.isEmpty()) {
@@ -3175,10 +3159,22 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     @Override
                     public void onUsage(com.codepal.model.ChatResponse.Usage usage) {
                         System.out.println("onUsage------------------------");
+                        if (usage == null) return;
+                        // ★ 竞态修复：usage 帧与 finish_reason/[DONE] 的到达顺序因厂商而异。
+                        //   旧实现把 usageReceivedThisRound=true 放进 EDT 队列，若 onComplete 的 EDT 任务
+                        //   先执行（解析器先触发 onComplete），标志仍为 false → chip 被误跳过（偶发缺统计图标）。
+                        //   现改为在解析线程【同步】落快照与标志（字段 volatile 保证可见性），
+                        //   只要解析器先回调 onUsage，EDT 里的 onComplete 必然能看到 true。
+                        //   分桶累计/落库/UI 刷新仍走 EDT（Swing 组件只能在 EDT 操作）。
+                        if (!sendSrc.isCurrentGeneration(myGen)) return; // 旧代数迟到的 usage 不污染当前轮
+                        lastPromptTokens     = usage.getPromptTokens();
+                        lastCompletionTokens = usage.getCompletionTokens();
+                        lastCacheHitTokens   = usage.getPromptCacheHitTokens();
+                        lastCacheMissTokens  = usage.getPromptCacheMissTokens();
+                        usageReceivedThisRound = true;
                         ApplicationManager.getApplication().invokeLater(() -> {
                             if (!sendSrc.isCurrentGeneration(myGen)) return;
                             updateTokenStats(usage);
-                            usageReceivedThisRound = true; // 本轮 usage 已到达
                         });
                     }
 
@@ -3250,9 +3246,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * attachTokenInfo 依赖 lcStreamingMsgId 仍指向该助手消息）。
      */
     private void attachAndPersistTokenInfo(String msgId, ChatWebView webView) {
-        if (msgId == null || !usageReceivedThisRound) return;
+        if (msgId == null) {
+            System.out.println("[TokenChip] 跳过：msgId=null（本轮无可挂载的助手消息）");
+            return;
+        }
+        if (!usageReceivedThisRound) {
+            System.out.println("[TokenChip] 跳过：本轮未收到 usage 帧（后端未回/流被掐断），不挂上一轮旧值");
+            return;
+        }
         String answerTokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
-        if (answerTokenJson == null) return;
+        if (answerTokenJson == null) {
+            System.out.println("[TokenChip] 跳过：usage 全为 0（input/output 均无值）");
+            return;
+        }
+        System.out.println("[TokenChip] 已挂载 msgId=" + msgId);
         webView.attachTokenInfo(answerTokenJson);
         ThreadHelper.executeAsync(project, () -> com.codepal.db.DBChatHistoryRepository
                 .updateTokenUsage(msgId, answerTokenJson), null);
@@ -4028,60 +4035,38 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         return null;
     }
 
-    /** 根据模型与四类 token 计算预估费用字符串（元） */
+    /** 根据模型与四类 token 计算预估费用字符串（元）。
+     *  优先取该模型在弹窗中配置的自定义单价；未配置/未启用时回退到 PricingCalculator 兜底单价。 */
     private String computeCostStr(long hit, long miss, long out, String modelName) {
-        double hitPrice, missPrice, outPrice;
-        if ("deepseek-v4-pro".equals(modelName)) {
-            hitPrice  = 0.1  / 1_000_000.0;
-            missPrice = 12.0 / 1_000_000.0;
-            outPrice  = 24.0 / 1_000_000.0;
-        } else {
-            hitPrice  = 0.02 / 1_000_000.0;
-            missPrice = 1.0  / 1_000_000.0;
-            outPrice  = 2.0  / 1_000_000.0;
+        com.codepal.model.ModelPricing p =
+                (modelName != null) ? com.codepal.db.ModelPricingRepository.load(modelName) : null;
+        if (p == null || !p.isEnabled()) {
+            p = com.codepal.billing.PricingCalculator.DEFAULT_FALLBACK;
         }
-        double totalCost = hit * hitPrice + miss * missPrice + out * outPrice;
-        return totalCost < 0.0001
-                ? String.format("¥%.2e", totalCost)
-                : String.format("¥%.4f", totalCost);
+        com.codepal.billing.PricingCalculator.CostResult r =
+                com.codepal.billing.PricingCalculator.compute(p, hit, miss, out);
+        return com.codepal.billing.PricingCalculator.format(r);
     }
 
     /**
      * 基于会话实际内容估算当前上下文使用量（token）。
      * 后端（尤其本地 sglang 网关）经常不回 usage / 不回 prompt_tokens，
      * 导致依赖 usage 的圆环统计不动。这里改用会话历史文本长度估算，
-     * 作为圆环"使用量"的可靠口径：中英文混合按 ~1.6 字符/token 估算。
+     * 作为圆环"使用量"的可靠口径（系数对齐 DeepSeek 官方换算，见 estimateTokens）。
      */
     private long estimateSessionTokens() {
         if (conversationManager == null) return 0;
-        long chars = 0;
-        for (com.codepal.model.ChatMessage m : conversationManager.getMessages()) {
-            String c = m.getContent();
-            if (c != null) chars += c.length();
-            String r = m.getReasoning_content();
-            if (r != null) chars += r.length();
-        }
-        return Math.max(0, chars / 16 * 10); // ≈ chars / 1.6
+        // 统一走 TokenEstimator（全插件唯一估算口径，系数对齐 DeepSeek 官方换算）。
+        // 含 content + reasoning_content + tool_calls 参数（三者都会随请求回传）。
+        // 旧实现 chars/1.6（中文 1.6 token/字）对 DeepSeek 高估约 2.7 倍 → 圆环虚假爆满。
+        return com.codepal.utils.TokenEstimator.estimateSession(conversationManager.getMessages());
     }
 
     /**
-     * 启发式 token 估算（展示级精度，对齐 codepal-desktop TokenMeter）。
-     * 中文/日文约 1.6 token/字符，西文与代码约 0.25 token/字符（≈4 字符/token）。
+     * 启发式 token 估算（展示级精度）——统一委托给 TokenEstimator（全插件唯一口径）。
      */
     private static long estimateTokens(String text) {
-        if (text == null || text.isEmpty()) return 0;
-        int cjk = 0;
-        double other = 0;
-        for (int i = 0; i < text.length(); ) {
-            int code = text.codePointAt(i);
-            if (code >= 0x4e00 && code <= 0x9fff) cjk++;
-            else if (code >= 0x3000 && code <= 0x30ff) cjk++;
-            else if (code == '\n' || code == '\t') other += 0.25;
-            else if (code == ' ') other += 0.1;
-            else other++;
-            i += Character.charCount(code);
-        }
-        return Math.max(0, Math.round((float) (cjk * 1.6 + other * 0.25)));
+        return com.codepal.utils.TokenEstimator.estimateTokens(text);
     }
 
     /** 判断工具是否为子智能体（独立 LLM 调用，非普通工具） */
@@ -4105,11 +4090,17 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     private void updateTokenStats(com.codepal.model.ChatResponse.Usage usage) {
         if (usage == null) return;
 
-        // 费用统计：跨轮累加（每次请求都重发整段对话，这就是真实消耗）
-        sessionPromptTokens     += usage.getPromptTokens();
-        sessionCompletionTokens += usage.getCompletionTokens();
-        sessionCacheHitTokens   += usage.getPromptCacheHitTokens();
-        sessionCacheMissTokens  += usage.getPromptCacheMissTokens();
+        // 费用统计：按模型分桶累计（usage 紧随请求到达，请求所用模型即当前选中模型）
+        String usedModel = selectedModelName();
+        if (usedModel != null) {
+            sessionModelUsage.computeIfAbsent(usedModel, k -> new com.codepal.model.ModelTokenUsage()).add(usage);
+            // 落库：会话×模型 原子增量（切会话/重启后由 onActivateSession 回填）
+            String sid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+            if (sid != null) {
+                ThreadHelper.executeAsync(project, () ->
+                        com.codepal.db.DBSessionUsageRepository.incrementUsage(sid, usedModel, usage), null);
+            }
+        }
 
         // 上下文快照：只取最近一次请求的值（用于圆环，不能累加）
         lastPromptTokens     = usage.getPromptTokens();
@@ -4118,78 +4109,95 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         lastCacheHitTokens   = usage.getPromptCacheHitTokens();
         lastCacheMissTokens  = usage.getPromptCacheMissTokens();
 
-        // 根据当前选择的模型确定单价（元 / token）
+        // 根据累计 token 与当前模型单价刷新 tooltip / 底部统计
+        refreshTokenStatsDisplay();
+    }
+
+    /**
+     * 刷新费用展示（圆环 tooltip / detail / 底部统计）。
+     *
+     * <p>两段口径：
+     * <ul>
+     *   <li><b>当前上下文（实时）</b>：最近一次请求的 token 快照，按当前选中模型单价折算费用；</li>
+     *   <li><b>会话累计（按模型）</b>：本会话用过的每个模型各自的总花费 / 总 token 消耗，
+     *       费用按该模型自己的单价实时计算（改单价即时生效）。</li>
+     * </ul>
+     */
+    private void refreshTokenStatsDisplay() {
         String model = null;
         Object selObj = modelCombo.getSelectedItem();
         if (selObj instanceof ModelComboItem) {
             model = ((ModelComboItem) selObj).name;
         }
-        String costStr = computeCostStr(sessionCacheHitTokens, sessionCacheMissTokens,
-                sessionCompletionTokens, model);
 
-        // 缓存命中率
-        int totalInput = sessionCacheHitTokens + sessionCacheMissTokens;
-        String hitRateStr = totalInput > 0
-                ? String.format("%.0f%%", sessionCacheHitTokens * 100.0 / totalInput)
+        // ── 当前上下文（实时）：最近一次请求快照 + 当前模型单价 ──
+        long usedContext = usedContextTokens();
+        long curInput = lastCacheHitTokens + lastCacheMissTokens;
+        String currentCost = computeCostStr(lastCacheHitTokens, lastCacheMissTokens,
+                lastCompletionTokens, model);
+        String hitRateStr = curInput > 0
+                ? String.format("%.0f%%", lastCacheHitTokens * 100.0 / curInput)
                 : "—";
 
-        // 💡【核心修改 1】将原本的 %d 改为 %s，并调用单位转换函数缩写数字
-        // 上下文窗口使用量口径：用最近一次请求的精确 usage 快照（prompt+completion），
-        // 后端不回 usage 时（如本地 sglang 网关）退化为基于会话内容的估算，保证圆环仍更新。
-        // 注意：不能用跨轮累加值 sessionPromptTokens+Completion 作圆环口径，否则会把整段对话数倍重复计数。
-        long usedContext = usedContextTokens();
+        // ── 会话累计（按模型分组）──
+        StringBuilder cumulative = new StringBuilder();
+        long allInput = 0, allOutput = 0;
+        for (java.util.Map.Entry<String, ModelTokenUsage> e : sessionModelUsage.entrySet()) {
+            ModelTokenUsage b = e.getValue();
+            String cost = computeCostStr(b.getCacheHit(), b.getCacheMiss(), b.getCompletion(), e.getKey());
+            if (cumulative.length() > 0) cumulative.append("<br>");
+            // 单行紧凑展示（过长会被 tooltip 自动折行），输入/输出明细放 detail 面板
+            cumulative.append(String.format("%s：总花费 %s｜总消耗 %s",
+                    e.getKey(), cost, formatTokenCount(b.totalTokens())));
+            allInput += b.totalInput();
+            allOutput += b.getCompletion();
+        }
+        String cumulativeHtml = cumulative.length() > 0 ? cumulative.toString() : "暂无";
 
         String detailHtml = String.format(
-                "<html>当前会话累计<br>"
-                        + "输入 tokens：%s（缓存命中 %s + 未命中 %s）<br>"
-                        + "输出 tokens：%s<br>"
-                        + "上下文窗口：%s / %sK<br>"
-                        + "缓存命中率：%s<br>"
-                        + "预估费用：%s 元</html>",
-                formatTokenCount(sessionPromptTokens),
-                formatTokenCount(sessionCacheHitTokens),
-                formatTokenCount(sessionCacheMissTokens),
-                formatTokenCount(sessionCompletionTokens),
-                formatTokenCount(usedContext),
-                getContextWindowLimit() / 1000,
+                "<html><b>当前上下文</b><br>"
+                        + "tokens：%s（缓存命中 %s + 未命中 %s）<br>"
+                        + "费用：%s（按 %s 单价）<br>"
+                        + "上下文窗口：%s / %sK｜缓存命中率：%s<br>"
+                        + "<b>会话累计（按模型）</b><br>%s</html>",
+                formatTokenCount(curInput + lastCompletionTokens),
+                formatTokenCount(lastCacheHitTokens),
+                formatTokenCount(lastCacheMissTokens),
+                currentCost, model != null ? model : "—",
+                formatTokenCount(usedContext), getContextWindowLimit() / 1000,
                 hitRateStr,
-                costStr
+                cumulativeHtml
         );
 
-        // 更新上下文进度圈：用累计上下文使用量（输入+输出），确保随对话增长而增长
+        // 更新上下文进度圈：圆环本体 = 当前上下文用量（实时）
         if (contextCircle != null) {
             contextCircle.setTokens(usedContext);
-            // 详细统计信息放到悬浮提示里
             String circleTooltip = String.format(
-                "<html>当前上下文：%s / %s（%.0f%%）<br><br>" +
-                    "<b>会话累计：</b><br>" +
-                    "输入：%s（命中 %s / 未命中 %s）<br>" +
-                    "输出：%s<br>" +
-                    "缓存命中率：%s<br>" +
-                    "预估费用：%s<br><br>" +
-                    "<small>点击压缩对话历史</small></html>",
+                "<html>当前上下文：%s / %s（%.0f%%）<br>"
+                    + "当前 tokens：%s（缓存命中率 %s）<br>"
+                    + "当前费用：%s（%s）<br><br>"
+                    + "<b>会话累计（按模型）</b><br>%s<br><br>"
+                    + "<small>点击压缩对话历史</small></html>",
                 formatTokenCount(usedContext),
                 formatTokenCount(contextCircle.getMaxContextTokens()),
-                usedContext * 100.0 / contextCircle.getMaxContextTokens(),
-                formatTokenCount(sessionPromptTokens),
-                formatTokenCount(sessionCacheHitTokens),
-                formatTokenCount(sessionCacheMissTokens),
-                formatTokenCount(sessionCompletionTokens),
+                usedContext * 100.0 / Math.max(1, contextCircle.getMaxContextTokens()),
+                formatTokenCount(curInput + lastCompletionTokens),
                 hitRateStr,
-                costStr
+                currentCost, model != null ? model : "—",
+                cumulativeHtml
             );
             contextCircle.setToolTipText(circleTooltip);
             contextCircle.putClientProperty("detail_text", detailHtml);
         }
 
-        // 同步到底部token统计（如果存在）
+        // 同步到底部token统计（如果存在）：全部模型合计 token + 当前模型实时费用
         if (tokenStatsLabel != null) {
             String tooltipText = String.format(
-                    "↑%s ↓%s | %s | 命中率 %s",
-                    formatTokenCount(sessionPromptTokens),
-                    formatTokenCount(sessionCompletionTokens),
-                    costStr,
-                    hitRateStr
+                    "↑%s ↓%s | 当前 %s | %s",
+                    formatTokenCount(allInput),
+                    formatTokenCount(allOutput),
+                    currentCost,
+                    model != null ? model : "—"
             );
             tokenStatsLabel.setToolTipText(tooltipText);
             tokenStatsLabel.putClientProperty("detail_text", detailHtml);
@@ -5289,8 +5297,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             cacheHitRate = String.format("%.1f", Math.min(ch, displayInput) * 100.0 / displayInput);
         }
 
-        String cost = computeCostStr(sessionCacheHitTokens, sessionCacheMissTokens,
-                sessionCompletionTokens, selectedModelName());
+        // chip 口径是"本次回答"：input/output/cacheHit/cacheMiss 均为本次快照，
+        // 费用也必须用本次快照（此前误用 session 累计值 → chip 显示成了会话累计费用）
+        String cost = computeCostStr(ch, cm, output, selectedModelName());
 
         JsonObject o = new JsonObject();
         o.addProperty("input", input);
@@ -5299,6 +5308,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         o.addProperty("cacheMiss", cm);
         o.addProperty("total", input + output);
         o.addProperty("cost", cost != null ? cost : "");
+        // 记录产生本次回答的模型（便于 chip 展示与后续按消息追溯计费）
+        o.addProperty("model", selectedModelName());
 
         // 四轴拆分（对齐 codepal-desktop TokenUsage）
         o.addProperty("system", systemTok);
@@ -5827,6 +5838,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (session == null) return;
         boolean deleted = chatSessionManager.deleteSession(session);
         if (deleted) {
+            // 会话已删除：其按模型分组的累计用量一并清理
+            if (session.getId() != null) {
+                ThreadHelper.executeAsync(project, () ->
+                        com.codepal.db.DBSessionUsageRepository.deleteUsage(session.getId()), null);
+            }
             refreshHistoryList();
         }
     }
@@ -5982,6 +5998,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     @Override
     public void onHistoryLoaded() {
         iterationGuard.detectAndRecoverCrash();
+        // 历史加载完成后二次回填按模型累计（覆盖"启动时 onActivateSession 先于会话/历史就绪"的时序）
+        reloadSessionModelUsage();
     }
 
     @Override
@@ -5999,6 +6017,13 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 会话被激活（新建/切换/启动加载）：通知 TabManager 更新标签标题。
         final String sid = sessionId;
         final String t = title;
+        // 回填该会话按模型分组的累计用量（session_model_usage 落库数据）；无记录则清空展示
+        // 会话切换：上下文快照属于上一个会话，清零（圆环先按估算回退，本会话首次真实 usage 到达后恢复精确）
+        lastPromptTokens = 0;
+        lastCompletionTokens = 0;
+        lastCacheHitTokens = 0;
+        lastCacheMissTokens = 0;
+        reloadSessionModelUsage();
         ApplicationManager.getApplication().invokeLater(() -> {
             // 保存上一个会话的输入框草稿
             if (activeInputSessionId != null && inputField != null) {
@@ -6016,6 +6041,26 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // 绑定当前会话的待办
             if (todoManager != null) todoManager.bindSession(sid);
         });
+    }
+
+    /**
+     * 从 DB 回填当前会话按模型分组的累计用量（session_model_usage），并刷新展示。
+     * onActivateSession（会话激活）与 onHistoryLoaded（历史加载完成，覆盖启动时序）都会调用。
+     */
+    private void reloadSessionModelUsage() {
+        final String sid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+        ThreadHelper.executeAsync(project, () -> {
+            java.util.LinkedHashMap<String, com.codepal.model.ModelTokenUsage> loaded =
+                    com.codepal.db.DBSessionUsageRepository.loadUsage(sid);
+            System.out.println("[UsageStats] 回填会话累计 sid=" + sid
+                    + ", 模型数=" + (loaded != null ? loaded.size() : 0)
+                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : ""));
+            ApplicationManager.getApplication().invokeLater(() -> {
+                sessionModelUsage.clear();
+                if (loaded != null) sessionModelUsage.putAll(loaded);
+                refreshTokenStatsDisplay();
+            });
+        }, null);
     }
 
     @Override
@@ -6818,8 +6863,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             boolean inList = renderingAsList;
 
             if (inList) {
-                g2.setColor(ComboStyle.surfaceColor());
-                g2.fillRect(0, 0, w, h);
+                // ★ 行不再自绘底色（与数据源弹层 DatabaseListRenderer 对齐）：保持透明，
+                //   让弹层自绘的 popupSurfaceColor 均匀透出。旧实现每行画 surfaceColor
+                //  （比弹层底色更深）→ 弹窗出现"外圈亮、内里一块更黑"的两层色。
+                //   此处只画选中/hover 覆盖层。
                 if (isSelectedItem) {
                     g2.setColor(ComboStyle.selectionColor());
                     g2.fillRect(0, 0, w, h);
@@ -6944,9 +6991,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // 勾选框状态：仅真实 skill 项、且位于已启用集合中才勾选
             this.checked = value != null && value.kind == SkillListItem.KIND_SKILL
                     && enabledSet != null && enabledSet.contains(value.name);
-            // 可删状态：仅真实 skill 且存在于用户目录（非出厂内置）才显示删除图标
+            // 可删状态：仅"用户导入"且非出厂默认才显示删除图标。
+            // 不能只看 isUserImported——ensureDefault 会把出厂技能拷进用户目录，
+            // 导致 source-navigation / project-doc-sync 等出厂技能也误显示删除图标。
             this.deletable = value != null && value.kind == SkillListItem.KIND_SKILL
-                    && com.codepal.skills.SkillStore.isUserImported(value.name);
+                    && com.codepal.skills.SkillStore.isUserImported(value.name)
+                    && !com.codepal.skills.SkillStore.isFactoryDefault(value.name);
             this.currentListIndex = index;
             calcHover(list, index);
             return this;
@@ -6968,6 +7018,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             if (mouseRow == index) {
                 rowHover = true;
                 // 删除图标 hover：同一行且鼠标 x 落在右侧删除图标命中区
+                // （光标已由 skillList 整表持有 HAND_CURSOR，无需在此逐行设置）
                 if (deletable) {
                     int w = list.getWidth();
                     int delX = delIconX(w);
@@ -6975,10 +7026,6 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         deleteHover = true;
                     }
                 }
-                // 光标：悬停在删除图标上变手型，否则默认
-                list.setCursor(deleteHover
-                        ? Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-                        : Cursor.getDefaultCursor());
             }
         }
     }
@@ -7834,12 +7881,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /** 刷新 skill 列表数据：从 SkillStore.listSkills() 重读，同步已启用集合到渲染器。 */
     private void refreshSkillCombo() {
+        // ★ 出厂默认 project-doc-sync 首次出现时自动勾选（仅一次；
+        //   此后用户取消勾选不会被再次自动勾上）。其它出厂技能（如 source-navigation）保持未勾选。
+        CPSettings skillSettings = CPSettings.getInstance();
+        java.util.List<String> names = com.codepal.skills.SkillStore.listSkills();
+        if (!skillSettings.isDocSyncSkillAutoEnabled() && names.contains("project-doc-sync")) {
+            boolean newlyEnabled = !skillSettings.isSkillEnabled("project-doc-sync");
+            skillSettings.setSkillEnabled("project-doc-sync", true);
+            skillSettings.setDocSyncSkillAutoEnabled(true);
+            if (newlyEnabled && conversationManager != null) {
+                // 启用 = 注入系统提示词，需重新生成
+                conversationManager.updateSystemPrompt(
+                        skillSettings.getSystemPrompt(project, craftMode));
+            }
+        }
         // 同步已启用集合（与 CPSettings 对齐），供渲染器画勾选框
         enabledSkillNames.clear();
         enabledSkillNames.addAll(CPSettings.getInstance().getEnabledSkills());
         if (skillComboRenderer != null) skillComboRenderer.setEnabledSet(enabledSkillNames);
         java.util.List<SkillListItem> items = new java.util.ArrayList<>();
-        java.util.List<String> names = com.codepal.skills.SkillStore.listSkills();
         for (String n : names) {
             items.add(SkillListItem.skill(n));
         }
@@ -7973,7 +8033,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      */
     private void deleteSkill(String name) {
         if (name == null || name.isBlank()) return;
-        if (!com.codepal.skills.SkillStore.isUserImported(name)) {
+        if (!com.codepal.skills.SkillStore.isUserImported(name)
+                || com.codepal.skills.SkillStore.isFactoryDefault(name)) {
             statusLabel.setText("内置出厂技能不可删除：" + name);
             return;
         }
@@ -8051,10 +8112,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             chatSessionManager.createNewSession();
             chatSessionManager.saveSessionConfig();
 
-            sessionPromptTokens = 0;
-            sessionCompletionTokens = 0;
-            sessionCacheHitTokens = 0;
-            sessionCacheMissTokens = 0;
+            sessionModelUsage.clear();
             if (tokenStatsLabel != null) {
                 tokenStatsLabel.setToolTipText("暂无统计数据");
                 tokenStatsLabel.putClientProperty("detail_text", null);

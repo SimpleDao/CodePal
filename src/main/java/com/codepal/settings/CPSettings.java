@@ -124,6 +124,13 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         if (on) enabledSkills.add(name); else enabledSkills.remove(name);
     }
 
+    /** project-doc-sync 出厂技能是否已执行过「首次自动勾选」：
+     *  仅自动勾一次；此后用户取消勾选不会被再次自动勾上 */
+    private boolean docSyncSkillAutoEnabled = false;
+
+    public boolean isDocSyncSkillAutoEnabled() { return docSyncSkillAutoEnabled; }
+    public void setDocSyncSkillAutoEnabled(boolean b) { this.docSyncSkillAutoEnabled = b; }
+
     // ── 聊天模型配置 ──────────────────────────────────────────
 //    private String apiKey = "";
 //    private String apiBase = "https://api.deepseek.com";
