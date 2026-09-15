@@ -79,7 +79,7 @@ public interface AgentBackend {
     void cancelCurrent();
 
     /**
-     * 设置 Craft 模式（true=自动执行，false=Plan模式）
+     * 设置 Craft 模式（自动执行文件修改）
      */
     void setCraftMode(boolean craftMode);
 

@@ -88,7 +88,22 @@ public class CompressionManager {
         Consumer<String> statusConsumer,
         long contextWindowTokens
     ) {
+        return compress(messages, conversationId, statusConsumer, contextWindowTokens, null);
+    }
+
+    /**
+     * @param usageSink 本次压缩请求的 usage 回收（参数=所用模型名），用于会话累计计费；可为 null
+     */
+    public CompressionResult compress(
+        List<ChatMessage> messages,
+        String conversationId,
+        Consumer<String> statusConsumer,
+        long contextWindowTokens,
+        java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink
+    ) {
         int oldCount = messages.size();
+        lastUsage = null;
+        lastUsageModelName = null;
         statusConsumer.accept("正在分析对话历史");
 
         // 1. 找出分割点：按 token 预算保留最近上下文（不看消息条数）
@@ -122,7 +137,7 @@ public class CompressionManager {
         // 3. 调用 LLM 生成摘要（不降级，失败直接抛异常）
         String summary;
         try {
-            summary = callLlmSummary(toCompress);
+            summary = callLlmSummary(toCompress, usageSink);
         } catch (Exception e) {
             throw new RuntimeException("LLM 摘要生成失败: " + e.getMessage(), e);
         }
@@ -295,10 +310,18 @@ public class CompressionManager {
         if (f != null) f.cancel(true);
     }
 
+    // ── 最近一次压缩请求的消耗（供 UI 展示"本次压缩消耗"）──
+    private volatile com.codepal.model.ChatResponse.Usage lastUsage;
+    private volatile String lastUsageModelName;
+
+    public com.codepal.model.ChatResponse.Usage getLastUsage() { return lastUsage; }
+    public String getLastUsageModelName() { return lastUsageModelName; }
+
     /**
      * 调用 LLM 生成对话摘要
      */
-    private String callLlmSummary(List<ChatMessage> toCompress) throws Exception {
+    private String callLlmSummary(List<ChatMessage> toCompress,
+                                  java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) throws Exception {
         // 构建历史文本
         StringBuilder historyText = new StringBuilder();
         for (ChatMessage msg : toCompress) {
@@ -363,6 +386,16 @@ public class CompressionManager {
             @Override
             public void onComplete() {
                 future.complete(resultBuilder.toString());
+            }
+
+            @Override
+            public void onUsage(com.codepal.model.ChatResponse.Usage usage) {
+                // 记录本次压缩的消耗并回调（压缩模型计入会话累计，按其自身单价计费）
+                if (usage == null) return;
+                lastUsage = usage;
+                String mName = compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName();
+                lastUsageModelName = mName;
+                if (usageSink != null) usageSink.accept(mName, usage);
             }
 
             @Override

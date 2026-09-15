@@ -17,7 +17,6 @@ import java.util.Map;
  *   <li>{@link StreamRenderController} — 独立的流式渲染状态，支持并发流式</li>
  *   <li>token 统计 — 每个标签独立累计</li>
  *   <li>流式写入可视化状态 — 每个标签独立</li>
- *   <li>Plan 模式文件状态 — 每个标签独立</li>
  * </ul>
  *
  * @author CodePal Tab Isolation
@@ -49,10 +48,6 @@ public class SessionContext {
     private boolean streamWriteIsEdit = false;
     private String streamWriteOriginal = "";
 
-    // ── Plan 模式文件状态（每标签独立）──
-    private final java.util.LinkedHashMap<String, Object> planFileStates = new java.util.LinkedHashMap<>();
-    private final java.util.Set<String> planFilesWithCards = new java.util.HashSet<>();
-    private boolean planCollecting = false;
     private boolean todoCompletionSummaryAppended = false;
 
     // ── 压缩/中断状态（每标签独立）──
@@ -134,13 +129,6 @@ public class SessionContext {
     public String getStreamWriteOriginal() { return streamWriteOriginal; }
     public void setStreamWriteOriginal(String v) { this.streamWriteOriginal = v; }
 
-    // ── Plan 状态 getters ──
-
-    @SuppressWarnings("unchecked")
-    public java.util.LinkedHashMap<String, Object> getPlanFileStates() { return planFileStates; }
-    public java.util.Set<String> getPlanFilesWithCards() { return planFilesWithCards; }
-    public boolean isPlanCollecting() { return planCollecting; }
-    public void setPlanCollecting(boolean v) { this.planCollecting = v; }
     public boolean isTodoCompletionSummaryAppended() { return todoCompletionSummaryAppended; }
     public void setTodoCompletionSummaryAppended(boolean v) { this.todoCompletionSummaryAppended = v; }
 

@@ -39,8 +39,8 @@ public interface Tool {
     String execute(JsonObject params, Project project);
 
     /**
-     * 执行工具（可跳过确认，用于 Craft 模式直接写文件/创建目录等）。
-     * 默认回退到 {@link #execute(JsonObject, Project)}（skipConfirmation=false，即 Plan 行为）。
+     * 执行工具（可跳过确认，用于直接写文件/创建目录等）。
+     * 默认回退到 {@link #execute(JsonObject, Project)}。
      */
     default String execute(JsonObject params, Project project, boolean skipConfirmation) {
         return execute(params, project);

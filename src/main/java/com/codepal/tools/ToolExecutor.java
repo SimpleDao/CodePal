@@ -105,6 +105,8 @@ public class ToolExecutor {
         public ToolConfirmProvider confirmProvider;
         public AskUserQuestionProvider askQuestionProvider;
         public com.codepal.agent.subagent.SubAgentManager subAgentManager;
+        /** usage 回收（子智能体等旁路请求的会话累计计费）：参数为模型名；可为 null */
+        public java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink;
     }
 
     // TMP-MARKER-CONFIRM-PROVIDER
@@ -429,10 +431,20 @@ public class ToolExecutor {
      */
     public static String execute(ChatMessage.ToolCall toolCall, Project project,
                                  boolean skipConfirmation, ToolConfirmManager manager) {
+        return execute(toolCall, project, skipConfirmation, manager, null);
+    }
+
+    /**
+     * @param usageSink 旁路请求（子智能体等）的 usage 回收（参数=模型名），用于会话累计计费；可为 null
+     */
+    public static String execute(ChatMessage.ToolCall toolCall, Project project,
+                                 boolean skipConfirmation, ToolConfirmManager manager,
+                                 java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) {
         ToolExecutionContext ctx = new ToolExecutionContext();
         ctx.confirmProvider = manager != null ? manager : confirmProvider;
         ctx.askQuestionProvider = manager != null ? manager : askQuestionProvider;
         ctx.subAgentManager = subAgentManager;
+        ctx.usageSink = usageSink;
         return execute(toolCall, project, skipConfirmation, ctx);
     }
 
@@ -548,13 +560,14 @@ public class ToolExecutor {
         if (project == null) return "错误：未打开项目";
 
         System.out.println("[SearchAgent] 开始搜索任务: " + query);
-        // 统一走 SubAgentManager 的搜索子智能体；未接线时回退到直接调用 SearchAgent
+        // 统一走 SubAgentManager 的搜索子智能体；未接线时回退到直接调用 SearchAgent。
+        // 两条路径都透传 ctx.usageSink —— 子智能体的 usage 也要进会话累计（按模型计费）。
         if (ctx.subAgentManager == null) {
-            SearchAgent.SearchResult direct = SearchAgent.search(query, project);
+            SearchAgent.SearchResult direct = SearchAgent.search(query, project, null, ctx.usageSink);
             System.out.println("[SearchAgent] 搜索完成, success=" + direct.success);
             return direct.toString();
         }
-        com.codepal.agent.subagent.AgentResult result = ctx.subAgentManager.search(query, null);
+        com.codepal.agent.subagent.AgentResult result = ctx.subAgentManager.search(query, null, ctx.usageSink);
         System.out.println("[SearchAgent] 搜索完成, success=" + result.isSuccess());
         return result.isSuccess() ? result.getContent() : "搜索失败：" + result.getErrorMessage();
     }
@@ -1192,12 +1205,9 @@ public class ToolExecutor {
     }
 
     /**
-     * 整文件写入工具（可写）—— 覆盖写入文件，Plan模式禁止，Craft模式直接写
+     * 整文件写入工具（可写）—— 覆盖写入文件
      */
     private static String execWriteFile(JsonObject params, Project project, boolean skipConfirmation) {
-        if (!skipConfirmation) {
-            return "错误：Plan 模式下不允许创建或修改文件。请切换到 Craft 模式后再试。";
-        }
         String filePath = getString(params, "file_path", "");
         String content = getString(params, "file_content", "");
 
@@ -1223,12 +1233,9 @@ public class ToolExecutor {
     }
 
     /**
-     * 编辑文件工具（可写）—— Plan 模式禁止；Craft 模式直接修改文件
+     * 编辑文件工具（可写）—— 通过确认卡流程后直接修改文件
      */
     private static String execEditFile(JsonObject params, Project project, boolean skipConfirmation) {
-        if (!skipConfirmation) {
-            return "错误：Plan 模式下不允许修改文件。请切换到 Craft 模式后再试。";
-        }
         String filePath = getString(params, "file_path", "");
 
         if (filePath.isBlank()) return "错误：请提供文件路径 (file_path)";
@@ -1277,12 +1284,9 @@ public class ToolExecutor {
     }
 
     /**
-     * 新建文件工具（可写）—— Plan 模式禁止；Craft 模式直接创建并打开
+     * 新建文件工具（可写）—— 直接创建并打开
      */
     private static String execCreateNewFile(JsonObject params, Project project, boolean skipConfirmation) {
-        if (!skipConfirmation) {
-            return "错误：Plan 模式下不允许创建文件。请切换到 Craft 模式后再试。";
-        }
         String filePath = getString(params, "file_path", "");
         String content = getString(params, "content", "");
         if (content.isEmpty()) {
@@ -1325,9 +1329,6 @@ public class ToolExecutor {
     }
 
     private static String execCreateDirectory(JsonObject params, Project project, boolean skipConfirmation) {
-        if (!skipConfirmation) {
-            return "错误：Plan 模式下不允许创建目录。请切换到 Craft 模式后再试。";
-        }
         String dirPath = getString(params, "dir_path", "");
         if (dirPath.isBlank()) return "错误：请提供目录路径 (dir_path)";
         if (project == null) return "错误：未打开项目";
@@ -1341,15 +1342,12 @@ public class ToolExecutor {
     }
 
     /**
-     * 删除文件工具（可写）—— Plan 模式禁止；Craft 模式删除前弹确认卡
+     * 删除文件工具（可写）—— 删除前弹确认卡
      *
-     * <p>删除属于不可逆操作，即便在 Craft 模式也走确认弹出（canTrust=false，不可"不再询问"），
+     * <p>删除属于不可逆操作，始终走确认弹出（canTrust=false，不可"不再询问"），
      * 复用与 run_command 相同的 ToolConfirmProvider 链路（内嵌 HTML 确认卡）。
      */
     private static String execDeleteFile(JsonObject params, Project project, boolean skipConfirmation, String toolCallId, ToolExecutionContext ctx) {
-        if (!skipConfirmation) {
-            return "错误：Plan 模式下不允许删除文件。请切换到 Craft 模式后再试。";
-        }
         String filePath = getString(params, "file_path", "");
         boolean recursive = getBool(params, "recursive", false);
 

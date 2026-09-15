@@ -173,6 +173,14 @@ public class SearchAgent {
      * @return 搜索结果
      */
     public static SearchResult search(String query, Project project, SearchProgressCallback callback) {
+        return search(query, project, callback, null);
+    }
+
+    /**
+     * @param usageSink 每轮请求的 usage 回收（参数=所用模型名），用于会话累计计费；可为 null
+     */
+    public static SearchResult search(String query, Project project, SearchProgressCallback callback,
+                                      java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) {
         if (query == null || query.isBlank()) {
             SearchResult err = SearchResult.error("搜索任务为空");
             if (callback != null) callback.onComplete(err);
@@ -210,6 +218,14 @@ public class SearchAgent {
                     public void onComplete() {
                         future.complete(new AgentStepResult(contentBuilder.toString(),
                                 reasoningBuilder.toString(), null));
+                    }
+
+                    @Override
+                    public void onUsage(com.codepal.model.ChatResponse.Usage usage) {
+                        // 每轮请求的 usage 回收 → 会话累计计费（子智能体使用当前聊天模型）
+                        if (usageSink != null && usage != null && model != null) {
+                            usageSink.accept(model.getName(), usage);
+                        }
                     }
 
                     @Override

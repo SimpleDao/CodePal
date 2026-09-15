@@ -581,12 +581,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         statusLabel = new JBLabel("就绪");
         inputField = new JTextArea(3, 0);
         agentCombo = new ComboBox<>(CPSettings.getInstance().getInstalledAgentNamesArray());
-        // ── 模式选择：仅保留 Craft 模式（Plan 选项已移除，但底层代码保留）──
+        // ── 模式选择：仅 Craft 模式 ──
         modeCombo = new ComboBox<>(new String[]{"Craft"});
         modeCombo.setSelectedItem("Craft");
 
         // ── 下拉框图标 + 自定义渲染器（图标+文字，参考现代 AI 聊天 UI）──
-        final Icon planIcon   = IconLoader.getIcon("/icons/combo_plan.svg", ChatPanel.class);
         final Icon craftIcon  = IconLoader.getIcon("/icons/combo_craft.svg", ChatPanel.class);
         final Icon modelIcon  = IconLoader.getIcon("/icons/combo_model.svg", ChatPanel.class);
         // ── 厂商图标：按模型 apiBase 域名/名称解析，同一厂商固定图标 ──
@@ -601,8 +600,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         final Icon editIcon   = IconLoader.getIcon("/icons/edit_model.svg", ChatPanel.class); // SVG 已固定 fill=#FFFFFF（暗色主题纯白）
         final Icon checkIcon  = IconLoader.getIcon("/icons/check_vision.svg", ChatPanel.class); // 绿色对号，与 editIcon 同源机制
 
-        // modeCombo 渲染器：Plan→眼睛图标, Craft→工具箱图标（和ModelComboRenderer结构一致）
-        modeCombo.setRenderer(new ModeComboRenderer(planIcon, craftIcon));
+        // modeCombo 渲染器：Craft→工具箱图标（和ModelComboRenderer结构一致）
+        modeCombo.setRenderer(new ModeComboRenderer(craftIcon));
 
         // 模型下拉框：底部"＋ 配置补全模型"和"＋ 配置自定义模型"选项
         // 使用自定义ModelComboBox，在setSelectedItem层面拦截添加项，防止其被选中
@@ -1744,7 +1743,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 }
                             }
                         ),
-                        limit   // 上下文窗口大小，用于按 token 预算决定保留多少最近消息
+                        limit,  // 上下文窗口大小，用于按 token 预算决定保留多少最近消息
+                        // 压缩模型的 usage 也计入会话累计（按压缩模型自己的单价计费）
+                        (m, u) -> com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater(
+                            () -> accumulateModelUsage(m, u))
                     );
                 } catch (Exception e) {
                     System.err.println("[Compress] 异常: " + e.getMessage());
@@ -1789,6 +1791,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     updateContextCircleFromHistory();  // 仅在成功时更新圆环
                     String msg = "对话已压缩：" + result.message
                         + "，节省约 " + result.getSavedCount() + " 条消息的上下文空间";
+                    // 展示本次压缩请求的真实消耗（压缩模型计入会话累计）
+                    com.codepal.model.ChatResponse.Usage cu = compressionManager.getLastUsage();
+                    if (cu != null) {
+                        String cmName = compressionManager.getLastUsageModelName();
+                        msg += "\n本次压缩消耗：tokens " + formatTokenCount(cu.getTotalTokens())
+                            + "｜费用 " + computeCostStr(cu.getPromptCacheHitTokens(), cu.getPromptCacheMissTokens(),
+                                    cu.getCompletionTokens(), cmName)
+                            + "（模型 " + (cmName != null ? cmName : "—") + "）";
+                    }
                     chatWebView.updateCompressCard(msg, true, false);
                     contextCircle.setToolTipText(result.message + " - 点击重新压缩");
                 } else {
@@ -2031,8 +2042,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         String titleSource = (text != null && !text.isBlank()) ? text : sendText;
         chatSessionManager.autoTitleFromUserMessage(titleSource);
         // 新消息开始时：不清除未处理的 pending 文件，仅重置收集标志让新一轮 edit_file 重新触发累积
-        planCollecting = false;
-        planFilesWithCards.removeIf(fp -> !planFileStates.containsKey(fp));
+        editsCollecting = false;
+        filesWithEditCards.removeIf(fp -> !fileEditStates.containsKey(fp));
         autoFixAttempts = 0;
         iterationGuard.resetRoundCounters();
         sendToApi();
@@ -2833,43 +2844,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 }
 
                                 // 第二遍：对每个唯一文件，处理 edit_file / write_file
-                                System.out.println("[DiffDebug] 第二遍处理前: hasEditFile=" + hasEditFile + " craftMode=" + craftMode + " editFileGroups=" + editFileGroups.keySet());
-                                if (hasEditFile && !craftMode) {
-                                    // ══ Plan 模式（只读）：拒绝所有 edit_file/write_file 调用 ══
-                                    for (Map.Entry<String, List<Integer>> entry : editFileGroups.entrySet()) {
-                                        String filePath = entry.getKey();
-                                        List<Integer> indices = entry.getValue();
-                                        String shortPath = filePath.contains("\\") ? filePath.substring(filePath.lastIndexOf('\\') + 1)
-                                                : filePath.contains("/") ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath;
-
-                                        String errMsg = "Plan 模式下不允许修改文件。请以 Markdown 代码块形式提供代码建议，或提示用户切换到 Craft 模式。";
-                                        final String planErrMsg = errMsg;
-                                        final String planShortPath = shortPath;
-                                        ApplicationManager.getApplication().invokeLater(() -> {
-                                            toolWebView.appendToolCard("编辑 " + planShortPath, "completed");
-                                        });
-                                        for (int tcIdx : indices) {
-                                            ChatMessage.ToolCall oc = finalToolCalls.get(tcIdx);
-                                            String toolName = oc.getFunction() != null ? oc.getFunction().getName() : "edit_file";
-                                            toolConvMgr.add(ChatMessage.toolResult(oc.getId(), toolName, errMsg));
-                                            String ocInput = oc.getFunction() != null ? oc.getFunction().getArguments() : "{}";
-                                            String ocPartId = finalPendingToolPartIds.get(tcIdx);
-                                            updateToolPartResult(ocPartId, toolName, ocInput, errMsg);
-                                        }
-                                    }
-                                // Plan 模式：拒绝后继续发送给 agent（让 agent 知道不能改文件，转而文字回复）
-                                ApplicationManager.getApplication().invokeLater(() -> {
-                                    if (!toolSrc.isCurrentGeneration(toolGen)) {
-                                        System.out.println("[ChatPanel] 工具轮次已失效（被停止/被新消息打断），放弃 Plan 模式重发");
-                                        return;
-                                    }
-                                    sendToApi();
-                                });
-                            } else if (hasEditFile && craftMode) {
+                                System.out.println("[DiffDebug] 第二遍处理前: hasEditFile=" + hasEditFile + " editFileGroups=" + editFileGroups.keySet());
+                                if (hasEditFile) {
                                     System.out.println("[DiffDebug] ========================================");
                                     System.out.println("[DiffDebug] 进入 Craft 模式文件处理，editFileGroups.size=" + editFileGroups.size());
                                     // ══ Craft 模式：全部走 ToolExecutor，ChatPanel 不再解析 file_content/edits ══
-                                    planCollecting = true;
+                                    editsCollecting = true;
                                     try {
                                         for (Map.Entry<String, List<Integer>> entry : editFileGroups.entrySet()) {
                                             String filePath = entry.getKey();
@@ -2886,10 +2866,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                             boolean fileExistedBefore = ioFile.exists();
                                             System.out.println("[DiffDebug] 文件路径(绝对): " + ioFile.getAbsolutePath() + " 执行前存在:" + fileExistedBefore);
 
-                                            PlanFileState state = planFileStates.get(filePath);
+                                            FileEditState state = fileEditStates.get(filePath);
                                             boolean firstTime = (state == null);
                                             if (state == null) {
-                                                state = new PlanFileState();
+                                                state = new FileEditState();
                                                 state.filePath = filePath;
                                                 state.editCount = 0;
                                                 state.isNewFile = !fileExistedBefore;
@@ -2937,7 +2917,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                                 // 调用 ToolExecutor（内部有 JSON sanitize，不会崩）
                                                 String execResult;
                                                 try {
-                                                    execResult = com.codepal.tools.ToolExecutor.execute(tc, project, craftMode, toolConfirmManager);
+                                                    // 子智能体（search_agent 等）的 usage 归属当前聊天模型 → 会话累计（按模型计费）
+                                                    final String roundModel = selectedModelName();
+                                                    java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink =
+                                                            (m, u) -> com.intellij.openapi.application.ApplicationManager.getApplication()
+                                                                    .invokeLater(() -> accumulateModelUsage(m != null ? m : roundModel, u));
+                                                    execResult = com.codepal.tools.ToolExecutor.execute(tc, project, craftMode, toolConfirmManager, usageSink);
                                                     System.out.println("[DiffDebug] ToolExecutor返回: " + (execResult != null ? execResult.substring(0, Math.min(100, execResult.length())) : "null"));
                                                 } catch (Exception toolEx) {
                                                     System.err.println("[DiffDebug] ToolExecutor执行异常: " + toolEx.getMessage());
@@ -3049,16 +3034,16 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                                 }
                                             }
                                             state.proposedContent = afterContent;
-                                            planFileStates.put(filePath, state);
-                                            planFilesWithCards.add(filePath);
-                                            System.out.println("[DiffDebug] 文件" + filePath + "已添加到planFileStates，当前总数=" + planFileStates.size());
+                                            fileEditStates.put(filePath, state);
+                                            filesWithEditCards.add(filePath);
+                                            System.out.println("[DiffDebug] 文件" + filePath + "已添加到fileEditStates，当前总数=" + fileEditStates.size());
                                         }
                                     } catch (Exception craftEx) {
                                         System.err.println("[DiffDebug] !!! Craft模式文件处理异常: " + craftEx.getMessage());
                                         craftEx.printStackTrace();
                                     }
 
-                                    System.out.println("[DiffDebug] 准备调用showAccumulatedDiffPanel，planFileStates.size=" + planFileStates.size());
+                                    System.out.println("[DiffDebug] 准备调用showAccumulatedDiffPanel，fileEditStates.size=" + fileEditStates.size());
                                     // 每轮文件编辑完成后立即刷新 Diff 面板，不等模型完全结束
                                     showAccumulatedDiffPanel();
 
@@ -3078,7 +3063,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             // 重置（不建气泡，让后续 reasoning/content 自动建）
                             toolSrc.resetStream();
 
-                            // Plan（拒写）/ Craft（已写盘）已在分支内调用 sendToApi()；仅非文件编辑工具在此继续
+                            // Craft（已写盘）已在分支内调用 sendToApi()；仅非文件编辑工具在此继续
                             if (!hasEditFile) {
                                 ApplicationManager.getApplication().invokeLater(() -> {
                                     if (!toolSrc.isCurrentGeneration(toolGen)) {
@@ -3145,8 +3130,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             refreshTokenStatsDisplay();
 
                             // Craft 模式：agent 已完成所有工作（无 tool_calls 的最终回复），展示累积的所有 diff
-                            if (planCollecting && !planFileStates.isEmpty()) {
-                                planCollecting = false;
+                            if (editsCollecting && !fileEditStates.isEmpty()) {
+                                editsCollecting = false;
                                 showAccumulatedDiffPanel();
                             }
                             // 流结束：执行被延迟的会话切换（用户在本轮流进行中点了其它会话标签）
@@ -3856,17 +3841,17 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // 文件修改列表面板（Plan 模式）— 类似 CodeBuddy 的文件修改展示区
+    // 文件修改列表面板 — 类似 CodeBuddy 的文件修改展示区
     // ═══════════════════════════════════════════════════════════════════════
 
-    // ── Plan 模式跨轮次累积状态 ──
-    /** Plan 模式正在累积修改中（agent 尚未完成所有工具调用） */
-    private boolean planCollecting = false;
+    // ── 跨轮次累积状态 ──
+    /** 正在累积修改中（agent 尚未完成所有工具调用） */
+    private boolean editsCollecting = false;
     /** Todo 完成清单是否已追加到消息末尾（避免重复追加） */
     private boolean todoCompletionSummaryAppended = false;
 
-    /** 单个文件在 Plan 模式下的累积状态 */
-    private static class PlanFileState {
+    /** 单个文件的累积修改状态 */
+    private static class FileEditState {
         String filePath;
         String originalContent;
         String proposedContent;
@@ -3875,11 +3860,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         final List<String> toolCallIds = new ArrayList<>();
     }
 
-    /** 按文件路径保存累积的 Plan 状态（有序，保持文件出现顺序） */
-    private final LinkedHashMap<String, PlanFileState> planFileStates = new LinkedHashMap<>();
+    /** 按文件路径保存累积的修改状态（有序，保持文件出现顺序） */
+    private final LinkedHashMap<String, FileEditState> fileEditStates = new LinkedHashMap<>();
 
     /** 已在 UI 中添加了 pending 工具卡片的文件集合（避免重复卡片） */
-    private final Set<String> planFilesWithCards = new HashSet<>();
+    private final Set<String> filesWithEditCards = new HashSet<>();
 
     // ── Error-Agent 自动修复保护 ──
     /** 自动修复最大重试次数 */
@@ -3888,17 +3873,17 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     private int autoFixAttempts = 0;
 
     /**
-     * 展示/更新 Plan 模式跨轮次累积的文件修改列表面板。
+     * 展示/更新跨轮次累积的文件修改列表面板。
      * 追加新文件/更新已有文件而非重建。已保留/已撤销的文件记录保留在列表中；
      * 若同一文件被再次修改，会重新标记为待处理状态。
      */
     private void showAccumulatedDiffPanel() {
-        System.out.println("[DiffDebug] showAccumulatedDiffPanel called, planFileStates.size=" + planFileStates.size());
-        if (planFileStates.isEmpty()) return;
+        System.out.println("[DiffDebug] showAccumulatedDiffPanel called, fileEditStates.size=" + fileEditStates.size());
+        if (fileEditStates.isEmpty()) return;
 
         ApplicationManager.getApplication().invokeLater(() -> {
-            System.out.println("[DiffDebug] EDT: upserting " + planFileStates.size() + " changes");
-            for (PlanFileState state : planFileStates.values()) {
+            System.out.println("[DiffDebug] EDT: upserting " + fileEditStates.size() + " changes");
+            for (FileEditState state : fileEditStates.values()) {
                 System.out.println("[DiffDebug] upsertChange: " + state.filePath + " originalLen=" + 
                     (state.originalContent != null ? state.originalContent.length() : -1) + 
                     " proposedLen=" + (state.proposedContent != null ? state.proposedContent.length() : -1) +
@@ -3945,12 +3930,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /**
      * 单个文件被用户保留：文件已写入磁盘，保留记录在变更列表中（显示"已保留"状态）。
-     * 不从planFileStates移除，以便用户始终能看到所有变更历史。
+     * 不从fileEditStates移除，以便用户始终能看到所有变更历史。
      */
     private void handleFileAccepted(String filePath, String newContent) {
         ThreadHelper.runOnUi(project, () -> {
-            // 保留文件在planFileStates中（标记为已处理即可，不用移除）
-            planFilesWithCards.remove(filePath);
+            // 保留文件在fileEditStates中（标记为已处理即可，不用移除）
+            filesWithEditCards.remove(filePath);
         });
     }
 
@@ -3958,12 +3943,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      * 单个文件被用户撤销：恢复磁盘上的文件到原始状态。
      * - 如果是新建文件：删除它
      * - 如果是已有文件：恢复 originalContent
-     * 保留记录在变更列表中（显示"已撤销"状态），不从planFileStates移除。
+     * 保留记录在变更列表中（显示"已撤销"状态），不从fileEditStates移除。
      */
     private void handleFileRejected(String filePath) {
         ThreadHelper.runOnUi(project, () -> {
-            PlanFileState state = planFileStates.get(filePath);
-            planFilesWithCards.remove(filePath);
+            FileEditState state = fileEditStates.get(filePath);
+            filesWithEditCards.remove(filePath);
 
             String shortPath = filePath.contains("\\") ? filePath.substring(filePath.lastIndexOf('\\') + 1)
                     : filePath.contains("/") ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath;
@@ -3978,25 +3963,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     FileOperationService.writeFile(filePath, state.originalContent, project);
                 }
             } catch (Exception ex) {
-                System.err.println("[Plan] 撤销修改失败: " + filePath + " - " + ex.getMessage());
+                System.err.println("[FileEdit] 撤销修改失败: " + filePath + " - " + ex.getMessage());
             }
         });
     }
 
     /**
      * 用户手动从变更列表中移除一个文件记录（点击X按钮）。
-     * 这才真正从planFileStates中移除。
+     * 这才真正从fileEditStates中移除。
      */
     private void handleFileRemoved(String filePath) {
         ThreadHelper.runOnUi(project, () -> {
-            planFileStates.remove(filePath);
-            planFilesWithCards.remove(filePath);
+            fileEditStates.remove(filePath);
+            filesWithEditCards.remove(filePath);
         });
     }
 
     /**
      * 所有待处理文件都已处理完毕（全部保留或撤销）：刷新 VFS。
-     * 注意：不清空 planFileStates，保留所有变更记录供用户查看。
+     * 注意：不清空 fileEditStates，保留所有变更记录供用户查看。
      */
     private void handleAllChangesResolved() {
         ThreadHelper.runOnUi(project, () -> {
@@ -4005,16 +3990,16 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 com.intellij.openapi.vfs.newvfs.RefreshQueue.getInstance()
                         .refresh(true, true, null, baseDir);
             }
-            planFilesWithCards.clear();
-            planCollecting = false;
+            filesWithEditCards.clear();
+            editsCollecting = false;
         });
     }
 
-    /** 强制清除 Plan 状态（用于切换会话、新建会话等场景） */
-    private void resetPlanState() {
-        planFileStates.clear();
-        planFilesWithCards.clear();
-        planCollecting = false;
+    /** 强制清除文件修改累积状态（用于切换会话、新建会话等场景） */
+    private void resetFileEditState() {
+        fileEditStates.clear();
+        filesWithEditCards.clear();
+        editsCollecting = false;
         autoFixAttempts = 0;
         todoCompletionSummaryAppended = false;
         todoManager.clearUiOnly(); // 只清 UI，不落库（避免误删旧会话待办；新会话由 bindSession 回填）
@@ -4091,16 +4076,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (usage == null) return;
 
         // 费用统计：按模型分桶累计（usage 紧随请求到达，请求所用模型即当前选中模型）
-        String usedModel = selectedModelName();
-        if (usedModel != null) {
-            sessionModelUsage.computeIfAbsent(usedModel, k -> new com.codepal.model.ModelTokenUsage()).add(usage);
-            // 落库：会话×模型 原子增量（切会话/重启后由 onActivateSession 回填）
-            String sid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
-            if (sid != null) {
-                ThreadHelper.executeAsync(project, () ->
-                        com.codepal.db.DBSessionUsageRepository.incrementUsage(sid, usedModel, usage), null);
-            }
-        }
+        accumulateModelUsage(selectedModelName(), usage);
 
         // 上下文快照：只取最近一次请求的值（用于圆环，不能累加）
         lastPromptTokens     = usage.getPromptTokens();
@@ -4111,6 +4087,21 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
         // 根据累计 token 与当前模型单价刷新 tooltip / 底部统计
         refreshTokenStatsDisplay();
+    }
+
+    /**
+     * 把一次 usage 按「会话×模型」累计：内存分桶 + DB 原子增量（会话累计口径，不含 last* 快照）。
+     * 主聊天链路与旁路链路（子智能体/压缩）统一走这里 —— 会话累计因此包含全部真实消耗。
+     */
+    private void accumulateModelUsage(String usedModel, com.codepal.model.ChatResponse.Usage usage) {
+        if (usedModel == null || usage == null) return;
+        sessionModelUsage.computeIfAbsent(usedModel, k -> new com.codepal.model.ModelTokenUsage()).add(usage);
+        // 落库：会话×模型 原子增量（切会话/重启后由 onActivateSession 回填）
+        String sid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+        if (sid != null) {
+            ThreadHelper.executeAsync(project, () ->
+                    com.codepal.db.DBSessionUsageRepository.incrementUsage(sid, usedModel, usage), null);
+        }
     }
 
     /**
@@ -5950,8 +5941,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 清空todo管理器状态：只清 UI/内存，不落库。
         todoManager.clearUiOnly();
         // 清空文件变更内存状态
-        planFileStates.clear();
-        planFilesWithCards.clear();
+        fileEditStates.clear();
+        filesWithEditCards.clear();
         // 重置完成标志
         todoCompletionSummaryAppended = false;
         // 清空TaskDiffTabPanel（任务+文件变更UI）并隐藏
@@ -7033,16 +7024,14 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // ── 模式下拉框渲染器（仅 Craft）—— 完全自绘，避免嵌套 JPanel/JLabel 布局问题 ──
 
     private static class ModeComboRenderer extends JComponent implements ListCellRenderer<String> {
-        private final Icon planIcon, craftIcon;
+        private final Icon craftIcon;
         private boolean isSelectedItem = false;
         private int currentRow = -1;
         private String text = "";
-        private boolean isCraft = false;
         private boolean rowHover = false;
         private boolean renderingAsList = false;
 
-        ModeComboRenderer(Icon planIcon, Icon craftIcon) {
-            this.planIcon = planIcon;
+        ModeComboRenderer(Icon craftIcon) {
             this.craftIcon = craftIcon;
             setOpaque(false);
             setBorder(null);
@@ -7074,7 +7063,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 int iconY = (h - iconSize) / 2;
                 int iconX = px; // 与 ModelComboRenderer 对齐：iconX = px（不再叠加 innerX）
                 // 去掉图标阴影框：直接绘制图标
-                Icon ic = isCraft ? craftIcon : planIcon;
+                Icon ic = craftIcon;
                 int icX = iconX + (iconSize - ic.getIconWidth()) / 2;
                 int icY = iconY + (iconSize - ic.getIconHeight()) / 2;
                 ic.paintIcon(this, g2, icX, icY);
@@ -7096,7 +7085,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 int iconY = (h - iconSize) / 2;
                 int iconX = 8;
                 // 去掉图标阴影框：直接绘制图标
-                Icon ic = isCraft ? craftIcon : planIcon;
+                Icon ic = craftIcon;
                 int icX = iconX + (iconSize - ic.getIconWidth()) / 2;
                 int icY = iconY + (iconSize - ic.getIconHeight()) / 2;
                 ic.paintIcon(this, g2, icX, icY);
@@ -7130,7 +7119,6 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         public Component getListCellRendererComponent(JList<? extends String> list, String value,
                 int index, boolean isSelected, boolean cellHasFocus) {
             this.text = value == null ? "" : value;
-            this.isCraft = "Craft".equals(value);
             this.isSelectedItem = isSelected;
             this.currentRow = index;
             // 列表态判断必须用 index>=0，不能用 list!=null：

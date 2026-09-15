@@ -102,11 +102,19 @@ public class SubAgentManager {
      * 执行搜索任务的快捷方法
      */
     public AgentResult search(String query, SubAgent.ProgressCallback callback) {
+        return search(query, callback, null);
+    }
+
+    /**
+     * @param usageSink 每次请求的 usage 回收（参数=所用模型名），用于会话累计计费；可为 null
+     */
+    public AgentResult search(String query, SubAgent.ProgressCallback callback,
+                              java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) {
         SearchSubAgent agent = getSearchAgent();
         if (agent == null) {
             return AgentResult.error("搜索智能体未初始化");
         }
-        return agent.execute(query, callback);
+        return agent.execute(query, callback, usageSink);
     }
 
     /**

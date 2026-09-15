@@ -21,7 +21,7 @@ import java.util.function.Consumer;
 
 public class FileDiffInEditor {
 
-    // ========== 旧版：模态弹窗（Plan 模式等旧调用方） ==========
+    // ========== 旧版：模态弹窗（旧调用方） ==========
 
     public static void showDiff(@NotNull Project project,
                                 @NotNull VirtualFile file,

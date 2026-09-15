@@ -49,6 +49,12 @@ public class SearchSubAgent extends SubAgent<String, AgentResult> {
 
     @Override
     public AgentResult execute(String query, ProgressCallback callback) {
+        return execute(query, callback, null);
+    }
+
+    /** @param usageSink 每次请求的 usage 回收（参数=所用模型名），用于会话累计计费；可为 null */
+    public AgentResult execute(String query, ProgressCallback callback,
+                               java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) {
         if (query == null || query.isBlank()) {
             return AgentResult.error("搜索任务为空");
         }

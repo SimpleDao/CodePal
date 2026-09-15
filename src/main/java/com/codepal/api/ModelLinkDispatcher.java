@@ -29,6 +29,11 @@ public final class ModelLinkDispatcher {
         void onToolCalls(List<ChatMessage.ToolCall> calls);
         void onComplete();
         void onError(Throwable t);
+        /**
+         * usage 到达。子智能体（SearchAgent）/ 压缩（CompressionManager）等旁路链路的
+         * 消耗统计入口；默认空实现保持既有调用方兼容（旁路 usage 此前在此被静默丢弃）。
+         */
+        default void onUsage(ChatResponse.Usage usage) { }
     }
 
     private ModelLinkDispatcher() {}
@@ -54,7 +59,7 @@ public final class ModelLinkDispatcher {
                 @Override
                 public void onComplete() { relay.onComplete(); }
                 @Override
-                public void onUsage(ChatResponse.Usage usage) { }
+                public void onUsage(ChatResponse.Usage usage) { relay.onUsage(usage); }
                 @Override
                 public void onError(Throwable t) { relay.onError(t); }
             });
@@ -69,6 +74,8 @@ public final class ModelLinkDispatcher {
                 public void onToolCalls(List<ChatMessage.ToolCall> calls) { relay.onToolCalls(calls); }
                 @Override
                 public void onComplete() { relay.onComplete(); }
+                @Override
+                public void onUsage(ChatResponse.Usage usage) { relay.onUsage(usage); }
                 @Override
                 public void onError(Throwable t) { relay.onError(t); }
             });

@@ -259,8 +259,8 @@ public class AcpConnection {
         approvalCaps.addProperty("autoApprove", false);
         clientCapabilities.add("approvalCapabilities", approvalCaps);
         params.add("clientCapabilities", clientCapabilities);
-        // Plan 模式：只读规划 / Craft 模式：可编辑但需确认
-        params.addProperty("clientMode", craftMode ? "acceptEdits" : "plan");
+        // 客户端模式：固定 acceptEdits（插件仅保留 Craft 模式：可编辑，工具按权限策略确认）
+        params.addProperty("clientMode", "acceptEdits");
 
         JsonObject clientInfo = new JsonObject();
         clientInfo.addProperty("name", "CP-CC");

@@ -781,34 +781,21 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
     }
 
     /**
-     * 构建包含项目上下文 + 当前模式的 System Prompt
-     * Plan 模式：只读，禁止修改文件
-     * Craft 模式：可修改文件，累积后统一展示 Diff 供用户确认
+     * 构建包含项目上下文 + 当前模式的 System Prompt。
+     * 插件仅保留 Craft 模式：可修改文件，累积后统一展示 Diff 供用户确认。
      */
     public String getSystemPrompt(Project project, boolean isCraftMode) {
         StringBuilder sb = new StringBuilder(getSystemPrompt(project));
 
         sb.append("\n---\n【当前模式】");
-        if (isCraftMode) {
-            sb.append(" ✨ Craft 模式\n");
-            sb.append("- 你可以使用 edit_file 精确修改现有文件，用 write_file 覆盖写入文件（适合大改动），用 create_new_file 创建新文件。\n");
-            sb.append("- 验证「你修改过的文件」能否编译通过，优先使用 compile_files 工具：它调用 IDEA 增量编译器，只编译你指定的文件（及其必需依赖），不受项目其他位置的预存错误干扰，能精确反映你改动的文件本身的编译状态。\n");
-            sb.append("- 只有在需要跑全量构建、运行测试套件（mvn test / gradle test）或对未纳入源码根的脚本做编译时，才用 run_command 执行命令。\n");
-            sb.append("- run_command 分级执行：只读查询静默执行，构建/测试类命令在IDEA控制台显示输出，高风险命令需用户确认。\n");
-            sb.append("- 所有文件修改会先累积，待你完成所有任务、回复最终文字后，统一在 Diff 面板中展示给用户确认。\n");
-            sb.append("- 用户确认后所有修改一次性应用，拒绝则全部撤销。\n");
-            sb.append("- 修改过程中无需等待用户确认，请连续完成所有编辑任务，修改后运行编译验证。\n");
-        } else {
-            sb.append(" 📋 Plan 模式（只读）\n");
-            sb.append("- 你只能阅读和分析代码，**绝对不能**调用 edit_file、write_file 或 create_new_file 修改文件。\n");
-            sb.append("- run_command 命令权限：\n");
-            sb.append("  - ✅ 允许：只读查询类命令（ls、cat、grep、git status、git log、git diff、查看版本号等）—— 静默快速执行\n");
-            sb.append("  - ⚠️ 允许但用户可见：构建/测试类命令（mvn compile、npm install、gradle test等）—— 在IDEA控制台执行，用户全程可见输出\n");
-            sb.append("  - 💡 若只想确认某个文件能否编译通过（而非全量构建），优先用 compile_files 工具（增量编译、不受项目其他错误干扰）。\n");
-            sb.append("  - ❌ 禁止：高风险命令（rm -rf、git push、git reset --hard、sudo、重定向写文件等）—— 会被拦截或需用户确认\n");
-            sb.append("- 如果用户要求修改代码，请以 Markdown 代码块的形式提供代码建议。\n");
-            sb.append("- 如果用户坚持要你直接修改文件，请提示用户切换到 Craft 模式。\n");
-        }
+        sb.append(" ✨ Craft 模式\n");
+        sb.append("- 你可以使用 edit_file 精确修改现有文件，用 write_file 覆盖写入文件（适合大改动），用 create_new_file 创建新文件。\n");
+        sb.append("- 验证「你修改过的文件」能否编译通过，优先使用 compile_files 工具：它调用 IDEA 增量编译器，只编译你指定的文件（及其必需依赖），不受项目其他位置的预存错误干扰，能精确反映你改动的文件本身的编译状态。\n");
+        sb.append("- 只有在需要跑全量构建、运行测试套件（mvn test / gradle test）或对未纳入源码根的脚本做编译时，才用 run_command 执行命令。\n");
+        sb.append("- run_command 分级执行：只读查询静默执行，构建/测试类命令在IDEA控制台显示输出，高风险命令需用户确认。\n");
+        sb.append("- 所有文件修改会先累积，待你完成所有任务、回复最终文字后，统一在 Diff 面板中展示给用户确认。\n");
+        sb.append("- 用户确认后所有修改一次性应用，拒绝则全部撤销。\n");
+        sb.append("- 修改过程中无需等待用户确认，请连续完成所有编辑任务，修改后运行编译验证。\n");
 
         // 注入已勾选启用的技能正文（勾选=模型可见；取消勾选=不可见且 load_skill 报找不到）
         appendEnabledSkills(sb);
