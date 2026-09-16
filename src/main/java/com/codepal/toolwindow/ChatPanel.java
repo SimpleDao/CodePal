@@ -993,6 +993,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             lastCompletionTokens = 0;
             lastCacheHitTokens   = 0;
             lastCacheMissTokens  = 0;
+            // 清空会话：上下文已清 → 真实快照一并失效删除（避免下次进入残留旧值）
+            {
+                String clearedSid = chatSessionManager != null
+                        ? chatSessionManager.getCurrentSessionId() : null;
+                if (clearedSid != null) {
+                    ThreadHelper.executeAsync(project, () ->
+                            com.codepal.db.DBSessionUsageRepository.deleteContextSnapshot(clearedSid), null);
+                }
+            }
             if (tokenStatsLabel != null) {
                 tokenStatsLabel.setToolTipText("暂无统计数据");
                 tokenStatsLabel.putClientProperty("detail_text", null);
@@ -1788,6 +1797,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             com.codepal.compression.CompressionPrompts.MEMORY_SUMMARY_PREFIX + result.summaryText,
                             result.compressedMessageCount);
                     }
+                    // ★ 压缩后上下文已被裁剪：真实快照失效——清零 last* 并删快照行，
+                    //   圆环回退估算（基于压缩后保留的消息），下一轮 usage 到达后重新精确
+                    lastPromptTokens     = 0;
+                    lastCompletionTokens = 0;
+                    lastCacheHitTokens   = 0;
+                    lastCacheMissTokens  = 0;
+                    final String compressedSid = chatSessionManager != null
+                            ? chatSessionManager.getCurrentSessionId() : null;
+                    if (compressedSid != null) {
+                        ThreadHelper.executeAsync(project, () ->
+                                com.codepal.db.DBSessionUsageRepository.deleteContextSnapshot(compressedSid), null);
+                    }
                     updateContextCircleFromHistory();  // 仅在成功时更新圆环
                     String msg = "对话已压缩：" + result.message
                         + "，节省约 " + result.getSavedCount() + " 条消息的上下文空间";
@@ -1835,8 +1856,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /**
      * 压缩成功 / 会话加载后刷新圆环。
-     * 此时真实 usage 累计已失效（历史被裁剪/尚未累积），统一用 estimateSessionTokens() 兜底估算，
-     * 与 onComplete 兜底刷新保持同一口径（~1.6 字符/token）。
+     * 此时真实 usage 快照已失效（历史被裁剪/尚未累积），统一用 estimateSessionTokens() 兜底估算，
+     * 与 onComplete 兜底刷新保持同一口径（TokenEstimator，系数对齐 DeepSeek 官方换算）。
      */
     private void updateContextCircleFromHistory() {
         if (contextCircle == null) return;
@@ -3217,6 +3238,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
         java.util.List<com.codepal.model.MessagePartEntity> parts = new java.util.ArrayList<>();
         parts.add(com.codepal.model.MessagePartEntity.text(msgId, sessionId, reasoningText, 0));
+        // ★ token_usage 随 INSERT 写入（与 persistPartialAssistant 同一修法，消灭异步 UPDATE 竞态）
+        if (usageReceivedThisRound) {
+            String tokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
+            if (tokenJson != null) entity.setTokenUsage(tokenJson);
+        }
         chatSessionManager.persistMessageWithParts(entity, parts);
 
         webView.promoteReasoningToAnswer(MarkdownUtil.toHtmlFragment(reasoningText), reasoningText);
@@ -3224,11 +3250,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     /**
-     * 统一收尾：本轮 usage 已到达时，把「本次回答 token 消耗」挂到助手消息底部并原样落库
-     * （messages.token_usage 单列 UPDATE，不触碰其它字段；重启回放按此复现）。
-     * usageReceivedThisRound 守卫：流中途出错/被掐断时 usage 未到达，lastPromptTokens 还是
-     * 上一轮旧值——此时不挂 chip（宁缺勿错）。调用须在 clearStreamRefs 之前（JS 端
-     * attachTokenInfo 依赖 lcStreamingMsgId 仍指向该助手消息）。
+     * 统一收尾：本轮 usage 已到达时，把「本次回答 token 消耗」挂到助手消息底部。
+     * 落库不再走这里——token_usage 已由 persistPartialAssistant / promoteReasoningAsAnswer
+     * 在 INSERT 事务内一次写入（旧实现的异步单列 UPDATE 与消息 INSERT 存在 pooled 线程
+     * 顺序竞态：UPDATE 先执行 → 0 行命中 → token_usage 永远 NULL，重启后 chip 消失）。
+     * usageReceivedThisRound 守卫保留：流中途出错/被掐断时 usage 未到达，不挂上一轮旧值（宁缺勿错）。
+     * 调用须在 clearStreamRefs 之前（JS 端 attachTokenInfo 依赖 lcStreamingMsgId 仍指向该助手消息）。
      */
     private void attachAndPersistTokenInfo(String msgId, ChatWebView webView) {
         if (msgId == null) {
@@ -3246,8 +3273,6 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
         System.out.println("[TokenChip] 已挂载 msgId=" + msgId);
         webView.attachTokenInfo(answerTokenJson);
-        ThreadHelper.executeAsync(project, () -> com.codepal.db.DBChatHistoryRepository
-                .updateTokenUsage(msgId, answerTokenJson), null);
     }
 
     /**
@@ -4078,6 +4103,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 费用统计：按模型分桶累计（usage 紧随请求到达，请求所用模型即当前选中模型）
         accumulateModelUsage(selectedModelName(), usage);
 
+        // ★ 真实上下文快照落库（覆盖式 upsert）：切换会话/重启回显时回填 last*，
+        //   圆环因此保持精确值而非估算。仅主聊天链路写快照——旁路 usage（子智能体/压缩）
+        //   走 accumulateModelUsage 但不代表当前对话上下文，不得污染快照。
+        String snapSid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+        if (snapSid != null) {
+            ThreadHelper.executeAsync(project, () ->
+                    com.codepal.db.DBSessionUsageRepository.saveContextSnapshot(snapSid, usage), null);
+        }
+
         // 上下文快照：只取最近一次请求的值（用于圆环，不能累加）
         lastPromptTokens     = usage.getPromptTokens();
         lastCompletionTokens = usage.getCompletionTokens();
@@ -4244,6 +4278,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             finalParts.add(com.codepal.model.MessagePartEntity.text(
                     finalMsgId, sessionId,
                     src.getCurrentAiRawText(), finalPartSeq++));
+        }
+        // ★ token_usage 随 INSERT 事务一次写入（根因修复）：
+        //   旧实现消息 INSERT 与 updateTokenUsage 是两个独立的 pooled 线程任务，无顺序保证——
+        //   UPDATE 先执行时该行尚不存在 → 0 行命中 → token_usage 永远 NULL
+        //   （实时 chip 同步挂载正常、重启回放消失的根因）。
+        //   usage 已在解析线程同步置位（usageReceivedThisRound），此处读 last* 快照安全。
+        if (usageReceivedThisRound) {
+            String tokenJson = buildAnswerTokenJson(lastPromptTokens, lastCompletionTokens);
+            if (tokenJson != null) finalMsgEntity.setTokenUsage(tokenJson);
         }
         chatSessionManager.persistMessageWithParts(finalMsgEntity, finalParts);
         return finalMsgId;
@@ -5829,10 +5872,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (session == null) return;
         boolean deleted = chatSessionManager.deleteSession(session);
         if (deleted) {
-            // 会话已删除：其按模型分组的累计用量一并清理
+            // 会话已删除：其按模型分组的累计用量与上下文快照一并清理
             if (session.getId() != null) {
-                ThreadHelper.executeAsync(project, () ->
-                        com.codepal.db.DBSessionUsageRepository.deleteUsage(session.getId()), null);
+                ThreadHelper.executeAsync(project, () -> {
+                    com.codepal.db.DBSessionUsageRepository.deleteUsage(session.getId());
+                    com.codepal.db.DBSessionUsageRepository.deleteContextSnapshot(session.getId());
+                }, null);
             }
             refreshHistoryList();
         }
@@ -6035,7 +6080,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     }
 
     /**
-     * 从 DB 回填当前会话按模型分组的累计用量（session_model_usage），并刷新展示。
+     * 从 DB 回填当前会话的用量状态并刷新展示：
+     * ① 按模型分组的会话累计（session_model_usage）→ sessionModelUsage；
+     * ② 「当前上下文」真实快照（session_context_snapshot）→ last* 四快照，
+     *    圆环跨重启/切会话保持精确值；无快照（老会话/新会话）则保持 0 → 回退估算。
      * onActivateSession（会话激活）与 onHistoryLoaded（历史加载完成，覆盖启动时序）都会调用。
      */
     private void reloadSessionModelUsage() {
@@ -6043,12 +6091,23 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         ThreadHelper.executeAsync(project, () -> {
             java.util.LinkedHashMap<String, com.codepal.model.ModelTokenUsage> loaded =
                     com.codepal.db.DBSessionUsageRepository.loadUsage(sid);
+            com.codepal.model.ChatResponse.Usage snap =
+                    com.codepal.db.DBSessionUsageRepository.loadContextSnapshot(sid);
             System.out.println("[UsageStats] 回填会话累计 sid=" + sid
                     + ", 模型数=" + (loaded != null ? loaded.size() : 0)
-                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : ""));
+                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : "")
+                    + ", 上下文快照=" + (snap != null
+                        ? snap.getPromptTokens() + "+" + snap.getCompletionTokens() : "无(估算)"));
             ApplicationManager.getApplication().invokeLater(() -> {
                 sessionModelUsage.clear();
                 if (loaded != null) sessionModelUsage.putAll(loaded);
+                // 回填真实上下文快照（无则保持 0 → usedContextTokens 回退估算）
+                if (snap != null) {
+                    lastPromptTokens     = snap.getPromptTokens();
+                    lastCompletionTokens = snap.getCompletionTokens();
+                    lastCacheHitTokens   = snap.getPromptCacheHitTokens();
+                    lastCacheMissTokens  = snap.getPromptCacheMissTokens();
+                }
                 refreshTokenStatsDisplay();
             });
         }, null);
@@ -6136,6 +6195,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // JS 端复用 mkFrame/appendReasoning/startAiStream/finalizeAiMessage/insertToolCard，
             // 与聊天同一套 DOM/样式，彻底消除历史/实时两套渲染漂移。整条仅 1 次 CEF 调用。
             String recordJson = buildReplayRecordJson(rec, parts);
+            boolean hasTokenInfo = recordJson != null && recordJson.contains("tokenInfo");
+            System.out.println("[ChipReplay] msg=" + rec.getId()
+                    + " tokenUsageLen=" + (rec.getTokenUsage() != null ? rec.getTokenUsage().length() : -1)
+                    + " record含tokenInfo=" + hasTokenInfo
+                    + " recordJsonLen=" + (recordJson != null ? recordJson.length() : -1));
             if (recordJson != null && !recordJson.isEmpty()) {
                 chatWebView.replayHistory(recordJson);
             }

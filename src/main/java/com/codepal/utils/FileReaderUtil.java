@@ -284,7 +284,12 @@ public class FileReaderUtil {
         }
 
         if (byFile.isEmpty()) {
-            return "🔍 目录搜索：\"" + keyword + "\"\n\n未找到匹配结果" + (rootPath != null ? "（范围：" + rootPath + "）" : "");
+            // 精简引导，与 searchGrep 口径一致
+            return "🔍 目录搜索：\"" + keyword + "\"\n\n未找到匹配结果"
+                    + (rootPath != null ? "（范围：" + rootPath + "）" : "") + "。提示：\n"
+                    + "1. 改用更宽泛的核心词，或核对写法惯例；\n"
+                    + "2. 可加 file_pattern 限定文件类型；\n"
+                    + "3. 关键词可能真的不存在——若在验证某个假设，请直接告知用户，勿继续换词重试。\n";
         }
         StringBuilder sb = new StringBuilder();
         sb.append("🔍 目录搜索：\"").append(keyword).append("\"")
@@ -982,22 +987,51 @@ public class FileReaderUtil {
         //   改用 synchronizedList，并用同步块保证「检查-添加」原子性；攒够后返回 false 让搜索提前停止。
         final java.util.List<com.intellij.usageView.UsageInfo> usages =
                 java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-        com.intellij.find.impl.FindInProjectUtil.findUsages(
-                findModel,
-                project,
-                usageInfo -> {
-                    synchronized (usages) {
-                        if (usages.size() >= limit * 20) return false; // 已攒够，停止搜索
-                        usages.add(usageInfo);
-                        return true;
-                    }
-                },
-                new com.intellij.usages.FindUsagesProcessPresentation(
-                        new com.intellij.usages.UsageViewPresentation())
-        );
+        // ★ 必须持读权限执行（根因修复）：本工具由 ChatPanel 的后台线程调用（非 EDT、无 ReadAction），
+        //   IDEA Find 引擎访问 PSI/索引会抛 "Read access is allowed from event dispatch thread or
+        //   inside read-action only" → 被 ToolExecutor 外层 catch 转成"工具执行失败"，
+        //   模型每换一个关键词都失败 → 反复重试（截图里连续 6 次搜索全无结果的根因）。
+        //   SearchAgent 侧执行同一批工具时包了 runReadAction（所以子智能体链路一直是好的）。
+        final boolean searchOk;
+        try {
+            searchOk = com.intellij.openapi.application.ReadAction.compute(() -> {
+                try {
+                    com.intellij.find.impl.FindInProjectUtil.findUsages(
+                            findModel,
+                            project,
+                            usageInfo -> {
+                                synchronized (usages) {
+                                    if (usages.size() >= limit * 20) return false; // 已攒够，停止搜索
+                                    usages.add(usageInfo);
+                                    return true;
+                                }
+                            },
+                            new com.intellij.usages.FindUsagesProcessPresentation(
+                                    new com.intellij.usages.UsageViewPresentation())
+                    );
+                    return true;
+                } catch (com.intellij.openapi.progress.ProcessCanceledException pce) {
+                    throw pce; // 平台取消信号必须原样上抛，不得吞
+                } catch (Exception searchEx) {
+                    com.intellij.openapi.diagnostic.Logger.getInstance(FileReaderUtil.class)
+                            .error("searchGrep findUsages failed, keyword=" + keyword, searchEx);
+                    return false;
+                }
+            });
+        } catch (com.intellij.openapi.progress.ProcessCanceledException pce) {
+            throw pce;
+        }
+        if (!searchOk) {
+            return "🔍 全局搜索：\"" + keyword + "\"\n\n搜索执行失败（内部错误已记录日志）。"
+                    + "可改用 mode=\"usages\" 按符号查找，或加 file_pattern 限定文件类型后重试。\n";
+        }
 
         if (usages.isEmpty()) {
-            return "🔍 全局搜索：\"" + keyword + "\"\n\n未找到匹配结果\n";
+            // 精简引导：给出换策略方向，避免模型反复换词重试
+            return "🔍 全局搜索：\"" + keyword + "\"\n\n未找到匹配结果。提示：\n"
+                    + "1. 改用更宽泛的核心词，或核对写法惯例；\n"
+                    + "2. 查引用/调用可改用 mode=\"usages\"；也可加 file_pattern 缩小范围；\n"
+                    + "3. 关键词可能真的不存在——若在验证某个假设，请直接告知用户，勿继续换词重试。\n";
         }
 
         // 按文件分组（保持出现顺序）。★ 默认排除点开头隐藏目录（.git/.codebuddy/.gradle 等）

@@ -58,15 +58,34 @@ public class SkillStore {
         return getUserSkillsDir().resolve(name + ".md");
     }
 
-    /** 若用户机器上不存在该技能文件，则从插件内置资源拷贝出厂默认（不覆盖已有） */
+    /**
+     * 确保出厂默认技能就位于用户目录。
+     *
+     * <p>★ 内容比对更新（根因修复）：旧实现"用户目录已存在就不拷贝"——插件升级后
+     * jar 内更新的出厂内容永远无法覆盖首次拷贝的旧版（如 project-doc-sync 从 docs/
+     * 改为 .codepal/ 后，模型收到的仍是旧文档路径）。出厂技能归插件方维护
+     * （不可删、无编辑入口），比对不一致即覆盖是安全的；用户导入的技能
+     * （jar 内无同名资源）不受此逻辑影响。
+     */
     public static void ensureDefault(String name) {
-        Path userPath = getUserSkillPath(name);
-        if (Files.exists(userPath)) return;
         try (InputStream is = SkillStore.class.getClassLoader()
-                .getResourceAsStream(RESOURCE_ROOT + name + ".md")) {
-            if (is == null) return;
+                .getResourceAsStream(RESOURCE_ROOT + name + FLAT_SKILL_SUFFIX)) {
+            if (is == null) return; // 非出厂默认（用户导入的）：不做任何管理
+            byte[] builtin = is.readAllBytes();
+            Path userPath = getUserSkillPath(name);
+            if (Files.exists(userPath)) {
+                try {
+                    if (!Arrays.equals(builtin, Files.readAllBytes(userPath))) {
+                        Files.write(userPath, builtin);
+                        LOG.info("ensureDefault: 出厂技能内容随插件更新已覆盖 -> " + userPath);
+                    }
+                } catch (IOException e) {
+                    LOG.warn("ensureDefault: 比对/更新出厂技能失败: " + userPath, e);
+                }
+                return;
+            }
             Files.createDirectories(userPath.getParent());
-            Files.copy(is, userPath);
+            Files.write(userPath, builtin);
         } catch (IOException ignored) {
             // 拷贝失败不影响后续：readSkill 会回退到内置资源读取
         }

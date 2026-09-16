@@ -234,6 +234,23 @@ public class SqliteDatabaseManager {
                     PRIMARY KEY (session_id, model_name)
                 )
             """);
+
+            // ─────────────────────────────────────────────
+            // 8. session_context_snapshot — 会话级「当前上下文」真实快照（每会话 1 行）
+            //    每轮主链路 usage 到达时覆盖式 upsert（最近一次请求的 prompt+completion+cache）；
+            //    会话激活/重启回显时回填 last* 快照，圆环因此跨重启/切会话仍为精确值；
+            //    压缩/清空会话后失效删除（上下文已裁剪，回退估算直到下一轮 usage）。
+            // ─────────────────────────────────────────────
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS session_context_snapshot (
+                    session_id VARCHAR(64) PRIMARY KEY,
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                    updated_at BIGINT NOT NULL
+                )
+            """);
         }
     }
 

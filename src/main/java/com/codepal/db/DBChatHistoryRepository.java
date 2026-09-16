@@ -501,6 +501,14 @@ public class DBChatHistoryRepository {
             if (lastAssistant != null && "assistant".equals(role)
                     && rec.getQaRound() == lastAssistant.getQaRound()) {
                 merged.get(lastAssistant).addAll(parts);
+                // ★ token_usage 随合并保留（根因修复）：实时 chip 落在每轮最终消息上，
+                //   而合并 key 是该轮第一条 assistant（token_usage 通常为 NULL）——
+                //   旧实现吸收后续行时丢弃 token_usage → 回显永远无 chip
+                //  （"实时有、重启丢；新会话有、老会话（工具循环轮）无"的根因）。
+                //   取时间序最后一个有值者 = 最后一次请求的 usage，与实时 chip 口径一致。
+                if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+                    lastAssistant.setTokenUsage(rec.getTokenUsage());
+                }
                 last = rec;
                 continue;
             }
@@ -508,6 +516,9 @@ public class DBChatHistoryRepository {
             if (lastAssistant != null && "tool".equals(role)
                     && rec.getQaRound() == lastAssistant.getQaRound()) {
                 merged.get(lastAssistant).addAll(parts);
+                if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+                    lastAssistant.setTokenUsage(rec.getTokenUsage());
+                }
                 last = rec;
                 continue;
             }
