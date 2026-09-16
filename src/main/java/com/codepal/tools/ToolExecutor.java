@@ -1323,9 +1323,26 @@ public class ToolExecutor {
     private static void openFileInEditorIfEnabled(Project project, VirtualFile vf) {
         if (vf == null || project == null) return;
         if (!CPSettings.getInstance().isOpenFileOnEdit()) return;
-        FileEditorManager fem = FileEditorManager.getInstance(project);
-        if (fem.isFileOpen(vf)) return; // 已打开的不必再打开
-        ApplicationManager.getApplication().invokeLater(() -> fem.openFile(vf, false));
+        // ★ EDT + WriteAction（根因修复）：
+        //   本方法在工具执行后台线程调用；裸 invokeLater(无参) 的任务进入平台的
+        //   NonBlockingFlushQueue，在 EDT 上以 write-unsafe（NON_MODAL）执行——
+        //   openFile 内部恢复编辑器状态要 commitDocument（改 PSI 模型），
+        //   2023.2 平台直接抛 "Write-unsafe context!"。
+        //   平台 2023.2 的 submitTransaction 需要 EDT 侧的事务 ID（后台拿不到），
+        //   runWithWritingAllowed 是 2024+ 才加入的 API——均不可用。
+        //   改用 EDT + runWriteAction：write action 是合法写上下文，内部 commitDocument
+        //   必然通过；openFile(self, focus=false) 在平台内部同样运行于等价锁级别
+        //  （WriteIntentReadAction），pump 窗口极短且不抢焦点，风险可控。
+        final FileEditorManager fem = FileEditorManager.getInstance(project);
+        ApplicationManager.getApplication().invokeLater(() -> {
+            if (project.isDisposed()) return;
+            if (fem.isFileOpen(vf)) return; // 已打开的不必再打开
+            ApplicationManager.getApplication().runWriteAction(
+                    (com.intellij.openapi.util.Computable<Void>) () -> {
+                        fem.openFile(vf, false);
+                        return null;
+                    });
+        });
     }
 
     private static String execCreateDirectory(JsonObject params, Project project, boolean skipConfirmation) {
