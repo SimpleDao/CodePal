@@ -315,6 +315,22 @@ public class SkillStore {
         }
     }
 
+    // ──────────────── 内置技能的一句话描述（skill 弹窗 hover tip）────────────────
+
+    /**
+     * 出厂默认技能的一句话描述，供 skill 弹窗悬浮展示；用户导入的技能不在此列（返回 null，无 tip）。
+     * 文案写死而非取 md 头部——md 简介太长，弹窗 tip 需要一句话级别的精简。
+     */
+    public static String getFactorySkillDescription(String name) {
+        if ("project-doc-sync".equals(name)) {
+            return "[内置] 为项目维护架构、表关系、进度三份活文档，跨会话持久记忆。";
+        }
+        if ("source-navigation".equals(name)) {
+            return "[内置] 看第三方库 / jar 源码时用：自动定位依赖并反编译出源码。";
+        }
+        return null;
+    }
+
     // ──────────────── 文件夹操作工具 ────────────────
 
     private static boolean deleteRecursively(Path root) {

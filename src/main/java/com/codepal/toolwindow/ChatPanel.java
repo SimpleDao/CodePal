@@ -6852,6 +6852,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         private boolean deleteHover = false;      // 鼠标是否悬停在本行删除图标上（在 calcHover 内按 modelMousePoint 判定，复用渲染器安全）
         private int currentListIndex = -1;        // 列表态行号（供 ChatPanel 反算删除图标命中区）
         private java.util.Set<String> enabledSet; // 已启用的 skill 名集合（由 ChatPanel 注入）
+        private String currentSkillName;          // 列表态当前行的 skill 名（hover tip 用；非 skill 行为 null）
 
         /** 注入当前已启用的 skill 名集合，供绘制勾选框时判断 */
         void setEnabledSet(java.util.Set<String> set) { this.enabledSet = set; }
@@ -7053,8 +7054,19 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     && com.codepal.skills.SkillStore.isUserImported(value.name)
                     && !com.codepal.skills.SkillStore.isFactoryDefault(value.name);
             this.currentListIndex = index;
+            // 记录当前行 skill 名：仅真实 skill 行（列表态），供 getToolTipText 展示内置技能描述
+            this.currentSkillName = (value != null && index >= 0 && value.kind == SkillListItem.KIND_SKILL)
+                    ? value.name : null;
             calcHover(list, index);
             return this;
+        }
+
+        /** 悬浮 tip：内置出厂技能展示一句话描述；用户导入的技能不展示（用户自己知道）。
+         *  JList 已自动注册 ToolTipManager，renderer 返回非 null 即显示。 */
+        @Override
+        public String getToolTipText(java.awt.event.MouseEvent e) {
+            if (currentSkillName == null) return null;
+            return com.codepal.skills.SkillStore.getFactorySkillDescription(currentSkillName);
         }
 
         private void calcHover(JList<?> list, int index) {
