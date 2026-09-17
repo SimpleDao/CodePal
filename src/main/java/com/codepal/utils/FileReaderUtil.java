@@ -241,14 +241,19 @@ public class FileReaderUtil {
             if (regex) {
                 final Pattern kwPat;
                 try {
-                    kwPat = Pattern.compile(keyword);
+                    // ★ 大小写不敏感（对齐 IDEA Find in Files 默认行为）：模型搜 xxljob
+                    //   必须能命中 XxlJob——大小写敏感会让全驼峰命名的代码全部落空
+                    kwPat = Pattern.compile(keyword, Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE);
                 } catch (Exception e) {
                     return "错误：正则表达式非法 - " + e.getMessage()
                             + "\n提示：如果只想搜普通文本，请传 regex=false 或不传。";
                 }
                 lineMatcher = line -> kwPat.matcher(line).find();
             } else {
-                lineMatcher = line -> line.contains(keyword);
+                // ★ 大小写不敏感（根因修复）：旧实现 line.contains(keyword) 大小写敏感，
+                //   模型搜 "xxljob" 找不到任何 "XxlJob"（全驼峰命名代码全部落空）
+                final String kwLower = keyword.toLowerCase();
+                lineMatcher = line -> line.toLowerCase().contains(kwLower);
             }
             Path root = resolveRootPath(rootPath);
             if (root == null || !Files.isDirectory(root)) {
@@ -1027,7 +1032,19 @@ public class FileReaderUtil {
         }
 
         if (usages.isEmpty()) {
-            // 精简引导：给出换策略方向，避免模型反复换词重试
+            // ★ IDEA 索引未命中 ≠ 关键词不存在：模块未导入项目、索引未就绪（dumb mode）、
+            //   范围配置等都可能让 Find 引擎漏掉真实存在的内容（用户在 IDEA 里用 Directory
+            //   模式才能搜到 xxljob 就是这类情况）。自动回退文件系统遍历（大小写不敏感）再搜一遍。
+            String basePath = project.getBasePath(); // 2023.2 平台直接返回 String
+            if (basePath != null) {
+                String fallback = searchGrepInPath(keyword, basePath, filePattern, limit, regex);
+                if (fallback != null && !fallback.contains("未找到匹配结果")) {
+                    return "🔍 全局搜索：\"" + keyword + "\"\n"
+                            + "（IDEA 索引未命中，以下为文件系统遍历兜底结果）\n\n"
+                            + fallback.replaceFirst("^🔍 目录搜索：[^\\n]*\\n\\n?", "");
+                }
+            }
+            // 兜底也无结果：给引导提示而非干巴巴的"未找到"——打断模型"假设错误→换词重试→焦虑"循环
             return "🔍 全局搜索：\"" + keyword + "\"\n\n未找到匹配结果。提示：\n"
                     + "1. 改用更宽泛的核心词，或核对写法惯例；\n"
                     + "2. 查引用/调用可改用 mode=\"usages\"；也可加 file_pattern 缩小范围；\n"

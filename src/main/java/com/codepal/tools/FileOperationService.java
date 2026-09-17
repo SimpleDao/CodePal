@@ -105,6 +105,9 @@ public class FileOperationService {
                         ApplicationManager.getApplication().runWriteAction(() -> {
                             doc.setText(finalContent);
                             FileDocumentManager.getInstance().saveDocument(doc);
+                            // 0 字节诊断：保存后记录 document 长度与 VFS 记录的磁盘长度
+                            System.out.println("[write_file] docPath saved: docLen=" + doc.getTextLength()
+                                    + " vfLen=" + finalVf.getLength() + " file=" + finalVf.getName());
                         });
                     });
                 } finally {
@@ -118,6 +121,8 @@ public class FileOperationService {
                             ApplicationManager.getApplication().runWriteAction(() -> {
                                 doc.setText(finalContent);
                                 FileDocumentManager.getInstance().saveDocument(doc);
+                                System.out.println("[write_file] docPath saved(bg): docLen=" + doc.getTextLength()
+                                        + " vfLen=" + finalVf.getLength() + " file=" + finalVf.getName());
                             });
                         });
                     } finally {
@@ -153,6 +158,8 @@ public class FileOperationService {
                         ApplicationManager.getApplication().runWriteAction(() -> {
                             try {
                                 finalVf.setBinaryContent(contentBytes);
+                                System.out.println("[write_file] binary saved: len=" + finalVf.getLength()
+                                        + " file=" + finalVf.getName());
                             } catch (Exception e) {
                                 throw new RuntimeException("文件写入失败: " + e.getMessage(), e);
                             }

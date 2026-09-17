@@ -1225,6 +1225,21 @@ public class ToolExecutor {
             }
             String action = fileExists ? "覆盖写入" : "创建并写入";
             long fileSize = writtenFile.length();
+            // ★ 写后校验（0 字节假成功修复）：曾有"返回覆盖写入成功但磁盘 0 字节"的报告——
+            //   旧实现无条件返回成功，模型被虚假成功骗过后基于空文件继续工作。
+            //   现在校验磁盘字节数与期望内容长度：不符必须如实报错，模型可立即重试。
+            int expectedBytes = content == null ? 0 : content.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+            if (expectedBytes > 0 && fileSize == 0) {
+                System.err.println("[write_file] 0字节异常: path=" + writtenFile.getAbsolutePath()
+                        + " contentLen=" + expectedBytes);
+                return "错误：写入异常 — 磁盘文件为 0 字节（期望 " + expectedBytes
+                        + " 字节）。可能是文档保存竞态，请重试本工具，或改用 edit_file 分段写入。";
+            }
+            if (Math.abs(fileSize - expectedBytes) > expectedBytes / 10 + 16) {
+                // 大小偏差超容忍（BOM/换行差异约几个字节）——记录但不阻断（编码差异合法）
+                System.err.println("[write_file] 磁盘与内容大小偏差: path=" + writtenFile.getAbsolutePath()
+                        + " disk=" + fileSize + " expectedUtf8=" + expectedBytes);
+            }
             return "✅ " + action + "成功。文件：" + writtenFile.getAbsolutePath()
                     + "（" + fileSize + " 字节）";
         } catch (Exception e) {
