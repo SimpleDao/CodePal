@@ -1338,25 +1338,34 @@ public class ToolExecutor {
     private static void openFileInEditorIfEnabled(Project project, VirtualFile vf) {
         if (vf == null || project == null) return;
         if (!CPSettings.getInstance().isOpenFileOnEdit()) return;
-        // ★ EDT + WriteAction（根因修复）：
-        //   本方法在工具执行后台线程调用；裸 invokeLater(无参) 的任务进入平台的
-        //   NonBlockingFlushQueue，在 EDT 上以 write-unsafe（NON_MODAL）执行——
-        //   openFile 内部恢复编辑器状态要 commitDocument（改 PSI 模型），
-        //   2023.2 平台直接抛 "Write-unsafe context!"。
-        //   平台 2023.2 的 submitTransaction 需要 EDT 侧的事务 ID（后台拿不到），
-        //   runWithWritingAllowed 是 2024+ 才加入的 API——均不可用。
-        //   改用 EDT + runWriteAction：write action 是合法写上下文，内部 commitDocument
-        //   必然通过；openFile(self, focus=false) 在平台内部同样运行于等价锁级别
-        //  （WriteIntentReadAction），pump 窗口极短且不抢焦点，风险可控。
+        // ★ 事务化打开（Write-unsafe 最终修复，v3）：
+        //   本方法在工具执行后台线程调用；裸 invokeLater(无参) 的任务经平台
+        //   NonBlockingFlushQueue 在 EDT 上以 write-unsafe（NON_MODAL）执行——
+        //   openFile 内部恢复编辑器状态要 commitDocument（PSI 模型修改）→ assert 失败。
+        //   v2（runWriteAction 包 openFile）引出新问题：模型一轮连续写多文件 →
+        //   多个 openFile 排队 → A 任务（写锁+同步进度泵）把排队的 B 任务拉进泵，
+        //   B 的 commit 在 write-unsafe 上下文再次报错（嵌套泵）。
+        //   v3 方案：EDT 任务里取当前事务 ID，把 openFile 提交为**独立事务**——
+        //   各文件的打开互不嵌套，commit 在各自事务内合法执行。
+        //   getContextTransaction() 为 null（无事务上下文）时退化为裸 openFile
+        //  （best-effort：文件仍会打开，仅可能记录一条状态恢复失败的日志）。
         final FileEditorManager fem = FileEditorManager.getInstance(project);
         ApplicationManager.getApplication().invokeLater(() -> {
             if (project.isDisposed()) return;
             if (fem.isFileOpen(vf)) return; // 已打开的不必再打开
-            ApplicationManager.getApplication().runWriteAction(
-                    (com.intellij.openapi.util.Computable<Void>) () -> {
-                        fem.openFile(vf, false);
-                        return null;
-                    });
+            com.intellij.openapi.application.TransactionGuard tg =
+                    com.intellij.openapi.application.TransactionGuard.getInstance();
+            com.intellij.openapi.application.TransactionId tid = tg.getContextTransaction();
+            Runnable open = () -> {
+                if (project.isDisposed()) return;
+                if (fem.isFileOpen(vf)) return;
+                fem.openFile(vf, false);
+            };
+            if (tid != null) {
+                tg.submitTransaction(project, tid, open);
+            } else {
+                open.run(); // 无事务上下文：best-effort
+            }
         });
     }
 

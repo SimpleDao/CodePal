@@ -803,6 +803,14 @@ public class CPSettings implements PersistentStateComponent<CPSettings> {
         // 注入可用数据源清单 + 当前默认选择，让模型知道有哪些数据源可用以及用哪个（无需每次重复 db_name）。
         appendAvailableDataSources(sb);
 
+        // ★ 当前时间（放最末尾）：ChatPanel.sendToApi 每轮请求前都会重建系统提示词，
+        //   因此此值随请求刷新——长会话跨小时/跨天时，"今天/昨天"等相对时间推理不会陈旧；
+        //   .codepal/progress/ 进度流水按此日期命名（YYYY-MM-DD.md）也不再依赖模型猜日期。
+        //   位置放最末尾：时间行之前的全部内容保持不变，利于上游前缀缓存（如 DeepSeek context caching）命中。
+        sb.append("\n---\n【当前时间】\n");
+        sb.append("- 现在：").append(new java.text.SimpleDateFormat(
+                "yyyy-MM-dd HH:mm EEEE", java.util.Locale.CHINA).format(new java.util.Date())).append("\n");
+
         return sb.toString();
     }
 
