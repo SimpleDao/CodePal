@@ -236,6 +236,10 @@ public class FileReaderUtil {
                                                String filePattern, int maxResults, boolean regex) {
             if (keyword == null || keyword.isBlank()) return "错误：请提供搜索关键词";
             final int limit = maxResults <= 0 ? 10 : maxResults;
+            // ★ 文件名匹配（与内容匹配并行）：搜"文档标题"时内容里未必有完整标题句，
+            //   但文件名本身就是标题（如 振华远洋轮和港座轮数据接口提供组织碳.md）——
+            //   旧实现只搜内容 → 按文件名找文档永远落空
+            final String kwLower = keyword.toLowerCase();
             // ★ 提前验证正则合法性，避免每个文件重复抛异常
             java.util.function.Predicate<String> lineMatcher;
             if (regex) {
@@ -252,24 +256,30 @@ public class FileReaderUtil {
             } else {
                 // ★ 大小写不敏感（根因修复）：旧实现 line.contains(keyword) 大小写敏感，
                 //   模型搜 "xxljob" 找不到任何 "XxlJob"（全驼峰命名代码全部落空）
-                final String kwLower = keyword.toLowerCase();
                 lineMatcher = line -> line.toLowerCase().contains(kwLower);
             }
             Path root = resolveRootPath(rootPath);
             if (root == null || !Files.isDirectory(root)) {
                 return "错误：目录不存在或无法访问：" + (rootPath == null ? "(空)" : rootPath);
             }
-     
+
              Pattern filePat = filePattern != null && !filePattern.isBlank()
                      ? globToRegex(filePattern) : null;
              final java.util.Map<String, List<String>> byFile = new java.util.LinkedHashMap<>();
+             final java.util.List<String> nameHits = new java.util.ArrayList<>();
              int[] found = {0};
-     
-             try (Stream<Path> walk = Files.walk(root, 20)) {
+
+             // 深度不限制（Files.walk 惰性流 + limit 提前终止 + 跳过目录/二进制/超大文件过滤可控开销）
+             try (Stream<Path> walk = Files.walk(root)) {
                  walk.filter(Files::isRegularFile)
                      .filter(p -> !isUnderSkippedDir(p))
                      .filter(p -> filePat == null || filePat.matcher(p.toString().replace('\\', '/')).find())
                      .forEach(p -> {
+                         // ★ 文件名匹配收集（与内容匹配并行，上限 20 条；内容命中满 limit 后仍继续收集）
+                         if (nameHits.size() < 20 && p.getFileName() != null
+                                 && p.getFileName().toString().toLowerCase().contains(kwLower)) {
+                             nameHits.add(p.toString());
+                         }
                          if (found[0] >= limit) return;
                          if (isBinaryOrHuge(p)) return;
                          try {
@@ -289,6 +299,17 @@ public class FileReaderUtil {
         }
 
         if (byFile.isEmpty()) {
+            // ★ 内容无命中但文件名命中：按文档标题找文件的场景，直接返回文件清单
+            if (!nameHits.isEmpty()) {
+                StringBuilder nsb = new StringBuilder();
+                nsb.append("🔍 文件名匹配：\"").append(keyword).append("\"")
+                  .append(rootPath != null ? "（范围：" + rootPath + "）" : "")
+                  .append(" —— 内容中未出现该完整关键词，但以下文件的**文件名**包含它：\n\n");
+                for (String p : nameHits) nsb.append("  📄 ").append(p).append("\n");
+                nsb.append("\n提示：如需查看内容，用 read_file_range 读取；")
+                   .append("若要搜索文件内的关键词，请改用更短的核心词。\n");
+                return nsb.toString();
+            }
             // 精简引导，与 searchGrep 口径一致
             return "🔍 目录搜索：\"" + keyword + "\"\n\n未找到匹配结果"
                     + (rootPath != null ? "（范围：" + rootPath + "）" : "") + "。提示：\n"
@@ -299,13 +320,35 @@ public class FileReaderUtil {
         StringBuilder sb = new StringBuilder();
         sb.append("🔍 目录搜索：\"").append(keyword).append("\"")
           .append(rootPath != null ? "（范围：" + rootPath + "）" : "").append("\n\n");
+        // ★ 明细展示按 shown 计数控制（0 字节式截断 bug 修复）：旧条件
+        //   "found >= limit && sb.length() > 0" 中 sb 已含标题恒非空 → 截断场景
+        //   （found 达到 max_results）第一次迭代就 break，明细全丢只剩计数。
+        int shown = 0;
         for (var entry : byFile.entrySet()) {
-            if (found[0] >= limit && sb.length() > 0) break;
+            if (shown >= limit) break;
             sb.append("## ").append(entry.getKey()).append("\n");
-            for (String l : entry.getValue()) sb.append(l).append("\n");
+            for (String l : entry.getValue()) {
+                if (shown >= limit) break;
+                sb.append(l).append("\n");
+                shown++;
+            }
             sb.append("\n");
         }
-        sb.append("共找到 ").append(found[0]).append(" 处匹配\n");
+        // ★ 计数语义：found 在收集阶段封顶于 limit，达到上限时是"至少 N 处"而非真实总数
+        //  （避免误导用户以为全项目只有 N 处）；提示可增大 max_results 看更多。
+        if (found[0] >= limit) {
+            sb.append("共找到 ≥").append(found[0])
+              .append(" 处匹配（已达 max_results=").append(limit)
+              .append(" 上限，如需更多请增大 max_results）\n");
+        } else {
+            sb.append("共找到 ").append(found[0]).append(" 处匹配\n");
+        }
+        // ★ 内容命中的文件之外，若还有文件名命中（内容未含完整关键词的文档），附在末尾供参考
+        if (!nameHits.isEmpty()) {
+            sb.append("\n📁 另有 ").append(nameHits.size())
+              .append(" 个文件的文件名包含该关键词（内容未命中）：\n");
+            for (String p : nameHits) sb.append("  📄 ").append(p).append("\n");
+        }
         return sb.toString();
     }
 
@@ -582,7 +625,11 @@ public class FileReaderUtil {
             }
             if (targets.isEmpty()) {
                 result[0] = "未找到符号 \"" + symbol + "\" 的定义，无法查找引用。"
-                                                 + "可先用 locate_code_by_symbol 确认定义位置，或改用 search_tool 做文本匹配。";
+                        + "可能原因：① 符号名不精确（请只传纯符号名，勿带方法签名/泛型）；"
+                        + "② 该类所在模块未被 IDEA 识别为源码（索引盲区）——可先用 search_tool "
+                        + "文本搜索确认定义确实存在，再用 view_class_source 或 read_file_range 查看；"
+                        + "③ 符号真不存在。若定义存在但无代码引用（仅被框架反射调用，如 @XxlJob 入口），"
+                        + "本工具也可能返回空结果，属正常。";
                 return;
             }
 
@@ -960,128 +1007,33 @@ public class FileReaderUtil {
     }
 
     /**
-     * 全局搜索 —— 使用 IDEA 自带的 FindInProjectUtil（索引搜索）。
-     * 自动覆盖所有模块 / 子模块，无目录递归 depth 限制，不依赖外部二进制。
-     * 对标 AutoDev 的 SearchInFilesContentTool（同样用 FindManager + FindInProjectUtil）。
+     * 全局搜索（项目内）—— 文件系统遍历实现。
+     * ★ 弃用 IDEA FindInProjectUtil 引擎（三次踩坑后的定案）：其线程模型过于苛刻——
+     *   后台线程裸调间歇性 "Read access is allowed"（依赖内部事务标记）、
+     *   包 ReadAction 又直接抛 "Must not execute inside read action"
+     *  （FindInProjectTask 断言调用线程自身无读锁），
+     *   且搜索范围受模块导入/索引就绪影响（未导入模块搜不到，用户在 IDEA 里
+     *   用 Directory 模式才能搜到 xxljob 即此情况）。
+     *   NIO 遍历零约束：任意后台线程可跑、大小写不敏感、覆盖全部文件（含未导入模块），
+     *   配合跳过目录/二进制/超大文件过滤与 limit 提前终止，性能可接受。
      */
         public static String searchGrep(String keyword, String filePattern, int maxResults, Project project) {
             return searchGrep(keyword, filePattern, maxResults, project, false);
         }
-    
-        /**
-         * 重载：支持 regex 模式。regex=true 时 keyword 按 IDEA 的正则语义匹配；false 时按字面量。
-         */
-        public static String searchGrep(String keyword, String filePattern, int maxResults,
-                                         Project project, boolean regex) {
-            if (keyword == null || keyword.isBlank()) return "错误：请提供搜索关键词";
-            if (project == null) return "错误：项目未打开";
-            final int limit = maxResults <= 0 ? 10 : maxResults;
-    
-             com.intellij.find.FindModel findModel =
-                     com.intellij.find.FindManager.getInstance(project).getFindInProjectModel().clone();
-             findModel.setStringToFind(keyword);
-             findModel.setCaseSensitive(false);
-             findModel.setWholeWordsOnly(false);
-             findModel.setRegularExpressions(regex);
-        if (filePattern != null && !filePattern.isBlank()) {
-            findModel.setFileFilter(filePattern);
-        }
 
-        // ★ FindInProjectUtil 在多线程上并发回调 consumer（processOnAllThreads + BoundedTaskExecutor），
-        //   ArrayList 非线程安全 → 并发 add/size 竞态使内部数组损坏并抛 ArrayIndexOutOfBoundsException。
-        //   改用 synchronizedList，并用同步块保证「检查-添加」原子性；攒够后返回 false 让搜索提前停止。
-        final java.util.List<com.intellij.usageView.UsageInfo> usages =
-                java.util.Collections.synchronizedList(new java.util.ArrayList<>());
-        // ★ 必须持读权限执行（根因修复）：本工具由 ChatPanel 的后台线程调用（非 EDT、无 ReadAction），
-        //   IDEA Find 引擎访问 PSI/索引会抛 "Read access is allowed from event dispatch thread or
-        //   inside read-action only" → 被 ToolExecutor 外层 catch 转成"工具执行失败"，
-        //   模型每换一个关键词都失败 → 反复重试（截图里连续 6 次搜索全无结果的根因）。
-        //   SearchAgent 侧执行同一批工具时包了 runReadAction（所以子智能体链路一直是好的）。
-        final boolean searchOk;
-        try {
-            searchOk = com.intellij.openapi.application.ReadAction.compute(() -> {
-                try {
-                    com.intellij.find.impl.FindInProjectUtil.findUsages(
-                            findModel,
-                            project,
-                            usageInfo -> {
-                                synchronized (usages) {
-                                    if (usages.size() >= limit * 20) return false; // 已攒够，停止搜索
-                                    usages.add(usageInfo);
-                                    return true;
-                                }
-                            },
-                            new com.intellij.usages.FindUsagesProcessPresentation(
-                                    new com.intellij.usages.UsageViewPresentation())
-                    );
-                    return true;
-                } catch (com.intellij.openapi.progress.ProcessCanceledException pce) {
-                    throw pce; // 平台取消信号必须原样上抛，不得吞
-                } catch (Exception searchEx) {
-                    com.intellij.openapi.diagnostic.Logger.getInstance(FileReaderUtil.class)
-                            .error("searchGrep findUsages failed, keyword=" + keyword, searchEx);
-                    return false;
-                }
-            });
-        } catch (com.intellij.openapi.progress.ProcessCanceledException pce) {
-            throw pce;
-        }
-        if (!searchOk) {
-            return "🔍 全局搜索：\"" + keyword + "\"\n\n搜索执行失败（内部错误已记录日志）。"
-                    + "可改用 mode=\"usages\" 按符号查找，或加 file_pattern 限定文件类型后重试。\n";
-        }
-
-        if (usages.isEmpty()) {
-            // ★ IDEA 索引未命中 ≠ 关键词不存在：模块未导入项目、索引未就绪（dumb mode）、
-            //   范围配置等都可能让 Find 引擎漏掉真实存在的内容（用户在 IDEA 里用 Directory
-            //   模式才能搜到 xxljob 就是这类情况）。自动回退文件系统遍历（大小写不敏感）再搜一遍。
-            String basePath = project.getBasePath(); // 2023.2 平台直接返回 String
-            if (basePath != null) {
-                String fallback = searchGrepInPath(keyword, basePath, filePattern, limit, regex);
-                if (fallback != null && !fallback.contains("未找到匹配结果")) {
-                    return "🔍 全局搜索：\"" + keyword + "\"\n"
-                            + "（IDEA 索引未命中，以下为文件系统遍历兜底结果）\n\n"
-                            + fallback.replaceFirst("^🔍 目录搜索：[^\\n]*\\n\\n?", "");
-                }
-            }
-            // 兜底也无结果：给引导提示而非干巴巴的"未找到"——打断模型"假设错误→换词重试→焦虑"循环
-            return "🔍 全局搜索：\"" + keyword + "\"\n\n未找到匹配结果。提示：\n"
-                    + "1. 改用更宽泛的核心词，或核对写法惯例；\n"
-                    + "2. 查引用/调用可改用 mode=\"usages\"；也可加 file_pattern 缩小范围；\n"
-                    + "3. 关键词可能真的不存在——若在验证某个假设，请直接告知用户，勿继续换词重试。\n";
-        }
-
-        // 按文件分组（保持出现顺序）。★ 默认排除点开头隐藏目录（.git/.codebuddy/.gradle 等）
-        //   及 node_modules/target/build 等构建产物目录 —— IDEA 索引搜索本身不过滤这些，
-        //   导致历史记忆/构建产物噪音混进结果。
-        java.util.Map<String, java.util.List<com.intellij.usageView.UsageInfo>> byFile =
-                new java.util.LinkedHashMap<>();
-        for (com.intellij.usageView.UsageInfo ui : usages) {
-            com.intellij.openapi.vfs.VirtualFile vf = ui.getVirtualFile();
-            if (vf == null) continue;
-            if (isUnderSkippedDirName(vf.getPath())) continue;
-            byFile.computeIfAbsent(vf.getPath(), k -> new java.util.ArrayList<>()).add(ui);
-        }
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("🔍 全局搜索：\"").append(keyword).append("\"\n\n");
-        int found = 0;
-        for (java.util.List<com.intellij.usageView.UsageInfo> group : byFile.values()) {
-            if (found >= limit) break;
-            com.intellij.openapi.vfs.VirtualFile vf = group.get(0).getVirtualFile();
-            if (vf == null) continue;
-            sb.append("## ").append(vf.getPath()).append("\n");
-            for (com.intellij.usageView.UsageInfo ui : group) {
-                if (found >= limit) break;
-                LineCtx ctx = readLineContext(vf, ui.getNavigationOffset());
-                if (ctx == null) continue;
-                found++;
-                sb.append(String.format("  %d:%s\n", ctx.lineNo, ctx.line.trim()));
-            }
-            sb.append("\n");
-        }
-        sb.append("共找到 ").append(found).append(" 处匹配\n");
-        return sb.toString();
+    /**
+     * 重载：支持 regex 模式。regex=true 时 keyword 按 Java 正则（大小写不敏感）匹配；false 时按字面量包含（大小写不敏感）。
+     */
+    public static String searchGrep(String keyword, String filePattern, int maxResults,
+                                     Project project, boolean regex) {
+        if (keyword == null || keyword.isBlank()) return "错误：请提供搜索关键词";
+        if (project == null) return "错误：项目未打开";
+        final int limit = maxResults <= 0 ? 10 : maxResults;
+        String basePath = project.getBasePath(); // 2023.2 平台直接返回 String
+        if (basePath == null || basePath.isBlank()) return "错误：无法获取项目根目录";
+        String out = searchGrepInPath(keyword, basePath, filePattern, limit, regex);
+        // 输出标题统一为"全局搜索"语义（NIO 实现默认打"目录搜索"）
+        return out == null ? out : out.replaceFirst("^🔍 目录搜索：", "🔍 全局搜索：");
     }
 
     /** 判断绝对路径中任一路径段是否属于应跳过的目录（点开头隐藏目录 / 构建产物等），供索引搜索结果过滤 */

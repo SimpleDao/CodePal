@@ -269,11 +269,12 @@ public class ToolDefinitions {
                 new ChatRequest.ToolDefinition.FunctionDef(
                         "search_tool",
                         "在整个项目（或指定本地目录）中搜索代码，返回文件路径、行号和匹配内容。"
-                        + "两种模式：① text（默认）：文本匹配，设 regex=true 可用正则表达式；"
-                        + "② usages（mode=\"usages\"）：语义引用查找，keyword 传类名/方法名，返回其所有引用/调用点，"
-                        + "能区分同名但无关的符号——查「这个方法被谁调用」、重构评估影响面时首选，比文本匹配精准。"
-                        + "默认在当前 IDEA 项目内用索引搜索（覆盖所有子模块）；"
-                        + "传 path 指定 IDEA 之外的本地目录时，改用文件系统遍历（不依赖项目索引）。"
+                        + "两种模式：① text（默认）：文本匹配（大小写不敏感），设 regex=true 可用正则表达式（同样大小写不敏感）；"
+                        + "② usages（mode=\"usages\"）：语义引用查找，keyword 传类名/方法名等**纯符号名**（勿传方法签名如 public List<...> xxx，"
+                        + "会导致找不到定义）；该模式忽略 file_pattern；返回所有引用/调用点，能区分同名但无关的符号——"
+                        + "查「这个方法被谁调用」、重构评估影响面时首选，比文本匹配精准；对仅被框架反射调用（如 @XxlJob 入口）而无代码引用的符号，返回结果为空属正常。"
+                        + "text 模式在当前 IDEA 项目内搜索（覆盖所有子模块，含未导入模块）；"
+                        + "传 path 指定 IDEA 之外的本地目录时，改用文件系统遍历。"
                         + "★ 自动排除点开头的隐藏目录（如 .git/.codebuddy/.gradle）及 node_modules/target/build 等构建产物目录，无需手动排除。",
                         params
                 )
