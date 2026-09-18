@@ -269,7 +269,8 @@ public class ToolDefinitions {
                 new ChatRequest.ToolDefinition.FunctionDef(
                         "search_tool",
                         "在整个项目（或指定本地目录）中搜索代码，返回文件路径、行号和匹配内容。"
-                        + "两种模式：① text（默认）：文本匹配（大小写不敏感），设 regex=true 可用正则表达式（同样大小写不敏感）；"
+                        + "两种模式：① text（默认）：文本匹配（大小写不敏感）；多关键词用 | 分隔（如 词1|词2|词3，任一命中即返回，各词按字面量匹配）；"
+                        + "设 regex=true 时 keyword 按正则匹配（同样大小写不敏感）；"
                         + "② usages（mode=\"usages\"）：语义引用查找，keyword 传类名/方法名等**纯符号名**（勿传方法签名如 public List<...> xxx，"
                         + "会导致找不到定义）；该模式忽略 file_pattern；返回所有引用/调用点，能区分同名但无关的符号——"
                         + "查「这个方法被谁调用」、重构评估影响面时首选，比文本匹配精准；对仅被框架反射调用（如 @XxlJob 入口）而无代码引用的符号，返回结果为空属正常。"

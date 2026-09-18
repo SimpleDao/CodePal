@@ -256,7 +256,20 @@ public class FileReaderUtil {
             } else {
                 // ★ 大小写不敏感（根因修复）：旧实现 line.contains(keyword) 大小写敏感，
                 //   模型搜 "xxljob" 找不到任何 "XxlJob"（全驼峰命名代码全部落空）
-                lineMatcher = line -> line.toLowerCase().contains(kwLower);
+                // ★ 多关键词 OR：keyword="词1|词2|词3" 任一命中即返回——各词按**字面量**匹配
+                //  （不解析正则，@GetMapping("/detail") 这类含元字符的词也安全），大小写不敏感
+                final java.util.List<String> kwLowerList = new java.util.ArrayList<>();
+                for (String w : keyword.split("\\|")) {
+                    String t = w.trim().toLowerCase();
+                    if (!t.isEmpty()) kwLowerList.add(t);
+                }
+                if (kwLowerList.isEmpty()) kwLowerList.add(keyword.toLowerCase());
+                lineMatcher = line -> {
+                    for (String w : kwLowerList) {
+                        if (line.toLowerCase().contains(w)) return true;
+                    }
+                    return false;
+                };
             }
             Path root = resolveRootPath(rootPath);
             if (root == null || !Files.isDirectory(root)) {
