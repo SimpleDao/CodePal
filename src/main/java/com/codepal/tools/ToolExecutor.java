@@ -1335,36 +1335,51 @@ public class ToolExecutor {
      *   <li>否则在 EDT 中打开（focus=false，不抢占用户输入焦点）</li>
      * </ul>
      */
+    /** 待自动打开的文件队列：多文件连续写入时合并为一次 EDT 任务串行处理，避免互相泵嵌套 */
+    private static final java.util.concurrent.ConcurrentLinkedQueue<VirtualFile> PENDING_OPEN =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private static final java.util.concurrent.atomic.AtomicBoolean OPEN_TASK_RUNNING =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private static void openFileInEditorIfEnabled(Project project, VirtualFile vf) {
         if (vf == null || project == null) return;
         if (!CPSettings.getInstance().isOpenFileOnEdit()) return;
-        // ★ 事务化打开（Write-unsafe 最终修复，v3）：
-        //   本方法在工具执行后台线程调用；裸 invokeLater(无参) 的任务经平台
-        //   NonBlockingFlushQueue 在 EDT 上以 write-unsafe（NON_MODAL）执行——
-        //   openFile 内部恢复编辑器状态要 commitDocument（PSI 模型修改）→ assert 失败。
-        //   v2（runWriteAction 包 openFile）引出新问题：模型一轮连续写多文件 →
-        //   多个 openFile 排队 → A 任务（写锁+同步进度泵）把排队的 B 任务拉进泵，
-        //   B 的 commit 在 write-unsafe 上下文再次报错（嵌套泵）。
-        //   v3 方案：EDT 任务里取当前事务 ID，把 openFile 提交为**独立事务**——
-        //   各文件的打开互不嵌套，commit 在各自事务内合法执行。
-        //   getContextTransaction() 为 null（无事务上下文）时退化为裸 openFile
-        //  （best-effort：文件仍会打开，仅可能记录一条状态恢复失败的日志）。
+        if (project.isDisposed()) return;
+        PENDING_OPEN.add(vf);
+
+        // ★ 队列 + 单任务消费（v4，三次失败后的定案）：
+        //   2023.2 平台规则：后台线程发起的 EDT 任务默认 write-unsafe（NonBlockingFlushQueue），
+        //   而 openFile 打开"有历史状态的文件"时内部恢复状态必须 commitDocument（模型修改）——
+        //   结构性冲突，历史上三个版本分别倒在：
+        //   v1 裸 openFile：每次打开一条 Write-unsafe error 日志（文件仍打开，功能可用但噪音大）；
+        //   v2 runWriteAction 包单个 openFile：单文件 OK，但模型一轮连续写多文件时，
+        //      多个 openFile 任务在 EDT 排队互相泵（A 的写锁+进度泵拉进 B），嵌套再次 write-unsafe；
+        //   v3 submitTransaction(后台能拿到的 NON_MODAL 事务 id)：该事务本身就是 write-unsafe，等效 v1。
+        //   v4：所有待打开文件进静态队列，单 EDT 任务用 runWriteAction 逐个打开——
+        //       后续文件不进 EDT 队列，泵拉不到，无跨任务嵌套；commit 在同一 write action 内合法。
+        //   已知代价：连续打开多个文件时写锁持有时间变长（每个约几百 ms）——可接受。
+        if (!OPEN_TASK_RUNNING.compareAndSet(false, true)) return; // 已有消费任务，队列里的会被顺带处理
         final FileEditorManager fem = FileEditorManager.getInstance(project);
         ApplicationManager.getApplication().invokeLater(() -> {
-            if (project.isDisposed()) return;
-            if (fem.isFileOpen(vf)) return; // 已打开的不必再打开
-            com.intellij.openapi.application.TransactionGuard tg =
-                    com.intellij.openapi.application.TransactionGuard.getInstance();
-            com.intellij.openapi.application.TransactionId tid = tg.getContextTransaction();
-            Runnable open = () -> {
-                if (project.isDisposed()) return;
-                if (fem.isFileOpen(vf)) return;
-                fem.openFile(vf, false);
-            };
-            if (tid != null) {
-                tg.submitTransaction(project, tid, open);
-            } else {
-                open.run(); // 无事务上下文：best-effort
+            try {
+                while (true) {
+                    final VirtualFile next = PENDING_OPEN.poll();
+                    if (next == null) break;
+                    if (project.isDisposed()) return;
+                    if (fem.isFileOpen(next)) continue;
+                    try {
+                        ApplicationManager.getApplication().runWriteAction(
+                                (com.intellij.openapi.util.Computable<Void>) () -> {
+                                    fem.openFile(next, false);
+                                    return null;
+                                });
+                    } catch (Throwable t) {
+                        com.intellij.openapi.diagnostic.Logger.getInstance(ToolExecutor.class)
+                                .warn("openFile failed: " + next.getName() + " - " + t.getMessage());
+                    }
+                }
+            } finally {
+                OPEN_TASK_RUNNING.set(false);
             }
         });
     }
@@ -1967,7 +1982,8 @@ public class ToolExecutor {
         try {
             java.util.concurrent.CompletableFuture<List<UserAnswer>> future =
                     ctx.askQuestionProvider.requestAskUserQuestion(questions);
-            List<UserAnswer> answers = future.get(30, java.util.concurrent.TimeUnit.MINUTES);
+            // ★ 10 分钟等待（与提问卡片 UI 提示"10 分钟后超时"一致；外层 Orchestrator 兜底已提到 600s）
+            List<UserAnswer> answers = future.get(10, java.util.concurrent.TimeUnit.MINUTES);
 
             StringBuilder sb = new StringBuilder("用户回答如下：\n\n");
             for (UserAnswer a : answers) {

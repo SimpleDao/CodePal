@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.codepal"
-version = "2.2.23"
+version = "2.2.24"
 
 repositories {
     maven { url = uri("https://maven.aliyun.com/repository/public") }
@@ -84,6 +84,13 @@ tasks {
     // 放在 afterEvaluate 里，确保晚于插件自身配置，禁用才不会被覆盖。
     afterEvaluate {
         tasks.getByName<Task>("downloadZipSigner").enabled = false
+    }
+
+    patchPluginXml {
+        // What's New / Changelog：发版前只需编辑项目根的 change-notes.html（支持 HTML），
+        // 内容自动注入 plugin.xml 并随 publishPlugin 上传——
+        // IDE 内插件详情的 What's New 与 Marketplace 网页版本说明同源显示。
+        changeNotes.set(rootProject.file("change-notes.html").readText())
     }
 
     publishPlugin {
