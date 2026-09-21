@@ -1217,6 +1217,18 @@ public class ToolExecutor {
         java.io.File targetFile = FileOperationService.resolveFilePath(filePath, project);
         boolean fileExists = targetFile.exists();
 
+        // ★ 空内容保护（0 字节事故根治）：实证发现模型偶发传空 file_content（意图是"先声明创建
+        //   后续填充"或生成时放弃输出），旧实现如实覆盖 → 已有文件被清成 0 字节且返回"成功"。
+        //   空内容覆盖非空文件几乎必是事故——拒绝执行并把原因反馈给模型，模型会重试带完整内容
+        //  （DB 实证：同一文件第一次空、第二次重试即成功）。
+        if (content.isEmpty() && fileExists && targetFile.length() > 0) {
+            System.err.println("[write_file] 拒绝空内容覆盖: path=" + targetFile.getAbsolutePath()
+                    + " 原大小=" + targetFile.length());
+            return "错误：file_content 为空，已拒绝覆盖非空文件（原 " + targetFile.length()
+                    + " 字节）。这通常是参数遗漏——请重新调用并提供完整文件内容；"
+                    + "如你确实要清空该文件，请在提问中向用户说明后再执行。";
+        }
+
         try {
             FileOperationService.writeFile(filePath, content, project);
             java.io.File writtenFile = FileOperationService.resolveFilePath(filePath, project);
