@@ -124,8 +124,8 @@ public class ToolOrchestrator {
         }
 
         // ★ 单工具执行加超时兜底（批量路径已有 120s，单工具路径此前无超时，会永久挂起）。
-        // 注意：必须大于内部耗时工具的自有超时（如整 jar 反编译 180s），预留余量。
-        final int TOOL_TIMEOUT_SECONDS = 240;
+        // 注意：必须大于内部耗时工具的自有超时（如整 jar 反编译 180s、ask_user_question 10 分钟），预留余量。
+        final int TOOL_TIMEOUT_SECONDS = 600;
         // params 在本方法内被重新赋值（解析/sanitize 分支），非 effectively final，lambda 需捕获快照
         final JsonObject finalParams = params;
         final Tool finalTool = tool;

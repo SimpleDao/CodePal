@@ -398,6 +398,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // 中途出错/被掐断时未收到，lastPromptTokens 还是上一轮旧值，不得用于本轮 chip。
     // volatile：在解析线程同步置位（见 onUsage），EDT 的 onComplete 收尾读取
     private volatile boolean usageReceivedThisRound = false;
+    /** 已回填真实 token_usage 的消息时间戳（重启回放/懒加载时防更早批次覆盖更新值） */
+    private volatile long lastUsageMsgTs = 0;
 
     // 「本轮发送给模型的完整上下文」快照：key=用户消息 DB id，value=JSON（system/history/userMessage/messageCount）。
     // 仅内存、不落库；重载会话后自然清空（悬浮查看时提示"未记录"，与桌面端一致）。
@@ -993,6 +995,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             lastCompletionTokens = 0;
             lastCacheHitTokens   = 0;
             lastCacheMissTokens  = 0;
+            lastUsageMsgTs       = 0;
             // 清空会话：上下文已清 → 真实快照一并失效删除（避免下次进入残留旧值）
             {
                 String clearedSid = chatSessionManager != null
@@ -1684,11 +1687,32 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
      *   用于 checkCompressionHint 的自动提示场景——那里已经问过「是否现在压缩？」，
      *   用户点是之后不该再弹第二个确认框（否则连问两遍）。
      */
+    /**
+     * 压缩预算的真实口径校准：
+     * TokenEstimator 是 DeepSeek 口径（中文 0.6/字），而实际模型的 tokenizer（如 xai/Grok
+     * 中文约 2+/字）可能相差 3~4 倍——按估算口径保留 20% 窗口，实际发送可能已超限
+     * （实例：圆环 90K，实际发送 328924 > 300000 → HTTP 400）。
+     * 校准系数 = 最近一次真实请求的 prompt_tokens / 当前消息估算值
+     * （prompt_tokens 含 system+tools，与估算口径略有差异——误差偏安全侧：压缩更狠）。
+     * 无真实 usage（重启且无会话快照/新会话）时系数=1，维持估算口径。
+     */
+    private long effectiveCompressLimit(long window) {
+        if (window <= 0) return window;
+        long est = estimateSessionTokens();
+        if (lastPromptTokens > 0 && est > 0) {
+            double cal = (double) lastPromptTokens / est;
+            cal = Math.max(0.1, Math.min(20.0, cal)); // 防异常值钳制
+            return Math.max(4096, (long) (window / cal));
+        }
+        return window;
+    }
+
     private void handleCompress(boolean skipConfirm) {
         if (streamRenderController != null && streamRenderController.isReceiving()) {
             Messages.showWarningDialog(project, "正在生成回复中，无法压缩。请等待生成完成后再试。", "压缩对话");
             return;
         }
+        long compressLimit = effectiveCompressLimit(contextCircle != null ? contextCircle.getMaxContextTokens() : 0L);
 
         // 上下文使用量低于阈值（默认 80%）时只给建议、不再硬拦截：
         // 把「建议」与「确认」合并成同一个确认框，用户点「继续压缩」即可照常压缩
@@ -1752,7 +1776,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                 }
                             }
                         ),
-                        limit,  // 上下文窗口大小，用于按 token 预算决定保留多少最近消息
+                        compressLimit,
                         // 压缩模型的 usage 也计入会话累计（按压缩模型自己的单价计费）
                         (m, u) -> com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater(
                             () -> accumulateModelUsage(m, u))
@@ -2158,6 +2182,26 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (!ApplicationManager.getApplication().isDispatchThread()) {
             ApplicationManager.getApplication().invokeLater(this::sendToApi);
             return;
+        }
+        // ★ 发送前预检（第二道防线）：按真实口径校准的上下文 + 输出预算 超过模型窗口时，
+        //   不发请求（API 必 400），改为明确报错引导压缩。
+        //   校准系数 = 最近一次真实请求的 prompt_tokens / 当前消息估算值
+        //  （TokenEstimator 是 DeepSeek 口径，xai/Grok 等模型 tokenizer 密度可差 3~4 倍）。
+        long window = contextCircle != null ? contextCircle.getMaxContextTokens() : 0L;
+        if (window > 0 && lastPromptTokens > 0) {
+            long est = estimateSessionTokens();
+            double cal = est > 0 ? (double) lastPromptTokens / est : 1.0;
+            long projected = (long) (est * cal);
+            if (projected + 8192 > window) {
+                String msg = "上下文已达模型上限（估算真实 " + formatTokenCount(projected)
+                        + " + 输出预算 ≈ 窗口 " + formatTokenCount(window)
+                        + "），本次不发送。请点击圆环压缩对话后重试。";
+                statusLabel.setText("上下文已满，请压缩");
+                System.err.println("[sendToApi] " + msg);
+                ApplicationManager.getApplication().invokeLater(() ->
+                        Messages.showWarningDialog(project, msg, "上下文已满"));
+                return;
+            }
         }
         // ★ 关键修复：切换会话后历史还在异步加载中，若此时直接发送，
         // conversationManager 里只有 system，模型会彻底失忆。
@@ -2970,7 +3014,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                                     writeStreamCardActive = false;
                                                     ApplicationManager.getApplication().invokeLater(() ->
                                                             chatWebView.finalizePendingToolCardHtml(
-                                                                    "<div style='margin-top:4px;opacity:0.8;font-size:11px;'>" + escapeHtml(fExecResult) + "</div>"));
+                                                                    "<div style='margin-top:4px;opacity:0.8;font-size:11px;'>" + escapeHtml(fExecResult) + "</div>",
+                                                                    fCardTitle));
                                                 } else {
                                                     ApplicationManager.getApplication().invokeLater(() ->
                                                             chatWebView.appendToolCard(fCardTitle, "completed", fExecResult));
@@ -5931,6 +5976,13 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             setOpaque(true);
             return this;
         }
+
+        /** 悬浮显示完整会话名：标题超宽被视觉截断时，hover 看全名 */
+        @Override
+        public String getToolTipText(java.awt.event.MouseEvent event) {
+            String t = titleLabel.getText();
+            return (t == null || t.isEmpty()) ? null : t;
+        }
     }
 
     private void saveSessionConfig() {
@@ -6006,6 +6058,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             renderMessageWithParts(entry.getKey(), entry.getValue());
         }
         chatWebView.commitHistoryBatch();
+        // 回放批次完成：真实上下文回填（最后一条带 token_usage 的消息）已就绪，刷新圆环与费用展示
+        refreshTokenStatsDisplay();
         // 加载完成：恢复状态栏（生成中不改，避免覆盖流式状态）
         if (statusLabel != null
                 && (streamRenderController == null || !streamRenderController.isReceiving())) {
@@ -6081,33 +6135,22 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /**
      * 从 DB 回填当前会话的用量状态并刷新展示：
-     * ① 按模型分组的会话累计（session_model_usage）→ sessionModelUsage；
-     * ② 「当前上下文」真实快照（session_context_snapshot）→ last* 四快照，
-     *    圆环跨重启/切会话保持精确值；无快照（老会话/新会话）则保持 0 → 回退估算。
-     * onActivateSession（会话激活）与 onHistoryLoaded（历史加载完成，覆盖启动时序）都会调用。
+     * 按模型分组的会话累计（session_model_usage）→ sessionModelUsage。
+     * 「当前上下文」的真实值**不再由快照表回填**——由历史回放循环从消息的
+     * token_usage（真实 usage）直接回填 last*（数据更完整：每条消息都有），
+     * 避免两路异步回填互相覆盖的竞态。onActivateSession 与 onHistoryLoaded 都会调用。
      */
     private void reloadSessionModelUsage() {
         final String sid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
         ThreadHelper.executeAsync(project, () -> {
             java.util.LinkedHashMap<String, com.codepal.model.ModelTokenUsage> loaded =
                     com.codepal.db.DBSessionUsageRepository.loadUsage(sid);
-            com.codepal.model.ChatResponse.Usage snap =
-                    com.codepal.db.DBSessionUsageRepository.loadContextSnapshot(sid);
             System.out.println("[UsageStats] 回填会话累计 sid=" + sid
                     + ", 模型数=" + (loaded != null ? loaded.size() : 0)
-                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : "")
-                    + ", 上下文快照=" + (snap != null
-                        ? snap.getPromptTokens() + "+" + snap.getCompletionTokens() : "无(估算)"));
+                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : ""));
             ApplicationManager.getApplication().invokeLater(() -> {
                 sessionModelUsage.clear();
                 if (loaded != null) sessionModelUsage.putAll(loaded);
-                // 回填真实上下文快照（无则保持 0 → usedContextTokens 回退估算）
-                if (snap != null) {
-                    lastPromptTokens     = snap.getPromptTokens();
-                    lastCompletionTokens = snap.getCompletionTokens();
-                    lastCacheHitTokens   = snap.getPromptCacheHitTokens();
-                    lastCacheMissTokens  = snap.getPromptCacheMissTokens();
-                }
                 refreshTokenStatsDisplay();
             });
         }, null);
@@ -6196,6 +6239,26 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // 与聊天同一套 DOM/样式，彻底消除历史/实时两套渲染漂移。整条仅 1 次 CEF 调用。
             String recordJson = buildReplayRecordJson(rec, parts);
             boolean hasTokenInfo = recordJson != null && recordJson.contains("tokenInfo");
+            // ★ 真实上下文回填（根本修复）：消息里存着每轮请求的真实 token_usage（input=output+缓存），
+            //   重启/切会话回放时**用真实数据回填 last* 快照**——替代估算与快照表回填。
+            //   回填后：圆环显示真实上下文占用；压缩预算校准（effectiveCompressLimit）自动生效；
+            //   发送前预检按真实口径拦截超限请求（此前 90K 估算 vs 实际 328924 的 400 事故根因）。
+            //   created_at 防护：懒加载的更早批次不得覆盖已回填的更新值（升序回放天然满足）。
+            if (rec.getTokenUsage() != null && !rec.getTokenUsage().isBlank()) {
+                try {
+                    com.google.gson.JsonObject tu = com.google.gson.JsonParser
+                            .parseString(rec.getTokenUsage()).getAsJsonObject();
+                    long in = tu.has("input") ? tu.get("input").getAsLong() : 0;
+                    long out = tu.has("output") ? tu.get("output").getAsLong() : 0;
+                    if (in > 0 && rec.getCreatedAt() >= lastUsageMsgTs) {
+                        lastPromptTokens = in;
+                        lastCompletionTokens = out;
+                        lastCacheHitTokens = tu.has("cacheHit") ? tu.get("cacheHit").getAsLong() : 0;
+                        lastCacheMissTokens = tu.has("cacheMiss") ? tu.get("cacheMiss").getAsLong() : 0;
+                        lastUsageMsgTs = rec.getCreatedAt();
+                    }
+                } catch (Exception ignored) {}
+            }
             System.out.println("[ChipReplay] msg=" + rec.getId()
                     + " tokenUsageLen=" + (rec.getTokenUsage() != null ? rec.getTokenUsage().length() : -1)
                     + " record含tokenInfo=" + hasTokenInfo

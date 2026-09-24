@@ -462,6 +462,13 @@ public final class ChatWebView {
         executeJs("finalizePendingToolCardHtml(" + escapeForJs(html) + ")");
     }
 
+    /** 完成 pending 工具卡片并纠正标题：流式期间的标题来自半截参数（如"写入 my"），
+     *  参数完整后用完整文件名覆盖。 */
+    public void finalizePendingToolCardHtml(String html, String title) {
+        executeJs("finalizePendingToolCardHtml(" + escapeForJs(html) + ","
+                + escapeForJs(title) + ")");
+    }
+
     /** 完成 pending 工具卡片，替换 body 整体 HTML（清掉「启动中...」占位），标记为已完成 */
     public void replacePendingToolCardBody(String html) {
         executeJs("replacePendingToolCardBody(" + escapeForJs(html) + ")");

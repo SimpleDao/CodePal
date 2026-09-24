@@ -134,10 +134,67 @@ public class CompressionManager {
 
         statusConsumer.accept("正在生成对话摘要（约需5-15秒）");
 
-        // 3. 调用 LLM 生成摘要（不降级，失败直接抛异常）
+        // ── 分块折叠（超窗口对话的压缩死锁解法）──
+        // 待压缩集（toCompress）的真实 token 可能已超模型窗口（如 880K 真实发给 300K 端点）——
+        // 压缩请求自身也会被端点拒绝（xai 网关返回 200+空 → "LLM 返回了空的摘要内容"，
+        // 会话死锁：不能发消息也不能压缩）。
+        // 解法：把 toCompress 分块，逐块摘要并以「前情摘要」衔接（保留时序），收敛进预算后
+        // 再走正常压缩流程。contextWindowTokens 已由调用方按真实口径校准（effectiveCompressLimit）。
+        long maxInputEst = (long) (contextWindowTokens * 0.5); // 估算口径的输入上限（真实约 0.5×窗口）
+        List<ChatMessage> work = new ArrayList<>(toCompress);
+        String carrySummary = null;
+        int foldRound = 0;
+        while (work.size() > 1 && sumTokens(work) > maxInputEst) {
+            foldRound++;
+            final int fr = foldRound;
+            // 从头部取一块（累积 ≤ maxInputEst/2，为摘要输出留余量）
+            List<ChatMessage> block = new ArrayList<>();
+            long acc = 0;
+            int cut = 0;
+            for (ChatMessage m : work) {
+                long t = estimateMessageTokens(m);
+                if (!block.isEmpty() && acc + t > maxInputEst / 2) break;
+                block.add(m);
+                acc += t;
+                cut++;
+            }
+            // 进度文案：优先显示正在压缩的对话轮次范围（如 第12~16 轮），qaRound 缺失时退化为批次号
+            int startRound = block.isEmpty() ? 0 : block.get(0).getQaRound();
+            int endRound = block.isEmpty() ? 0 : block.get(block.size() - 1).getQaRound();
+            statusConsumer.accept((startRound > 0 && endRound > 0)
+                    ? "正在压缩第 " + startRound + "~" + endRound + " 轮对话（第 " + fr + " 批）…"
+                    : "正在压缩对话（第 " + fr + " 批）…");
+            if (block.isEmpty()) {
+                // 单条消息超预算：复制并截断其内容（不污染原消息）
+                block.add(truncateMessageContent(work.get(0), maxInputEst / 2));
+                cut = 1;
+            }
+            String blockSummary;
+            try {
+                blockSummary = callLlmSummary(block, usageSink);
+            } catch (java.util.concurrent.CancellationException ce) {
+                throw ce; // 用户主动取消：原样上抛
+            } catch (Exception blockEx) {
+                throw new RuntimeException("第 " + fr + " 批摘要生成失败（"
+                        + block.get(0).getQaRound() + "~"
+                        + block.get(block.size() - 1).getQaRound() + " 轮）: "
+                        + blockEx.getMessage(), blockEx);
+            }
+            carrySummary = blockSummary;
+            List<ChatMessage> rest = new ArrayList<>(work.subList(cut, work.size()));
+            work = new ArrayList<>();
+            work.add(new ChatMessage("user", "[前情摘要（此前 " + cut + " 条对话的压缩）]\n" + blockSummary));
+            work.addAll(rest);
+            if (sumTokens(work) <= maxInputEst) break; // 已收敛进预算
+        }
+        if (foldRound > 0) {
+            statusConsumer.accept("分块压缩完成（" + foldRound + " 批），生成最终摘要");
+        }
+
+        // 3. 调用 LLM 生成摘要（不降级，失败直接抛异常）。work=折叠后的剩余对话（含前情摘要）
         String summary;
         try {
-            summary = callLlmSummary(toCompress, usageSink);
+            summary = callLlmSummary(work, usageSink);
         } catch (Exception e) {
             throw new RuntimeException("LLM 摘要生成失败: " + e.getMessage(), e);
         }
@@ -295,6 +352,21 @@ public class CompressionManager {
         long total = 0;
         for (ChatMessage m : msgs) total += estimateMessageTokens(m);
         return total;
+    }
+
+    /** 折叠用：复制消息并把文本内容截断（token 粗算转字符，偏保守），不修改原消息 */
+    private static ChatMessage truncateMessageContent(ChatMessage src, long maxTokens) {
+        int maxChars = (int) Math.max(1000, maxTokens); // token≈字符的保守截断
+        String c = src.getContent() != null && src.getContent().length() > maxChars
+                ? src.getContent().substring(0, maxChars) + "\n…(已截断)" : src.getContent();
+        ChatMessage copy = new ChatMessage(src.getRole(), c);
+        if (src.getReasoning_content() != null && src.getReasoning_content().length() > maxChars) {
+            copy.setReasoning_content(src.getReasoning_content().substring(0, maxChars) + "\n…(已截断)");
+        } else if (src.getReasoning_content() != null) {
+            copy.setReasoning_content(src.getReasoning_content());
+        }
+        if (src.getTool_calls() != null) copy.setTool_calls(src.getTool_calls());
+        return copy;
     }
 
     /** 用户是否请求取消当前压缩（压缩可能耗时数分钟，必须允许中止） */

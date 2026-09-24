@@ -1218,15 +1218,15 @@ public class ToolExecutor {
         boolean fileExists = targetFile.exists();
 
         // ★ 空内容保护（0 字节事故根治）：实证发现模型偶发传空 file_content（意图是"先声明创建
-        //   后续填充"或生成时放弃输出），旧实现如实覆盖 → 已有文件被清成 0 字节且返回"成功"。
-        //   空内容覆盖非空文件几乎必是事故——拒绝执行并把原因反馈给模型，模型会重试带完整内容
-        //  （DB 实证：同一文件第一次空、第二次重试即成功）。
-        if (content.isEmpty() && fileExists && targetFile.length() > 0) {
-            System.err.println("[write_file] 拒绝空内容覆盖: path=" + targetFile.getAbsolutePath()
-                    + " 原大小=" + targetFile.length());
-            return "错误：file_content 为空，已拒绝覆盖非空文件（原 " + targetFile.length()
-                    + " 字节）。这通常是参数遗漏——请重新调用并提供完整文件内容；"
-                    + "如你确实要清空该文件，请在提问中向用户说明后再执行。";
+        //   后续填充"或生成时放弃输出），旧实现如实覆盖 → 文件被清成 0 字节且返回"成功"。
+        //   前置条件 length()>0 的版本存在漏洞：**已被清成 0 字节的文件**再次空写入仍放行。
+        //   write_file 的语义就是"写入完整内容"——空内容一律拒绝；创建空文件应走 create_new_file。
+        if (content.isEmpty()) {
+            System.err.println("[write_file] 拒绝空内容写入: path=" + targetFile.getAbsolutePath()
+                    + (fileExists ? " 原大小=" + targetFile.length() : ""));
+            return "错误：file_content 为空，已拒绝执行。write_file 必须提供完整文件内容"
+                    + "（创建不带内容的空文件请使用 create_new_file）；"
+                    + "这通常是参数遗漏——请重新调用并提供完整内容。";
         }
 
         try {

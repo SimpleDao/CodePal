@@ -150,12 +150,14 @@ public class ChatSessionManager {
                 });
     }
 
-    /** 从用户输入派生一个简短标题：取首行、折叠空白、超长截断并加省略号 */
+    /** 从用户输入派生标题：取首行、折叠空白、超长截断并加省略号。
+     *  max=60：列表面板视觉截断照旧（窄），但 DB 保存 60 字符——
+     *  会话列表 hover tip 显示完整标题（旧实现 24 字符连 tip 里都是截断的）。 */
     private static String deriveTitle(String text) {
         if (text == null) return null;
         String clean = text.strip().replaceAll("\\s+", " ");
         if (clean.isEmpty()) return null;
-        final int max = 24;
+        final int max = 60;
         if (clean.length() > max) {
             clean = clean.substring(0, max).strip() + "…";
         }
