@@ -1276,7 +1276,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         ActionMap am = inputField.getActionMap();
         im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "sendMessage");
         am.put("sendMessage", new AbstractAction() {
-            @Override public void actionPerformed(ActionEvent e) { sendMessage(); }
+            @Override public void actionPerformed(ActionEvent e) {
+                // ★ @ 弹窗激活时 Enter 优先确认提及（键盘选库回车无效的修复），
+                //   仅鼠标点击能选中的原因：JBPopup 弹出后焦点仍在输入框，列表收不到键盘事件
+                if (mentionActive) { confirmMentionOnEnter(); return; }
+                sendMessage();
+            }
         });
         im.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, InputEvent.SHIFT_DOWN_MASK), "insert-break");
         // 右键弹出：仅「粘贴」
@@ -1355,6 +1360,30 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         escAm.put("codepal.hideMention", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent e) {
                 if (mentionActive) hideMentionPopup();
+            }
+        });
+        // ★ @ 弹窗激活时方向键移动列表选中项（跳过 header 行）；未激活时转发原默认行为
+        //   （JTextComponent 默认的 caret 上下移动），保证多行输入场景不受影响。
+        //   DOWN/UP 分开注册（共享 action 拿不到原始 KeyStroke，无法判方向）
+        KeyStroke downKs = KeyStroke.getKeyStroke(KeyEvent.VK_DOWN, 0);
+        KeyStroke upKs = KeyStroke.getKeyStroke(KeyEvent.VK_UP, 0);
+        // InputMap.get 返回绑定的 key 字符串（非 Action），需两跳经 ActionMap 取原 action
+        Object downCmd = escIm.get(downKs);
+        Object upCmd = escIm.get(upKs);
+        Action origDown = downCmd != null ? escAm.get(downCmd) : null;
+        Action origUp = upCmd != null ? escAm.get(upCmd) : null;
+        escIm.put(downKs, "codepal.mentionDown");
+        escAm.put("codepal.mentionDown", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                if (mentionActive) { moveMentionSelection(1); return; }
+                if (origDown != null) origDown.actionPerformed(e);
+            }
+        });
+        escIm.put(upKs, "codepal.mentionUp");
+        escAm.put("codepal.mentionUp", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                if (mentionActive) { moveMentionSelection(-1); return; }
+                if (origUp != null) origUp.actionPerformed(e);
             }
         });
 
@@ -1779,7 +1808,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         compressLimit,
                         // 压缩模型的 usage 也计入会话累计（按压缩模型自己的单价计费）
                         (m, u) -> com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater(
-                            () -> accumulateModelUsage(m, u))
+                            () -> accumulateModelUsage(m, u)),
+                        // ★ 压缩过程实时流（LLM 摘要输出、分批进度）→ 压缩卡片过程区
+                        text -> com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater(
+                            () -> chatWebView.appendCompressStream(text))
                     );
                 } catch (Exception e) {
                     System.err.println("[Compress] 异常: " + e.getMessage());
@@ -3336,6 +3368,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             String dirPath = args.has("dir_path") ? args.get("dir_path").getAsString() : null;
             String startLine = args.has("start_line") ? args.get("start_line").getAsString() : null;
             String endLine = args.has("end_line") ? args.get("end_line").getAsString() : null;
+            // ★ query_database 卡片标题显示实际执行的 SQL（此前无参数分支 → 只显示工具名，
+            //   用户不知道模型查了什么库/执行了什么 SQL）
+            if ("query_database".equals(name)) {
+                String sql = args.has("sql") ? args.get("sql").getAsString() : null;
+                String tableName = args.has("table_name") ? args.get("table_name").getAsString() : null;
+                String mode = args.has("mode") ? args.get("mode").getAsString() : null;
+                if (sql != null && !sql.isBlank()) {
+                    String shortSql = sql.replaceAll("\\s+", " ").trim();
+                    shortSql = shortSql.length() > 60 ? shortSql.substring(0, 60) + "..." : shortSql;
+                    return "SQL: " + shortSql;
+                }
+                if (tableName != null && !tableName.isBlank()) {
+                    return "查询表结构 " + tableName;
+                }
+                if (mode != null && !mode.isBlank()) {
+                    return "查询数据库（" + mode + "）";
+                }
+                return "查询数据库";
+            }
 
             if (filePath != null) {
                 String shortPath = filePath.contains("/") ? filePath.substring(filePath.lastIndexOf('/') + 1) : filePath;
@@ -3402,6 +3453,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             case "validate_code" -> "验证代码";
             case "search_agent" -> "搜索代码";
             case "create_directory" -> "创建目录";
+            case "query_database" -> "查询数据库";
             default -> toolName;
         };
     }
@@ -8608,6 +8660,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         mentionList.setBackground(new Color(0, 0, 0, 0));
         attachListHoverTracking(mentionList);
 
+        // ★ 键盘绑定（根因：popup builder setRequestFocus(true) 把焦点抢到 mentionList 上，
+        //   输入框的 InputMap 收不到键盘事件——Enter/ESC 必须绑在列表上才有效）：
+        //   Enter=确认选中项插入；Esc=关闭弹窗。↑↓ 用 JList 自带的行选择（Enter 的
+        //   confirmMentionOnEnter 已兜底处理选中落在 header/占位行的情况）。
+        javax.swing.InputMap lim = mentionList.getInputMap(JComponent.WHEN_FOCUSED);
+        javax.swing.ActionMap lam = mentionList.getActionMap();
+        lim.put(KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0), "codepal.confirmMention");
+        lam.put("codepal.confirmMention", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                confirmMentionOnEnter();
+            }
+        });
+        lim.put(KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), "codepal.hideMentionPopup");
+        lam.put("codepal.hideMentionPopup", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent e) {
+                hideMentionPopup();
+            }
+        });
+
         MouseAdapter click = new MouseAdapter() {
             @Override public void mouseClicked(MouseEvent e) {
                 int idx = mentionList.locationToIndex(e.getPoint());
@@ -8753,6 +8824,46 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (mentionPopup != null) mentionPopup.cancel();
         mentionActive = false;
         mentionStartPos = -1;
+    }
+
+    /** @ 弹窗激活时方向键移动选中项：跳过 header 行，循环滚动 */
+    private void moveMentionSelection(int dir) {
+        if (mentionList == null) return;
+        javax.swing.ListModel<MentionListItem> m = mentionList.getModel();
+        int size = m.getSize();
+        if (size == 0) return;
+        int idx = mentionList.getSelectedIndex();
+        for (int step = 0; step < size; step++) {
+            idx = (idx + dir + size) % size;
+            MentionListItem it = m.getElementAt(idx);
+            if (it != null && it.kind == MentionListItem.KIND_DATABASE) {
+                mentionList.setSelectedIndex(idx);
+                mentionList.ensureIndexIsVisible(idx);
+                return;
+            }
+        }
+    }
+
+    /** @ 弹窗激活时按 Enter：确认当前选中项（选中项无效则取第一个数据源行） */
+    private void confirmMentionOnEnter() {
+        if (mentionList == null) { sendMessage(); return; }
+        MentionListItem sel = mentionList.getSelectedValue();
+        if (sel != null && sel.kind == MentionListItem.KIND_DATABASE && sel.name != null
+                && !sel.name.startsWith("(")) { // "(暂无数据源…)" 占位行不可确认
+            insertMentionedDatabase(sel.name);
+            return;
+        }
+        // 选中项无效（header/占位）：找第一个真实数据源行；没有则回退发送
+        javax.swing.ListModel<MentionListItem> m = mentionList.getModel();
+        for (int i = 0; i < m.getSize(); i++) {
+            MentionListItem it = m.getElementAt(i);
+            if (it != null && it.kind == MentionListItem.KIND_DATABASE && it.name != null
+                    && !it.name.startsWith("(")) {
+                insertMentionedDatabase(it.name);
+                return;
+            }
+        }
+        sendMessage();
     }
 
     private void insertMentionedDatabase(String dbName) {
