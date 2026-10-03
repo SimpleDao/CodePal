@@ -341,6 +341,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // ★ 按工具 index 隔离的参数缓冲区，避免多个工具的参数片段互相污染
     //   （如 todo 的 "content" + write_file 的 "file_path" 混在同一 buffer 导致误判）
     private final java.util.Map<Integer, StringBuilder> streamWriteRawArgsByIndex = new java.util.HashMap<>();
+    // ★ 已建流式卡的工具 index 集合（finalize 按 idx 精确落回原卡，根治"编辑 my"遗弃卡——
+    //   旧实现 streamWriteCardIndex 单值只记最后一个，同回复多次编辑时前面的 pending 卡永久遗弃）
+    private final java.util.Set<Integer> streamWriteBuiltIdx = new java.util.HashSet<>();
     private int streamWriteShownLen = 0;             // 已铺进卡片的 file_content 字符数
     private String streamWriteTitle = "";            // 当前写入卡片标题（用于头部 +/− 统计定位）
     private int streamWriteRemovedLines = 0;         // 被覆盖文件的原有行数（create_new_file 为 0）
@@ -2254,6 +2257,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 重置流式写入可视化状态（每轮请求都是新的工具调用流）
         writeStreamCardActive = false;
         streamWriteCardIndex = -1;
+        streamWriteBuiltIdx.clear();
         streamWriteRawArgsByIndex.clear();
         streamWriteShownLen = 0;
         streamWriteTitle = "";
@@ -2487,7 +2491,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                         ? (isEdit ? "编辑文件…" : "写入文件…")
                                         : (isEdit ? "编辑 " + shortName : "写入 " + shortName);
                                 streamWriteTitle = title;
-                                sendWebView.appendToolCard(title, "pending");
+                                // ★ 带 idx 建卡：卡片挂 data-tool-idx，执行完成按 idx 精确落回原卡
+                                sendWebView.appendToolCardWithIdx(title, "pending", idx);
+                                streamWriteBuiltIdx.add(idx);
                                 sendWebView.updateWriteCardStats(title, 0, streamWriteIsEdit ? 0 : streamWriteRemovedLines);
                                 sendSrc.startAiStreamLoading(isEdit ? "file_editing" : "file_writing");
                             }
@@ -3040,12 +3046,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                                 final String fTcArgs = tc.getFunction() != null ? tc.getFunction().getArguments() : "{}";
                                                 final Integer fTcIndex = tc.getIndex();
 
-                                                // ── 真实流式写入：若 onToolArgsDelta 期间已为该工具建好 pending 卡片，
-                                                //    直接 finalize 翻 completed；否则（极快完成未赶上流式）这里补建 completed 卡片。──
-                                                if (fTcIndex != null && fTcIndex.equals(streamWriteCardIndex) && writeStreamCardActive) {
-                                                    writeStreamCardActive = false;
+                                                // ── 流式卡收尾：按工具 index 精确落回原 pending 卡（纠正半截标题+追加结果）；
+                                                //    该调用未建过流式卡（极快完成未赶上流式）则补建 completed 卡片。──
+                                                if (fTcIndex != null && streamWriteBuiltIdx.contains(fTcIndex)) {
+                                                    streamWriteBuiltIdx.remove(fTcIndex);
                                                     ApplicationManager.getApplication().invokeLater(() ->
-                                                            chatWebView.finalizePendingToolCardHtml(
+                                                            chatWebView.finalizePendingToolCardByIdx(fTcIndex,
                                                                     "<div style='margin-top:4px;opacity:0.8;font-size:11px;'>" + escapeHtml(fExecResult) + "</div>",
                                                                     fCardTitle));
                                                 } else {
@@ -3157,6 +3163,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             // 工具执行后无需全局刷新 VFS：FileOperationService 在每次写盘时已对
                             // 单个文件调用 refreshIoFiles 做精准同步，全局递归刷新整棵项目树会触发
                             // 大量 VFS 事件，导致整个 IDE 闪烁/卡顿，故移除。
+
+                            // ★ 轮次收尾：清理遗弃的流式 pending 卡（"编辑 my"空卡片根因）——
+                            //   同一回复多次 edit_file 时每次各建一张流式 pending 卡，但 finalize
+                            //   只救最后一张（streamWriteCardIndex 单值），前面的永久残留半截标题
+                            //  （如"编辑 my"）+空内容。工具轮次全部执行完，统一翻 completed。
+                            toolWebView.finalizeAllPendingToolCards();
 
                             // 重置（不建气泡，让后续 reasoning/content 自动建）
                             toolSrc.resetStream();
@@ -3671,14 +3683,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             if (q < 0) continue;
             StringBuilder sb = new StringBuilder();
             int j = q + 1;
+            boolean closed = false;
             while (j < raw.length()) {
                 char c = raw.charAt(j);
                 if (c == '\\') {
-                    if (j + 1 < raw.length()) { sb.append(raw.charAt(j + 1)); j += 2; } else break;
+                    if (j + 1 < raw.length()) { sb.append(raw.charAt(j + 1)); j += 2; } else return "";
                 } else if (c == '"') {
+                    closed = true;
                     break;
                 } else { sb.append(c); j++; }
             }
+            // ★ 值未闭合 = JSON 半成品（流式增量恰好在 file_path 值中间截断，如只收到 "my）。
+            //   返回空 → 建卡标题走"编辑文件…"占位，参数收全后 finalize 会用完整文件名覆盖标题。
+            //   旧实现把半截值当路径 → "编辑 my" 标题。
+            if (!closed) return "";
             return sb.toString();
         }
         return "";

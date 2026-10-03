@@ -210,7 +210,7 @@ public class ToolDefinitions {
         properties.put("file_path", createStringProp(
                 "要审查的文件路径，例如 src/main/java/com/example/UserService.java"));
         properties.put("mode", createEnumProp(
-                "审查模式：auto=自动（linter优先，没linter用LLM）、linter=仅linter快速检查、llm=仅LLM深度审查",
+                "审查模式：auto=自动（linter优先，没linter用LLM）、linter=仅linter快速检查、llm=仅LLM深度审查（消耗较多token，执行前会请求用户确认，请仅在linter无法满足时使用）",
                 Arrays.asList("auto", "linter", "llm")));
         properties.put("focus", createEnumProp(
                 "审查重点（llm模式有效）：all=全面审查、security=安全、performance=性能、bug=潜在Bug、style=代码风格、best-practice=最佳实践",

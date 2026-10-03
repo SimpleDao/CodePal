@@ -101,6 +101,21 @@ public class CompressionManager {
         long contextWindowTokens,
         java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink
     ) {
+        return compress(messages, conversationId, statusConsumer, contextWindowTokens, usageSink, null);
+    }
+
+    /**
+     * @param streamConsumer 实时过程流回调（LLM 摘要的流式输出、分批进度等逐段推送，
+     *                       由压缩卡片的过程区展示）；可为 null
+     */
+    public CompressionResult compress(
+        List<ChatMessage> messages,
+        String conversationId,
+        Consumer<String> statusConsumer,
+        long contextWindowTokens,
+        java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink,
+        java.util.function.Consumer<String> streamConsumer
+    ) {
         int oldCount = messages.size();
         lastUsage = null;
         lastUsageModelName = null;
@@ -132,7 +147,10 @@ public class CompressionManager {
             return new CompressionResult(false, "没有可压缩的消息", oldCount, oldCount);
         }
 
-        statusConsumer.accept("正在生成对话摘要（约需5-15秒）");
+        // ★ 规模预告：让用户知道这次压缩的工作量与预期耗时
+        long toCompressTokens = sumTokens(toCompress);
+        statusConsumer.accept("待压缩内容 " + toCompress.size() + " 条消息（约 "
+                + toCompressTokens + " tokens）");
 
         // ── 分块折叠（超窗口对话的压缩死锁解法）──
         // 待压缩集（toCompress）的真实 token 可能已超模型窗口（如 880K 真实发给 300K 端点）——
@@ -141,12 +159,15 @@ public class CompressionManager {
         // 解法：把 toCompress 分块，逐块摘要并以「前情摘要」衔接（保留时序），收敛进预算后
         // 再走正常压缩流程。contextWindowTokens 已由调用方按真实口径校准（effectiveCompressLimit）。
         long maxInputEst = (long) (contextWindowTokens * 0.5); // 估算口径的输入上限（真实约 0.5×窗口）
+        // 预估总批数（上界）：每批处理 maxInputEst/2 的原文量，待压缩总量除之即得；
+        // 首批摘要后 work 大幅收缩，实际批数只会少不会多 → 文案用"预计约"
+        final int estBatches = Math.max(1, (int) Math.ceil((double) toCompressTokens / (maxInputEst / 2)));
         List<ChatMessage> work = new ArrayList<>(toCompress);
-        String carrySummary = null;
         int foldRound = 0;
         while (work.size() > 1 && sumTokens(work) > maxInputEst) {
             foldRound++;
             final int fr = foldRound;
+            final long batchStartMs = System.currentTimeMillis();
             // 从头部取一块（累积 ≤ maxInputEst/2，为摘要输出留余量）
             List<ChatMessage> block = new ArrayList<>();
             long acc = 0;
@@ -158,20 +179,27 @@ public class CompressionManager {
                 acc += t;
                 cut++;
             }
-            // 进度文案：优先显示正在压缩的对话轮次范围（如 第12~16 轮），qaRound 缺失时退化为批次号
+            // 进度文案：优先显示正在压缩的对话轮次范围（如 第12~16 轮），qaRound 缺失时退化为批次号；
+            // 附预估总批数（上界——每批摘要后剩余量收缩，实际批数只会更少）
             int startRound = block.isEmpty() ? 0 : block.get(0).getQaRound();
             int endRound = block.isEmpty() ? 0 : block.get(block.size() - 1).getQaRound();
             statusConsumer.accept((startRound > 0 && endRound > 0)
-                    ? "正在压缩第 " + startRound + "~" + endRound + " 轮对话（第 " + fr + " 批）…"
-                    : "正在压缩对话（第 " + fr + " 批）…");
+                    ? "正在压缩第 " + startRound + "~" + endRound + " 轮对话（第 " + fr
+                        + " 批，预计约 " + estBatches + " 批）…"
+                    : "正在压缩对话（第 " + fr + " 批，预计约 " + estBatches + " 批）…");
             if (block.isEmpty()) {
                 // 单条消息超预算：复制并截断其内容（不污染原消息）
                 block.add(truncateMessageContent(work.get(0), maxInputEst / 2));
                 cut = 1;
             }
+            // ★ 批摘要的流式输出实时上屏（分隔线区分批次，附预估总批数）
+            if (streamConsumer != null) {
+                streamConsumer.accept("\n════ 第 " + fr + "/" + estBatches + " 批（第 " + startRound + "~" + endRound
+                        + " 轮对话）摘要 ════\n");
+            }
             String blockSummary;
             try {
-                blockSummary = callLlmSummary(block, usageSink);
+                blockSummary = callLlmSummary(block, usageSink, streamConsumer);
             } catch (java.util.concurrent.CancellationException ce) {
                 throw ce; // 用户主动取消：原样上抛
             } catch (Exception blockEx) {
@@ -180,7 +208,11 @@ public class CompressionManager {
                         + block.get(block.size() - 1).getQaRound() + " 轮）: "
                         + blockEx.getMessage(), blockEx);
             }
-            carrySummary = blockSummary;
+            // ★ 批完成即时报耗时：每批是一次完整 LLM 调用（数十秒），明确"动了"而不是卡住
+            statusConsumer.accept("第 " + fr + " 批摘要完成（耗时 "
+                    + (System.currentTimeMillis() - batchStartMs) / 1000 + " 秒）");
+
+
             List<ChatMessage> rest = new ArrayList<>(work.subList(cut, work.size()));
             work = new ArrayList<>();
             work.add(new ChatMessage("user", "[前情摘要（此前 " + cut + " 条对话的压缩）]\n" + blockSummary));
@@ -192,13 +224,16 @@ public class CompressionManager {
         }
 
         // 3. 调用 LLM 生成摘要（不降级，失败直接抛异常）。work=折叠后的剩余对话（含前情摘要）
+        // ★ streamConsumer 必须接入（此前漏接）：不分块场景（待压缩量未超窗口）只走这一次
+        //   最终摘要调用，streamConsumer=null 会导致全程无流式过程输出、卡片"直接成功"
         String summary;
         try {
-            summary = callLlmSummary(work, usageSink);
+            summary = callLlmSummary(work, usageSink, streamConsumer);
         } catch (Exception e) {
             throw new RuntimeException("LLM 摘要生成失败: " + e.getMessage(), e);
         }
         if (summary == null || summary.isBlank()) {
+            // 兜底（正常不会到达）：callLlmSummary 内已做带完整诊断的空摘要检查
             throw new RuntimeException("LLM 返回了空的摘要内容");
         }
         // 提取 <state_snapshot> 部分
@@ -394,6 +429,13 @@ public class CompressionManager {
      */
     private String callLlmSummary(List<ChatMessage> toCompress,
                                   java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink) throws Exception {
+        return callLlmSummary(toCompress, usageSink, null);
+    }
+
+    /** @param streamConsumer LLM 摘要的流式输出回调（逐 delta 推送），可为 null */
+    private String callLlmSummary(List<ChatMessage> toCompress,
+                                  java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink,
+                                  java.util.function.Consumer<String> streamConsumer) throws Exception {
         // 构建历史文本
         StringBuilder historyText = new StringBuilder();
         for (ChatMessage msg : toCompress) {
@@ -424,14 +466,27 @@ public class CompressionManager {
         currentCompressFuture = future;   // 注册，供 cancelCompress() 中断
         StringBuilder resultBuilder = new StringBuilder();
         AtomicReference<String> errorRef = new AtomicReference<>();
+        // ★ 空响应诊断计数器（空摘要异常携带现场，替代无信息的"LLM 返回了空的摘要内容"）：
+        //   deltaCount/contentLen=content 通道输出量；reasoningLen=思考通道输出量（端点把
+        //   摘要写进思考通道时 content 为空，此前完全无法与"端点空响应"区分）；
+        //   usageRef=是否收到 usage（收到则说明请求确实被端点处理）。
+        java.util.concurrent.atomic.AtomicInteger deltaCount = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicLong contentLen = new java.util.concurrent.atomic.AtomicLong();
+        java.util.concurrent.atomic.AtomicLong reasoningLen = new java.util.concurrent.atomic.AtomicLong();
+        AtomicReference<com.codepal.model.ChatResponse.Usage> usageRef = new AtomicReference<>();
 
         CPSettings settings = CPSettings.getInstance();
         ModelConfig compressModelCfg = settings.getCompressionOrChatModel(); // 优先已配置压缩模型，否则回退聊天模型
+        // 空摘要诊断的固定字段（模型名 + 输入规模），在空摘要异常中携带现场
+        final String diagModel = compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName();
+        final String diagInput = "输入消息 " + compressMessages.size() + " 条（history "
+                + historyText.length() + " 字符，估算约 " + historyText.length() / 3 + " tokens）";
         ChatRequest compressRequest = new ChatRequest();
         compressRequest.setModel(compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName());
         compressRequest.setMessages(compressMessages);
         compressRequest.setStream(true);
-        // 摘要输出通常 500-2000 token，设 8192 留足余量防止截断
+        // max_tokens 写死（用户定案：不随模型配置）——摘要输出通常 500-2000 token，
+        // 8192 留足余量防止截断
         compressRequest.setMax_tokens(8192);
         compressRequest.setTemperature(0.3);
         // 关闭深度思考：压缩是结构化总结任务，不需要思考链条，节省时间和 token
@@ -447,12 +502,18 @@ public class CompressionManager {
             public void onMessage(String content) {
                 if (content != null) {
                     resultBuilder.append(content);
+                    deltaCount.incrementAndGet();
+                    contentLen.addAndGet(content.length());
+                    // ★ 摘要流式输出实时上屏（压缩卡片过程区）
+                    if (streamConsumer != null) streamConsumer.accept(content);
                 }
             }
 
             @Override
             public void onReasoning(String reasoning) {
-                // 思考过程忽略，只收集最终内容
+                // 思考过程不进摘要，但记录输出量——content 空而 reasoning 非空时
+                // 可明确诊断"模型把摘要写进了思考通道"（端点/参数问题）
+                if (reasoning != null) reasoningLen.addAndGet(reasoning.length());
             }
 
             @Override
@@ -464,6 +525,7 @@ public class CompressionManager {
             public void onUsage(com.codepal.model.ChatResponse.Usage usage) {
                 // 记录本次压缩的消耗并回调（压缩模型计入会话累计，按其自身单价计费）
                 if (usage == null) return;
+                usageRef.set(usage);
                 lastUsage = usage;
                 String mName = compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName();
                 lastUsageModelName = mName;
@@ -483,8 +545,9 @@ public class CompressionManager {
             }
         });
 
+        String got;
         try {
-            return future.get(COMPRESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            got = future.get(COMPRESS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
             throw new RuntimeException("摘要生成超时（" + COMPRESS_TIMEOUT_SECONDS + "秒）", e);
         } catch (java.util.concurrent.CancellationException e) {
@@ -498,6 +561,30 @@ public class CompressionManager {
         } finally {
             currentCompressFuture = null;
         }
+        // ★ 空摘要诊断检查（在 try-catch 之外：诊断异常直接上抛，不被包装套前缀；
+        //   诊断计数器仍在此方法作用域）
+        if (got == null || got.isBlank()) {
+            String diag = "模型=" + diagModel + "，" + diagInput
+                    + "；端点返回：content 空流（" + deltaCount.get() + " 个 delta，共 "
+                    + contentLen.get() + " 字符），思考通道 " + reasoningLen.get() + " 字符"
+                    + (usageRef.get() != null
+                        ? "，usage 已收到（prompt " + usageRef.get().getPromptTokens()
+                          + " / completion " + usageRef.get().getCompletionTokens() + "）"
+                        : "，未收到 usage（请求可能未被端点真正处理）");
+            System.err.println("[Compress] 空摘要诊断: " + diag);
+            String hint;
+            if (reasoningLen.get() > 0 && contentLen.get() == 0) {
+                hint = "摘要被模型输出到了思考通道（reasoning 非空而 content 为空）——请检查该模型/端点是否支持关闭 thinking，或更换压缩模型";
+            } else if (usageRef.get() == null) {
+                hint = "端点未回传任何有效数据（usage 也没有）——疑似网关 200 空响应，请检查压缩模型端点";
+            } else if (usageRef.get().getCompletionTokens() == 0) {
+                hint = "端点报告 completion=0——请求被处理但未生成内容，可能被内容过滤或 max_tokens 拦截";
+            } else {
+                hint = "content 通道与思考通道均无输出但流正常结束——建议更换压缩模型或查看 idea.log 详细诊断";
+            }
+            throw new RuntimeException("LLM 返回了空的摘要内容（" + diag + "）。建议：" + hint);
+        }
+        return got;
     }
 
     /**

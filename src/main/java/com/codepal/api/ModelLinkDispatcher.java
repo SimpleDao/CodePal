@@ -45,7 +45,12 @@ public final class ModelLinkDispatcher {
                                   Relay relay) {
         if (model != null && ModelConfig.FORMAT_ANTHROPIC.equals(model.getApiFormat())) {
             AnthropicClient client = new AnthropicClient();
-            client.streamChat(messages, tools, new AnthropicClient.StreamCallback() {
+            // ★ 传入 model 配置（旁路模型配置生效的关键）：旧实现不传，AnthropicClient
+            //   内部硬取当前聊天模型 → 压缩等旁路的模型配置被完全无视。
+            //   thinking 开关一并透传（ChatRequest.thinking，enabled/disabled）。
+            client.streamChat(messages, tools, model,
+                    openaiRequest != null ? openaiRequest.getThinking() : null,
+                    new AnthropicClient.StreamCallback() {
                 @Override
                 public void onMessage(String content) { relay.onMessage(content); }
                 @Override
@@ -65,7 +70,12 @@ public final class ModelLinkDispatcher {
             });
         } else {
             DeepSeekClient client = new DeepSeekClient();
-            client.streamChat(openaiRequest, new DeepSeekClient.StreamCallback() {
+            // ★ 传入旁路模型自己的 base/key（与 anthropic 分支对称）：旧实现 DeepSeekClient
+            //   两参版本内部硬取当前聊天模型的端点与密钥——压缩模型换 URL 不生效
+            client.streamChat(openaiRequest,
+                    model != null ? model.getApiBase() : null,
+                    model != null ? model.getApiKey() : null,
+                    new DeepSeekClient.StreamCallback() {
                 @Override
                 public void onMessage(String content) { relay.onMessage(content); }
                 @Override

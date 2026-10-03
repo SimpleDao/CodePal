@@ -50,14 +50,36 @@ public class DeepSeekClient {
     }
 
     /**
-     * 发送流式聊天请求（支持工具调用）— 使用完整的 ChatRequest 对象
-     * 适用于需要自定义模型参数的场景（子智能体、压缩智能体等）
+     * 发送流式聊天请求（支持工具调用）— 使用完整的 ChatRequest 对象。
+     * ★ 主聊天链路使用：base/key 取当前聊天模型（历史行为保持）。
+     *   旁路链路（压缩等）请走四参重载显式传入 base/key——旧实现内部硬取
+     *   settings.getChatApiBase()/getChatApiKey()，压缩模型的地址与密钥被无视。
      */
     public void streamChat(ChatRequest request, StreamCallback callback) {
         CPSettings settings = CPSettings.getInstance();
-        if (!settings.isConfigured()) {
+        streamChat(request, settings.getChatApiBase(), settings.getChatApiKey(), callback);
+    }
+
+    /**
+     * 指定 base/key 的流式聊天请求（dispatcher 的 openai 分支用）。
+     * ★ 内部自动注入 stream_options.include_usage=true（标准 OpenAI/DeepSeek 协议：
+     *   流式默认不发 usage 帧——压缩费用展示/token 圆环的真实用量因此拿不到，
+     *   实测 xai 网关 finish_reason=stop 帧无 usage 字段即此原因）。
+     */
+    public void streamChat(ChatRequest request, String apiBase, String apiKey, StreamCallback callback) {
+        CPSettings settings = CPSettings.getInstance();
+        if ((apiKey == null || apiKey.isBlank()) && !settings.isConfigured()) {
             callback.onError(new IllegalStateException("请先配置 DeepSeek API Key（Settings -> CP）"));
             return;
+        }
+        if (apiKey == null || apiKey.isBlank()) apiKey = settings.getChatApiKey();
+        if (apiBase == null || apiBase.isBlank()) apiBase = settings.getChatApiBase();
+
+        // ★ 流式 usage 开关：标准协议必须显式请求，否则整条流不带 usage
+        if (request.isStream() && request.getStream_options() == null) {
+            java.util.Map<String, Object> so = new java.util.HashMap<>();
+            so.put("include_usage", true);
+            request.setStream_options(so);
         }
 
         String jsonBody = GSON.toJson(request);
@@ -70,7 +92,7 @@ public class DeepSeekClient {
         //     https://api.deepseek.com          → .../api.deepseek.com/v1/chat/completions
         //     .../v1                            → .../v1/chat/completions
         //     .../chat/completions              → 原样使用
-        String baseUrl = settings.getChatApiBase();
+        String baseUrl = apiBase;
         if (baseUrl == null || baseUrl.isBlank()) baseUrl = "https://api.deepseek.com";
         while (baseUrl.endsWith("/")) baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
         final String endpoint;
@@ -82,9 +104,10 @@ public class DeepSeekClient {
             endpoint = baseUrl + "/v1/chat/completions";           // 无版本段，补全默认 /v1 前缀
         }
         System.out.println("endpoint = \n"+endpoint);
+        final String fApiKey = apiKey;
         Request httpRequest = new Request.Builder()
                 .url(endpoint)
-                .header("Authorization", "Bearer " + settings.getChatApiKey())
+                .header("Authorization", "Bearer " + fApiKey)
                 .header("Content-Type", "application/json")
                 .post(body)
                 .build();
@@ -114,6 +137,16 @@ public class DeepSeekClient {
                 lastSseData = data; // 调试：记录最近一帧
                 try {
                     ChatResponse chatResponse = GSON.fromJson(data, ChatResponse.class);
+                    if (chatResponse != null && (chatResponse.getChoices() == null
+                            || chatResponse.getChoices().isEmpty())
+                            && chatResponse.getUsage() != null) {
+                        // ★ 独立 usage 帧（标准 OpenAI/DeepSeek 协议：stream_options.include_usage
+                        //   开启后，最后一个 chunk 的 choices 为空、只带 usage）——旧实现直接跳过，
+                        //   压缩费用/token 统计拿不到真实用量
+                        ChatResponse.Usage usage = resolveUsage(data, chatResponse.getUsage());
+                        if (usage != null) callback.onUsage(usage);
+                        return;
+                    }
                     if (chatResponse != null && chatResponse.getChoices() != null
                             && !chatResponse.getChoices().isEmpty()) {
                         ChatResponse.Choice choice = chatResponse.getChoices().get(0);

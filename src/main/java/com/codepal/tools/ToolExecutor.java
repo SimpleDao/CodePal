@@ -121,6 +121,11 @@ public class ToolExecutor {
         confirmProvider = provider;
     }
 
+    /** 供 CodeReviewer 等内部工具类复用应用内确认卡（聊天窗内嵌 HTML 确认框） */
+    public static ToolConfirmProvider getConfirmProvider() {
+        return confirmProvider;
+    }
+
     /** register ask-user-question provider (UI layer) */
     public static void setAskQuestionProvider(AskUserQuestionProvider provider) {
         askQuestionProvider = provider;

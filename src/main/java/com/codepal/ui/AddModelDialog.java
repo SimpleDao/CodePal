@@ -1445,13 +1445,43 @@ public class AddModelDialog extends JDialog {
 
     private void applyProviderDefaults(int idx) {
         if (idx < 0 || idx >= P_BASEURL.length) return;
-        if (editingConfig != null) return; // 编辑模式不覆盖
         if (visionMode) return; // 视觉子智能体模式：字段已由 prefillVision() 从已存配置预填，切换服务提供商不得重置用户已填内容
-        baseurlField.setText(P_BASEURL[idx]);
-        modelNameField.setText(P_MODEL[idx]);
-        maxContextField.setText(String.valueOf(P_MAXCTX[idx]));
-        maxOutputField.setText(String.valueOf(P_MAXOUT[idx]));
-        temperatureSlider.setValue((int) (P_TEMP[idx] * 100));
+        // ★ 智能预填（脏数据修复）：旧实现无差别覆盖 baseurl/模型名/上下文/输出/温度——
+        //   新增模式下用户填到一半切个 tab，已填内容被静默重置为预设值（apiKey 却保留），
+        //   没察觉就保存 → "预设值+用户 key"的混合配置跟随模型入库。
+        //   现在只有字段为空、或仍等于任一 provider 的预设值（= 用户没改过）才换成新预设；
+        //   用户已填/已改的字段一律保留。编辑模式同样生效（原配置值不属于预设时保留原值）。
+        baseurlField.setText(smartPrefill(baseurlField.getText(), P_BASEURL, idx));
+        modelNameField.setText(smartPrefill(modelNameField.getText(), P_MODEL, idx));
+        maxContextField.setText(smartPrefill(maxContextField.getText(),
+                java.util.Arrays.stream(P_MAXCTX).mapToObj(String::valueOf).toArray(String[]::new), idx));
+        maxOutputField.setText(smartPrefill(maxOutputField.getText(),
+                java.util.Arrays.stream(P_MAXOUT).mapToObj(String::valueOf).toArray(String[]::new), idx));
+        int curTemp = temperatureSlider.getValue();
+        boolean tempUntouched = false;
+        for (double t : P_TEMP) {
+            if (curTemp == (int) (t * 100)) { tempUntouched = true; break; }
+        }
+        if (temperatureSlider.getValue() == 0 || tempUntouched || curTemp == 70) {
+            temperatureSlider.setValue((int) (P_TEMP[idx] * 100));
+        }
+    }
+
+    /**
+     * 智能预填单字段：当前值为空、或等于任一 provider 预设值（含剥离后缀形态，= 用户没改过），
+     * 返回新预设；否则返回原值（用户已填/已改，不得覆盖）。
+     */
+    private String smartPrefill(String current, String[] presets, int idx) {
+        String cur = current == null ? "" : current.trim();
+        if (cur.isEmpty()) return presets[idx];
+        for (String p : presets) {
+            if (cur.equals(p)) return presets[idx];
+            // 剥离接口后缀后与预设基址同形（如 .../v1/chat/completions 与裸域名），也视为未改过
+            String bare = p;
+            int i = bare.indexOf("/", bare.indexOf("//") + 2);
+            if (i > 0 && cur.equals(bare.substring(0, i))) return presets[idx];
+        }
+        return cur;
     }
 
     private void onModeChanged() {

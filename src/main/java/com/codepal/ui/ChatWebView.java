@@ -419,6 +419,19 @@ public final class ChatWebView {
                 + escapeForJs(status != null ? status : "pending") + ")");
     }
 
+    /** 流式写入卡建卡（带工具调用 index）：finalize 时按 idx 精确落回原卡，
+     *  根治"编辑 my"遗弃卡（同回复多次编辑时 finalize 只救最后一张的问题） */
+    public void appendToolCardWithIdx(String name, String status, int toolIdx) {
+        executeJs("insertToolCard(" + escapeForJs(name) + ","
+                + escapeForJs(status != null ? status : "pending") + ",\"\",0," + toolIdx + ")");
+    }
+
+    /** 按工具调用 index 精确 finalize 流式卡（原卡不存在则新建 completed 卡，绝不写错卡） */
+    public void finalizePendingToolCardByIdx(int toolIdx, String html, String title) {
+        executeJs("finalizePendingToolCardByIdx(" + toolIdx + ","
+                + escapeForJs(html) + "," + escapeForJs(title) + ")");
+    }
+
     /** ACP 路径专用：带详情的工具卡片（点击可展开查看） */
     public void appendToolCard(String name, String status, String detail) {
         executeJs("insertToolCard(" + escapeForJs(name) + ","
@@ -469,6 +482,12 @@ public final class ChatWebView {
                 + escapeForJs(title) + ")");
     }
 
+    /** 工具轮次收尾：把所有仍处 pending 的工具卡翻成 completed（清理被后续卡"顶掉"的遗弃卡——
+     *  同一回复多次 edit_file 时，finalize 只救最后一张流式卡，前面的永久残留"编辑 my"+空内容） */
+    public void finalizeAllPendingToolCards() {
+        executeJs("finalizeAllPendingToolCards()");
+    }
+
     /** 完成 pending 工具卡片，替换 body 整体 HTML（清掉「启动中...」占位），标记为已完成 */
     public void replacePendingToolCardBody(String html) {
         executeJs("replacePendingToolCardBody(" + escapeForJs(html) + ")");
@@ -517,6 +536,12 @@ public final class ChatWebView {
     public void showAskUserQuestion(String questionId, String questionsJson) {
         String escapedJson = escapeForJs(questionsJson);
         executeJs("showAskUserQuestion(" + escapeForJs(questionId) + "," + escapedJson + ")");
+    }
+
+    /** 压缩过程实时流：向压缩卡片的过程区追加文本（LLM 摘要输出、分批进度等） */
+    public void appendCompressStream(String text) {
+        if (text == null || text.isEmpty()) return;
+        executeJs("appendCompressStream(" + escapeForJs(text) + ")");
     }
 
     /** 流式过程中实时渲染 Markdown：替换气泡 innerHTML 并保留光标 */

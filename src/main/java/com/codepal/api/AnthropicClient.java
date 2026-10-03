@@ -48,17 +48,37 @@ public class AnthropicClient {
                 .build();
     }
 
+    /** 主聊天链路：使用当前聊天模型（委托五参重载） */
     public void streamChat(List<ChatMessage> messages,
                            List<ChatRequest.ToolDefinition> tools,
                            StreamCallback callback) {
+        streamChat(messages, tools, CPSettings.getInstance().getCurrentChatModel(), null, callback);
+    }
+
+    /**
+     * 指定模型配置的流式调用。
+     * ★ 旁路链路（压缩 / SearchAgent / CodeReviewer）必须走此重载并传入各自的模型配置——
+     *   旧实现三参版本内部硬取 {@code settings.getCurrentChatModel()}，经 ModelLinkDispatcher
+     *   分发的旁路请求全部用成了当前聊天模型的 URL/Key（压缩模型改什么配置都不生效，
+     *   报错 URL 永远是聊天模型的），本次修复该缺陷。
+     *
+     * @param thinking 思考开关（来自 ChatRequest.thinking，type=enabled/disabled；null=不控制）。
+     *                 Anthropic 语义：{@code enabled} → 发 thinking 块（budget_tokens 自动取
+     *                 max_tokens 一半、温度强制 1.0——平台硬约束）；{@code disabled}/null →
+     *                 不发 thinking 字段（Anthropic 官方无 disabled 类型，不发即关闭）。
+     */
+    public void streamChat(List<ChatMessage> messages,
+                           List<ChatRequest.ToolDefinition> tools,
+                           ModelConfig model,
+                           java.util.Map<String, Object> thinking,
+                           StreamCallback callback) {
         CPSettings settings = CPSettings.getInstance();
-        ModelConfig model = settings.getCurrentChatModel();
-        if (model == null || model.getApiKey().trim().isEmpty()) {
-            callback.onError(new IllegalStateException("请先配置 Anthropic API Key（Settings -> CP）"));
+        if (model == null || model.getApiKey() == null || model.getApiKey().trim().isEmpty()) {
+            callback.onError(new IllegalStateException("请先配置模型与 API Key（该模型走 Anthropic 格式，需在模型配置里填写 Key）"));
             return;
         }
 
-        JsonObject body = buildRequestBody(messages, tools, model, settings);
+        JsonObject body = buildRequestBody(messages, tools, model, thinking, settings);
         RequestBody reqBody = RequestBody.create(GSON.toJson(body), JSON);
 
         String url = normalizeAnthropicUrl(model.getApiBase());
@@ -366,11 +386,29 @@ public class AnthropicClient {
     private JsonObject buildRequestBody(List<ChatMessage> messages,
                                         List<ChatRequest.ToolDefinition> tools,
                                         ModelConfig model,
+                                        java.util.Map<String, Object> thinking,
                                         CPSettings settings) {
         JsonObject body = new JsonObject();
         body.addProperty("model", model.getName());
         body.addProperty("max_tokens", Math.max(1, model.getMaxOutput()));
         double temp = model.getTemperature();
+        // ★ thinking 开关补齐（此前请求体里根本没有 thinking 字段——Anthropic 链路永远
+        //   无法关闭思考，端点默认开思考 → 思考输出吃满 max_tokens → content 空摘要）：
+        //   enabled → 发 thinking 块（budget_tokens 取 max_tokens 一半且 ≥1024；
+        //             Anthropic 硬约束：thinking 开启时 temperature 必须为 1.0）；
+        //   disabled/null → 不发字段（Anthropic 官方无 disabled 类型，缺省即关闭；
+        //             兼容网关默认行为不因此改变）。
+        boolean thinkingEnabled = thinking != null
+                && "enabled".equals(String.valueOf(thinking.get("type")));
+        if (thinkingEnabled) {
+            int maxOut = Math.max(1, model.getMaxOutput());
+            int budget = Math.max(1024, Math.min(maxOut / 2, 32768));
+            JsonObject th = new JsonObject();
+            th.addProperty("type", "enabled");
+            th.addProperty("budget_tokens", budget);
+            body.add("thinking", th);
+            temp = 1.0;
+        }
         body.addProperty("temperature", temp);
         // 请求流式响应（SSE）；部分代理忽略 stream 标志时仍返回单条 JSON，由解析层兼容
         body.addProperty("stream", true);

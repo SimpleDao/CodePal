@@ -1,6 +1,8 @@
 package com.codepal.tools;
 
+import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.ui.Messages;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.codepal.api.ModelLinkDispatcher;
 import com.codepal.linter.LinterRegistry;
@@ -75,6 +77,38 @@ public class CodeReviewer {
         }
 
         if (useLlm) {
+            // ★ LLM 深度审查消耗较多 token：执行前必须向用户确认。
+            //   确认走聊天窗内嵌确认卡（ToolConfirmProvider，与高危命令确认同一 UX），
+            //   而非 Swing 弹窗——保持应用内交互一致。
+            ToolExecutor.ToolConfirmProvider confirm = ToolExecutor.getConfirmProvider();
+            boolean approved;
+            String declineNote = "";
+            if (confirm == null) {
+                // 无 UI 上下文（如无确认卡的执行链）：宁缺勿错，不静默消耗
+                approved = false;
+                declineNote = "当前环境无确认通道，需用户在聊天窗内确认后方可执行 LLM 审查。";
+            } else {
+                String desc = "对 " + vf.getName() + " 执行 LLM 深度代码审查"
+                        + (useLinter ? "（Linter 已检查，无进一步发现，深度审查将消耗较多 token）" : "（消耗较多 token）");
+                try {
+                    approved = confirm.requestConfirm(
+                            java.util.UUID.randomUUID().toString(), desc, "warning", true, "command")
+                            .get(120, TimeUnit.SECONDS);
+                } catch (java.util.concurrent.CancellationException ce) {
+                    approved = false;
+                } catch (Exception e) {
+                    approved = false;
+                    declineNote = "（确认请求异常: " + e.getMessage() + "）";
+                }
+            }
+            if (!approved) {
+                result.append("ℹ️ 已按用户选择跳过 LLM 深度审查。");
+                if (!useLinter) {
+                    result.append("当前文件没有可用的 Linter 检查，如需审查请更换支持该文件类型的 Linter 或允许 LLM 审查。");
+                }
+                result.append(declineNote);
+                return result.toString().trim();
+            }
             String content = FileReaderUtil.readFileContent(vf);
             if (content != null) {
                 int totalLines = content.split("\n", -1).length;
@@ -119,6 +153,31 @@ public class CodeReviewer {
         StringBuilder result = new StringBuilder();
         result.append("📄 文件：").append(filePath).append("\n");
         result.append("📝 范围：第 ").append(start).append(" - ").append(end).append(" 行\n\n");
+
+        // ★ LLM 深度审查消耗较多 token：执行前必须向用户确认（与 reviewFile 一致，
+        //   走聊天窗内嵌确认卡）
+        ToolExecutor.ToolConfirmProvider confirm = ToolExecutor.getConfirmProvider();
+        boolean approved;
+        String declineNote = "";
+        if (confirm == null) {
+            approved = false;
+            declineNote = "当前环境无确认通道，需用户在聊天窗内确认后方可执行 LLM 审查。";
+        } else {
+            String desc = "对 " + vf.getName() + " 第 " + start + "~" + end
+                    + " 行执行 LLM 深度代码审查（消耗较多 token）";
+            try {
+                approved = confirm.requestConfirm(
+                        java.util.UUID.randomUUID().toString(), desc, "warning", true, "command")
+                        .get(120, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                approved = false;
+                declineNote = "（确认请求异常: " + e.getMessage() + "）";
+            }
+        }
+        if (!approved) {
+            result.append("ℹ️ 已按用户选择跳过 LLM 深度审查。").append(declineNote).append("\n");
+            return result.toString();
+        }
 
         String llmResult = doLlmReview(vf.getName(), code, start, end, focus);
         result.append("🤖 LLM 深度审查\n");

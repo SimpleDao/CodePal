@@ -22,6 +22,12 @@ public class ChatRequest {
 
     private Map<String,Object> thinking;
     private String reasoning_effort;
+    /**
+     * OpenAI/DeepSeek 流式 usage 开关：{"include_usage": true}。
+     * 标准协议下流式默认【不发】usage 帧（压缩费用/token 圆环因此拿不到真实用量），
+     * 必须显式开启；xai 等兼容网关对未知字段容忍（忽略或支持）。
+     */
+    private Map<String,Object> stream_options;
 
     public String getModel() { return model; }
     public void setModel(String model) { this.model = model; }
@@ -52,6 +58,9 @@ public class ChatRequest {
 
     public String getReasoning_effort() { return reasoning_effort; }
     public void setReasoning_effort(String reasoning_effort) { this.reasoning_effort = reasoning_effort; }
+
+    public Map<String, Object> getStream_options() { return stream_options; }
+    public void setStream_options(Map<String, Object> stream_options) { this.stream_options = stream_options; }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 内部类：工具定义

@@ -296,7 +296,7 @@ public final class ChatHtmlTemplate {
                 + ".tool-group.open .tool-group-body{display:block}"
                 + ".tool-group-body .tool-card{margin:0;padding:1px 0}"
                 // 压缩状态卡片（独立于对话流程的系统通知风格）
-                + ".compress-card{margin:4px 0;padding:10px 14px;"
+                + ".compress-card{margin:4px 0;padding:10px 14px;flex-wrap:wrap;"
                 + "border-radius:8px;border:1px solid " + (isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)") + ";"
                 + "background:" + (isDark ? "rgba(255,255,255,0.03)" : "rgba(0,0,0,0.02)") + ";"
                 + "display:flex;align-items:center;gap:9px;"
@@ -318,6 +318,10 @@ public final class ChatHtmlTemplate {
                 + ".compress-card.loading .compress-card-icon{animation:compressSpin 2.4s linear infinite}"
                 + ".compress-card.loading .compress-card-text::after{content:'...';display:inline-block;width:0ch;overflow:hidden;"
                 + "vertical-align:bottom;animation:compressDots 1.4s steps(3,end) infinite}"
+                // ── 压缩流式过程区（LLM 摘要实时输出）──
+                + ".compress-stream{width:100%;max-height:220px;overflow:auto;white-space:pre-wrap;word-break:break-all;"
+                + "font-family:JetBrains Mono,Consolas,monospace;font-size:11px;line-height:1.5;opacity:0.85;"
+                + "background:rgba(127,127,127,0.08);border-radius:6px;padding:8px 10px;margin-top:8px;}"
                 + "@keyframes compressFlow{0%{background-position:0% 50%}100%{background-position:200% 50%}}"
                 + "@keyframes compressSpin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}"
                 + "@keyframes compressDots{0%{width:0ch}100%{width:3ch}}"
@@ -618,9 +622,16 @@ public final class ChatHtmlTemplate {
                 + "lcCompressCardId='compress'+(++lcMsgCount);"
                 + "card.id=lcCompressCardId;"
                 + "card.innerHTML='<span class=\"compress-card-icon\">&#9881;</span>'"
-                + "+'<span class=\"compress-card-text\">'+esc(status)+'</span>';"
+                + "+'<span class=\"compress-card-text\">'+esc(status)+'</span>'"
+                + "+'<div class=\"compress-stream\"></div>';"
                 + "getChat().appendChild(card);scrollDown();"
                 + "}"
+                // 实时过程流：压缩的 LLM 摘要输出、分批进度等追加到此区（等宽、自动滚底）
+                + "function appendCompressStream(text){"
+                + "if(!lcCompressCardId||!text)return;"
+                + "var card=document.getElementById(lcCompressCardId);if(!card)return;"
+                + "var st=card.querySelector('.compress-stream');if(!st)return;"
+                + "st.textContent+=text;st.scrollTop=st.scrollHeight;}"
                 + "function _updateCompressCard(status,completed,failed){"
                 + "if(!lcCompressCardId)return;"
                 + "var card=document.getElementById(lcCompressCardId);"
@@ -1061,7 +1072,7 @@ public final class ChatHtmlTemplate {
                 + "lcToolGroup={active:false,cards:[],wrapped:false,groupEl:null,bodyEl:null,hdrLabel:null};}"
                 // ★ 读取类工具（read_file_range/view_file_outline）平铺展示：无折叠、无详情，仅标题卡片
                 + "function isFlatReadCard(name){return name==='读取'||/^(读取|查看大纲) /.test(name);}"
-                + "function insertToolCard(name,status,detail,nameHtml){"
+                + "function insertToolCard(name,status,detail,nameHtml,dataIdx){"
                 + "var label=status==='completed'?'已完成':(status||'pending');"
                 + "var flat=isFlatReadCard(name);"
                 + "if(status==='completed'){"
@@ -1072,6 +1083,8 @@ public final class ChatHtmlTemplate {
                 + "if(detail&&!flat)updateToolCardDetail(card,detail);delete lcPendingCards[k];if(!flat){linkifyFilePaths(card);linkifyTitleFiles(nm);}return;}}}}"
                 + "var d=el('div','tool-card');"
                 + "var cardId='tc-'+(++lcMsgCount);d.id=cardId;d.setAttribute('data-tname',name);"
+                // ★ data-tool-idx：流式写入卡与工具调用 index 关联，finalize 按 idx 精确落回原卡
+                + "if(dataIdx!==undefined&&dataIdx!==null)d.setAttribute('data-tool-idx',dataIdx);"
                 + "d.innerHTML='<div class=\"tool-card-hdr\">'"
                 + "+'<span class=\"tool-card-icon\">'+getToolIcon(name)+'</span>'"
                 + "+'<span class=\"tool-card-name\">'+(nameHtml===1?name:esc(name))+'</span>'"
@@ -1176,6 +1189,37 @@ public final class ChatHtmlTemplate {
                 + "var html='<span class=\"tc-add\">+'+added+'</span>';"
                 + "if(removed>0)html+='<span class=\"tc-del\">−'+removed+'</span>';"
                 + "sts.innerHTML=html;return;}}}"
+                // ★ 轮次收尾：把所有仍处 pending 的工具卡翻成 completed（遗弃卡清理）。
+                //   场景：同一回复多次 edit_file/write_file 时，onToolArgsDelta 为每次调用各建
+                //   一张流式 pending 卡，但 finalize 只救最后一张（streamWriteCardIndex 单值 +
+                //   _lastPendingCard 只找最后一张）——前面的卡永久残留"编辑 my"+空内容。
+                //   工具轮次全部执行完后统一收尾：状态翻已完成，保留已有标题/内容。
+                + "function finalizeAllPendingToolCards(){"
+                + "var cards=document.querySelectorAll('.tool-card.pending');"
+                + "for(var i=0;i<cards.length;i++){var c=cards[i];"
+                + "c.classList.add('completed');c.classList.remove('pending');"
+                + "var sts=c.querySelector('.tool-card-status');if(sts)sts.textContent='已完成';"
+                + "if(c.id&&lcPendingCards[c.id])delete lcPendingCards[c.id];}"
+                + "if(cards.length>0)scrollDown();"
+                + "}"
+                // ★ 按工具调用 index 精确 finalize 流式卡（根治"编辑 my"遗弃卡）：
+                //   遍历 pending 账本找 data-tool-idx 匹配的原卡 → 纠正标题+追加结果+翻已完成；
+                //   找不到原卡（极快完成未赶上流式/卡片已被轮次收尾）→ 直接新建 completed 卡，
+                //   绝不回退 _lastPendingCard（那会把结果写到错误的卡上）。
+                + "function finalizePendingToolCardByIdx(idx,html,newTitle){"
+                + "var keys=Object.keys(lcPendingCards);var card=null;"
+                + "for(var i=keys.length-1;i>=0;i--){var c=document.getElementById(keys[i]);"
+                + "if(c&&c.getAttribute&&c.getAttribute('data-tool-idx')==String(idx)){card=c;break;}}"
+                + "if(!card){insertToolCard(newTitle,'completed',html,0);return;}"
+                + "if(newTitle){var nm=card.querySelector('.tool-card-name');if(nm)nm.textContent=newTitle;}"
+                + "var body=card.querySelector('.tool-card-body');"
+                + "if(body)body.insertAdjacentHTML('beforeend',html);"
+                + "card.classList.add('completed');card.classList.remove('pending');"
+                + "var sts=card.querySelector('.tool-card-status');if(sts)sts.textContent='已完成';"
+                + "if(card.id&&lcPendingCards[card.id])delete lcPendingCards[card.id];"
+                + "if(body)lcFollowScroll(body);"
+                + "scrollDown();linkifyFilePaths(card);"
+                + "}"
                 + "function finalizePendingToolCardHtml(html,newTitle){"
                 + "var card=_lastPendingCard();if(!card)return;"
                 // ★ 流式期间标题来自半截参数（如 "写入 my"），finalize 时用完整参数名纠正

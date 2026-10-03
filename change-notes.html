@@ -1,3 +1,15 @@
+<h3>2.2.29</h3>
+<ul>
+  <li>修复编辑工具偶发"编辑 my"空卡片：流式建卡时标题来自半截参数（文件在 mydocs/ 下时分词边界恰切在 my|docs），现半截值走"编辑文件…"占位，执行结果按工具 index 精确落回原卡并纠正为完整文件名——重复卡/遗弃卡同时根治</li>
+  <li>压缩失败给出完整诊断：LLM 返回空摘要时携带模型名、输入规模、content/思考通道输出量、usage 到达情况，并按现场给出针对性建议</li>
+  <li>压缩过程流式输出修复：不分块场景最终摘要也实时上屏；分批进度显示预估总批数</li>
+  <li>旁路模型配置参数化：压缩/搜索/代码审查等使用的 URL、Key、模型名、思考开关完整生效（旧实现 Anthropic/OpenAI 两链路均硬取当前聊天模型，压缩模型改配置不生效）</li>
+  <li>OpenAI 流式 usage 开启：压缩费用展示与 token 圆环在标准协议端点下拿到真实用量（此前流式默认不发 usage 帧）</li>
+  <li>Anthropic 链路支持 thinking 开关（enabled 自动设 budget_tokens 与温度约束；disabled 不发字段）</li>
+  <li>query_database 工具卡片标题直接显示执行的 SQL / 表名</li>
+  <li>code_review 的 LLM 深度审查确认改用聊天窗内嵌确认卡（不再弹 Swing 对话框）</li>
+  <li>模型配置对话框切换"兼容 OpenAI / 兼容 Anthropic"时已填内容不再被预设值静默覆盖（智能预填）</li>
+</ul>
 <h3>2.2.28</h3>
 <ul>
   <li>@ 数据源弹窗支持键盘操作：↑↓ 选择、Enter 确认插入、Esc 关闭（此前 Enter 无效，只能鼠标点击）</li>
