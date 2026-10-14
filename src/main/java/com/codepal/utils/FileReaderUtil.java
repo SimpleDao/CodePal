@@ -281,6 +281,7 @@ public class FileReaderUtil {
              final java.util.Map<String, List<String>> byFile = new java.util.LinkedHashMap<>();
              final java.util.List<String> nameHits = new java.util.ArrayList<>();
              int[] found = {0};
+             final int[] walked = {0}; // ★ 遍历文件计数（0 命中复现时的决定性观测：区分 walk 空转 vs 匹配问题）
 
              // 深度不限制（Files.walk 惰性流 + limit 提前终止 + 跳过目录/二进制/超大文件过滤可控开销）
              try (Stream<Path> walk = Files.walk(root)) {
@@ -288,6 +289,7 @@ public class FileReaderUtil {
                      .filter(p -> !isUnderSkippedDir(p))
                      .filter(p -> filePat == null || filePat.matcher(p.toString().replace('\\', '/')).find())
                      .forEach(p -> {
+                         walked[0]++;
                          // ★ 文件名匹配收集（与内容匹配并行，上限 20 条；内容命中满 limit 后仍继续收集）
                          if (nameHits.size() < 20 && p.getFileName() != null
                                  && p.getFileName().toString().toLowerCase().contains(kwLower)) {
@@ -310,6 +312,12 @@ public class FileReaderUtil {
         } catch (IOException | RuntimeException e) {
             LOG.warn("searchGrepInPath failed for " + root, e);
         }
+        // ★ 决定性观测（"明明存在却搜不到"的复现定位）：root/遍历数/命中数/文件名命中数。
+        //   walked=0 → walk 根本没遍历到文件（根/权限/中断问题）；
+        //   walked 正常但 byFile=0 → 遍历到了但匹配失败（编码/关键词/过滤问题）。
+        System.out.println("[searchGrep] root=" + root + " walked=" + walked[0]
+                + " byFile=" + byFile.size() + " nameHits=" + nameHits.size()
+                + " keyword=" + keyword + " filePattern=" + filePattern);
 
         if (byFile.isEmpty()) {
             // ★ 内容无命中但文件名命中：按文档标题找文件的场景，直接返回文件清单

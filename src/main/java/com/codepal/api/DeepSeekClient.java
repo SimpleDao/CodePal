@@ -229,7 +229,41 @@ public class DeepSeekClient {
                 // ★ 根因修复：仅当真正累积到工具调用时才回调 onToolCalls。
                 // 之前 finish_reason="tool_calls" 但 accumulatedToolCalls 为空时也会回调空列表，
                 // 导致上层创建 content=null 且无 tool_calls 的非法 assistant 消息，污染后续每次请求。
+                // ★ 大参数诊断：write_file 空内容事故定位用——逐调用打印累积 arguments 长度。
+                //   若 8KB 内容丢失，此处 argsLen 会异常小（≈file_path 长度）→ 模型/网关输出端问题；
+                //   若 argsLen 正常（8000+）但执行时 file_content 为空 → 插件解析/修复环节 bug。
                 if (!accumulatedToolCalls.isEmpty()) {
+                    for (ChatMessage.ToolCall t : accumulatedToolCalls) {
+                        if (t.getFunction() != null) {
+                            String args = t.getFunction().getArguments();
+                            System.out.println("[SSE] tool_call 累积诊断: name=" + t.getFunction().getName()
+                                    + " argsLen=" + (args == null ? -1 : args.length())
+                                    + " finishReason=" + finishReason);
+                        }
+                    }
+                }
+                if (!accumulatedToolCalls.isEmpty()) {
+                    // ★ length 截断防御（MalformedJsonException: Unterminated string 根因）：
+                    //   工具参数（如 write_file 的 file_content）生成到 max_tokens 上限被硬截断——
+                    //   JSON 在字符串值中间戛然而止（无闭合引号/括号），旧实现照常回调 →
+                    //   上层 Gson 解析抛 MalformedJsonException。现在拦截并给出自救指引，
+                    //   绝不把残缺 JSON 传下去。
+                    if ("length".equals(finishReason)) {
+                        int totalArgsLen = 0;
+                        for (ChatMessage.ToolCall t : accumulatedToolCalls) {
+                            if (t.getFunction() != null && t.getFunction().getArguments() != null) {
+                                totalArgsLen += t.getFunction().getArguments().length();
+                            }
+                        }
+                        LOG.warn("tool_calls 因 max_tokens 截断: finishReason=length, argsLen=" + totalArgsLen);
+                        callback.onError(new RuntimeException(
+                                "工具调用参数因达到模型「最大输出 token」上限被截断（finish_reason=length，"
+                                        + "已生成约 " + totalArgsLen + " 字符，JSON 不完整）。解决办法："
+                                        + "①调大该模型配置中的「最大输出」数值后重试；"
+                                        + "②或将任务拆小：分段写入（先写一部分，再用 edit_file 分次追加），"
+                                        + "避免单次工具调用携带超大内容。"));
+                        return;
+                    }
                     callback.onToolCalls(accumulatedToolCalls);
                 } else if ("tool_calls".equals(finishReason)) {
                     // 模型声明要调用工具却没解析出任何调用（流式分片异常），按正常完成处理，避免产出非法消息

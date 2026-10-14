@@ -1194,6 +1194,24 @@ public final class ChatHtmlTemplate {
                 //   一张流式 pending 卡，但 finalize 只救最后一张（streamWriteCardIndex 单值 +
                 //   _lastPendingCard 只找最后一张）——前面的卡永久残留"编辑 my"+空内容。
                 //   工具轮次全部执行完后统一收尾：状态翻已完成，保留已有标题/内容。
+                // ★ 移除空的加载占位 frame（纯 tool_calls 轮收尾）：startAiStreamLoading 的
+                //   ensureAiFrame 建了头像+轮播，若该轮模型只回工具调用（无正文/思考），
+                //   aiStreamStarted=false → onToolCalls 收尾跳过 → 空 frame 残留成孤立头像。
+                //   保留含工具卡/写入卡/文本的 frame（那些是有内容的正常形态）。
+                + "function removeEmptyLoadingFrame(){"
+                + "if(!lcStreamingMsgId)return;"
+                + "var w=document.getElementById(lcStreamingMsgId);if(!w)return;"
+                + "var bw=w.querySelector('.bubble-wrap');"
+                + "var hasCards=w.querySelector('.tool-card')||w.querySelector('.tool-group');"
+                // ★ 只在真的删除了空 frame 时才清流式锚点——有内容（工具组/思考/正文）的 frame
+                //   必须保留 lcStreamingMsgId（它是跨工具轮的锚点：多轮 Craft 循环的工具卡/思考
+                //   都插进同一个气泡）。无条件清锚点会让每个工具轮都新建空 frame = 大量孤立头像。
+                + "if(bw&&!bw.textContent.trim()&&!hasCards){"
+                + "w.remove();"
+                + "lcStreamingMsgId=null;lcCurrentBubbleId=null;lcCurrentRsnId=null;"
+                + "clearStatusTimer();"
+                + "}"
+                + "}"
                 + "function finalizeAllPendingToolCards(){"
                 + "var cards=document.querySelectorAll('.tool-card.pending');"
                 + "for(var i=0;i<cards.length;i++){var c=cards[i];"

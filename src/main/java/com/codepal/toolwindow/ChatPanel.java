@@ -985,6 +985,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     public void clearChat() {
         ApplicationManager.getApplication().invokeLater(() -> {
+            // ★ 清空前 IDEA 确认框：清空动作会立即重置上下文与界面，误触代价高
+            int choice = Messages.showOkCancelDialog(project,
+                    "确定清空当前对话？\n\n当前上下文与界面将被清空，模型将不再记得本轮之前的对话内容。\n"
+                            + "（会话历史仍保留在数据库中，切换会话后重新进入可恢复）",
+                    "清空对话", "清空", "取消", Messages.getQuestionIcon());
+            if (choice != Messages.OK) return;
             if (chatWebView != null) chatWebView.clearMessages();
             todoManager.clear();
             taskDiffTabPanel.clearTodos();
@@ -2451,6 +2457,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         // 真实流式写入可视化：边收边把已生成的 file_content 铺进工具卡片。
                         // 此回调来自 OkHttp 网络线程，所有 Swing 操作必须切 EDT。
                         if (deltaArgs == null || deltaArgs.isEmpty()) return;
+                        // ★ 工具参数流也是真实进展（write_file 的 8KB 内容由模型逐 token 生成，
+                        //   可能持续 17s+）——不喂狗会被看门狗误判"无进展"报"可能连接已断开"
+                        sendSrc.petWatchdog();
                         final int idx = index;
                         final String delta = deltaArgs;
                         ApplicationManager.getApplication().invokeLater(() -> {
@@ -2559,6 +2568,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                     if (sendSrc.isAiStreamStarted()) {
                                         sendSrc.cancelPendingRenderAndBump();
                                         sendWebView.sealStream(false);
+                                    } else {
+                                        // ★ 纯 tool_calls 轮：加载占位 frame（头像+轮播）无人消费 → 清理
+                                        sendWebView.removeEmptyLoadingFrame();
                                     }
                                 }
                                 sendSrc.setReceiving(false);
@@ -2579,6 +2591,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             } else if (sendSrc.isAiStreamStarted()) {
                                 sendSrc.cancelPendingRenderAndBump();
                                 sendWebView.sealStream(false);
+                            } else {
+                                // ★ 纯 tool_calls 轮：加载占位 frame（头像+轮播）无人消费 → 清理，
+                                //   消除"会话末尾孤立 L 头像"（frame 含工具卡/写入卡时保留不动）
+                                sendWebView.removeEmptyLoadingFrame();
                             }
 
                             // 不在此创建气泡——工具卡片是独立元素，后续推理/正文到达时自动创建
@@ -3293,6 +3309,30 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             // ★ 修复：出错轮此前漏挂/漏存 token chip。usage 已到达（如 finish_reason=length 帧自带）
                             //   则正常挂上；流中途网络断开未收到 usage 时由 usageReceivedThisRound 守卫跳过（防挂上一轮旧值）
                             attachAndPersistTokenInfo(errMsgId, sendWebView);
+                            // ★ 系统消息模式（截断场景专项）：把截断原因作为 assistant 系统消息
+                            //   写进上下文+落库——模型下一轮能看到失败原因并自我纠正（分段写入/
+                            //   调小单次写入量），用户也能在界面看到原因，而不是对着一个空错误气泡茫然。
+                            String errMsgText = error.getMessage() == null ? "" : error.getMessage();
+                            if (errMsgText.contains("最大输出 token") || errMsgText.contains("被截断")) {
+                                String sysNote = "[系统提示] 你上一轮的工具调用参数因达到模型「最大输出 token」上限被截断"
+                                        + "（JSON 不完整），该次调用未执行，目标文件未被修改。"
+                                        + "请改用分段策略：先 write_file 写入内容的前半部分，再用 edit_file 分次追加剩余部分；"
+                                        + "或减小单次工具调用的内容量。";
+                                ChatMessage noteMsg = new ChatMessage("assistant", sysNote);
+                                sendConvMgr.add(noteMsg);
+                                String noteId = DBChatHistoryRepository.getUUID();
+                                ChatMessageEntity noteEntity = new ChatMessageEntity();
+                                noteEntity.setId(noteId);
+                                noteEntity.setSessionId(sendSessionId);
+                                noteEntity.setRole(Constant.ROLE_assistant);
+                                noteEntity.setQaRound(chatSessionManager.getCurrentQaRound());
+                                noteEntity.setCreatedAt(System.currentTimeMillis());
+                                noteEntity.setUpdatedAt(System.currentTimeMillis());
+                                java.util.List<com.codepal.model.MessagePartEntity> noteParts = new java.util.ArrayList<>();
+                                noteParts.add(com.codepal.model.MessagePartEntity.text(
+                                        noteId, sendSessionId, sysNote, 0));
+                                chatSessionManager.persistMessageWithParts(noteEntity, noteParts);
+                            }
                             sendSrc.finalizeAiMessage(CARD_BG());
                             clearStreamRefs();
                             // 流结束：执行被延迟的会话切换
@@ -5594,7 +5634,41 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         deleteAllBtn.addActionListener(e -> deleteAllSessions());
         toolbar.add(deleteAllBtn, BorderLayout.EAST);
 
-        panel.add(toolbar, BorderLayout.NORTH);
+        // ── 搜索行（按会话标题过滤，实时）──
+        JBPanel<?> north = new JBPanel<>(new BorderLayout());
+        north.setOpaque(false);
+        north.add(toolbar, BorderLayout.NORTH);
+
+        historySearchField = new com.intellij.ui.SearchTextField(false); // false=不启用搜索历史下拉
+        historySearchField.getTextEditor().getEmptyText().setText("搜索历史对话");
+        // ★ 暗黑主题可见性：SearchTextField 默认样式在自定义背景上会"消失"（框线/文字不可辨）。
+        //   显式设置背景/前景/线框——与面板其它控件（返回按钮的 dividerColor 线框）同一套确定性样式
+        historySearchField.getTextEditor().setBackground(UIUtil.getPanelBackground());
+        historySearchField.getTextEditor().setForeground(JBColor.foreground());
+        historySearchField.getTextEditor().setCaretColor(JBColor.foreground());
+        historySearchField.getTextEditor().setBorder(JBUI.Borders.empty(4, 8));
+        historySearchField.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(dividerColor(), 1),
+                JBUI.Borders.empty(4, 6)));
+        // ★ 用标准 Swing DocumentListener（挂在文本框 Document 上）——平台 com.intellij.ui.DocumentListener
+        //   在 2023.2 的包位置与常见写法不符，Swing 标准监听跨版本稳定
+        historySearchField.getTextEditor().getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            @Override
+            public void insertUpdate(javax.swing.event.DocumentEvent e) {
+                applyHistoryFilter(historySearchField.getText());
+            }
+            @Override
+            public void removeUpdate(javax.swing.event.DocumentEvent e) {
+                applyHistoryFilter(historySearchField.getText());
+            }
+            @Override
+            public void changedUpdate(javax.swing.event.DocumentEvent e) {
+                applyHistoryFilter(historySearchField.getText());
+            }
+        });
+        north.add(historySearchField, BorderLayout.CENTER);
+
+        panel.add(north, BorderLayout.NORTH);
 
         // ── 会话列表 ──
         historyListModel = new DefaultListModel<>();
@@ -5961,26 +6035,48 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
     }
 
+    /** 历史面板搜索框（按会话标题实时过滤） */
+    private com.intellij.ui.SearchTextField historySearchField;
+    /** 历史会话全量缓存：搜索过滤只动列表模型，不动这个缓存（清空/重查时刷新） */
+    private final java.util.List<ChatSessionEntity> allHistorySessions = new java.util.ArrayList<>();
+
     private void refreshHistoryList() {
         historyListModel.clear();
         historyListModel.addElement(new HistoryItem(null, "加载中...", ""));
         ThreadHelper.executeAsync(project,
                 () -> DBChatHistoryRepository.listSessions(project.getBasePath()),
                 (sessions) -> {
-                    System.out.println("sessions = " + sessions);
-                    historyListModel.clear();
-                    if (sessions.isEmpty()) {
-                        historyListModel.addElement(new HistoryItem(null, "暂无历史会话", ""));
-                        return;
-                    }
-                    java.text.SimpleDateFormat df = new java.text.SimpleDateFormat("MM-dd HH:mm");
-                    for (ChatSessionEntity s : sessions) {
-                        String title = s.getName() != null && !s.getName().isEmpty() ? s.getName() : "未命名会话";
-                        String time = s.getCreatedAt() > 0 ? df.format(s.getCreatedAt()) : "";
-                        String info = s.getChatMessageCount() + " 轮对话  ·  " + time;
-                        historyListModel.addElement(new HistoryItem(s, title, info));
-                    }
+                    allHistorySessions.clear();
+                    if (sessions != null) allHistorySessions.addAll(sessions);
+                    String q = historySearchField != null ? historySearchField.getText() : "";
+                    applyHistoryFilter(q);
                 });
+    }
+
+    /**
+     * 按标题过滤历史会话列表（大小写不敏感包含匹配）。
+     * 搜索词为空时展示全量；无匹配时给出占位提示。
+     */
+    private void applyHistoryFilter(String query) {
+        String q = query == null ? "" : query.trim().toLowerCase();
+        historyListModel.clear();
+        if (allHistorySessions.isEmpty()) {
+            historyListModel.addElement(new HistoryItem(null, "暂无历史会话", ""));
+            return;
+        }
+        java.text.SimpleDateFormat df = new java.text.SimpleDateFormat("MM-dd HH:mm");
+        int shown = 0;
+        for (ChatSessionEntity s : allHistorySessions) {
+            String title = s.getName() != null && !s.getName().isEmpty() ? s.getName() : "未命名会话";
+            if (!q.isEmpty() && !title.toLowerCase().contains(q)) continue;
+            String time = s.getCreatedAt() > 0 ? df.format(s.getCreatedAt()) : "";
+            String info = s.getChatMessageCount() + " 轮对话  ·  " + time;
+            historyListModel.addElement(new HistoryItem(s, title, info));
+            shown++;
+        }
+        if (shown == 0) {
+            historyListModel.addElement(new HistoryItem(null, "无匹配的会话（关键词：“" + query.trim() + "”）", ""));
+        }
     }
 
     private void deleteHistorySession(ChatSessionEntity session) {
@@ -6901,7 +6997,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         boolean hasToolCalls = toolCallsJson != null && !toolCallsJson.isEmpty();
         boolean hasContent = content != null && !content.isEmpty();
         boolean hasReasoning = reasoningContent != null && !reasoningContent.isEmpty();
-        if (hasContent || hasToolCalls || hasReasoning) {
+        // ★ 纯 tool_calls 轮（无正文无思考）不建头像气泡（孤立 L 头像根因）：
+        //   Craft 工具循环里模型某轮只回 tool_calls（无 reasoning/text）时，旧实现
+        //   startAiStream（建头像）+ 立即 sealStream（封口）→ 会话末尾冒出空头像。
+        //   该轮的 tool 结果卡由 role=tool 行独立渲染，不依赖这个气泡。
+        boolean pureToolCalls = hasToolCalls && !hasContent && !hasReasoning;
+        if (hasContent || hasReasoning || !pureToolCalls) {
             chatWebView.startAiStream();
         }
         if (hasReasoning) {
@@ -6926,7 +7027,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             chatWebView.finalizeAiMessage(bodyHtml, content);
         } else if (hasToolCalls || hasReasoning) {
             streamRenderController.cancelPendingRenderAndBump();
-            chatWebView.sealStream();
+            if (!pureToolCalls) chatWebView.sealStream(); // 有思考折叠的气泡正常封口；纯 tool_calls 无气泡可封
         }
     }
 

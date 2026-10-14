@@ -488,6 +488,12 @@ public final class ChatWebView {
         executeJs("finalizeAllPendingToolCards()");
     }
 
+    /** 纯 tool_calls 轮收尾：移除空的加载占位 frame（头像+轮播，无任何内容/工具卡）——
+     *  消除"会话末尾孤立 L 头像"。含工具卡/写入卡/文本的 frame 保留不动。 */
+    public void removeEmptyLoadingFrame() {
+        executeJs("removeEmptyLoadingFrame()");
+    }
+
     /** 完成 pending 工具卡片，替换 body 整体 HTML（清掉「启动中...」占位），标记为已完成 */
     public void replacePendingToolCardBody(String html) {
         executeJs("replacePendingToolCardBody(" + escapeForJs(html) + ")");
