@@ -2104,7 +2104,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 新会话入库后刷新历史面板，让新会话出现在历史列表中
         refreshHistoryList();
         chatSessionManager.incrementQaRound(); // 新一问开始
-        ChatMessage userMsg = new ChatMessage("user", sendText);
+        // ★ 发送时间注入（仅进模型上下文）：模型获得每条用户消息的精确时间锚点
+        //   （"昨天说的那个"可定位）。UI 气泡/text part 保持原文不显示（时间戳气泡尾部已有）。
+        //   回显场景由 buildChatMessagesFromParts 从 DB created_at 重建同等尾巴，全程一致。
+        String sentTimeMark = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
+        ChatMessage userMsg = new ChatMessage("user", sendText + "\n[发送时间：" + sentTimeMark + "]");
         userMsg.setQaRound(chatSessionManager.getCurrentQaRound());
         if (!toSend.isEmpty()) {
             userMsg.setAttachments(toSend);

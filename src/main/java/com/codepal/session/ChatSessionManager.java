@@ -701,6 +701,14 @@ public class ChatSessionManager {
             // 兜底：若没有任何 text part（持久化异常等），content 保持 null 会让 API 400，
             // 这里设为空串，至少保证消息结构合法（内容缺失由持久化层负责）。
             if (msg.getContent() == null) msg.setContent("");
+            // ★ 发送时间注入（与实时发送的尾巴格式一致）：历史消息从 DB created_at 重建
+            //   时间锚点——重启/切会话后发给模型的历史消息同样带时间，时间线不断档。
+            //   UI 渲染走 parts 原文（renderMessageWithParts），不受影响。
+            if (rec.getCreatedAt() > 0) {
+                String ts = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm")
+                        .format(new java.util.Date(rec.getCreatedAt()));
+                msg.setContent(msg.getContent() + "\n[发送时间：" + ts + "]");
+            }
         } else if (Constant.ROLE_assistant.equals(rec.getRole())) {
             List<ChatMessage.ToolCall> toolCalls = new ArrayList<>();
             List<ChatMessage> toolResultMessages = new ArrayList<>();
