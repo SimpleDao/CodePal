@@ -2238,7 +2238,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             long est = estimateSessionTokens();
             double cal = est > 0 ? (double) lastPromptTokens / est : 1.0;
             long projected = (long) (est * cal);
-            if (projected + 8192 > window) {
+            if (projected + 8192 > window
+                    // ★ 直判追加（真实事故 10/16：估算 41% 但端点报 prompt_tokens=839790）——
+                    //   上下文只增不减，**上次真实 prompt 已吃满窗口**时必然再超，无论估算怎么算
+                    || (lastPromptTokens > 0 && lastPromptTokens + 8192 + 4096 > window)) {
                 String msg = "上下文已达模型上限（估算真实 " + formatTokenCount(projected)
                         + " + 输出预算 ≈ 窗口 " + formatTokenCount(window)
                         + "），本次不发送。请点击圆环压缩对话后重试。";
@@ -2353,6 +2356,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         final ChatWebView sendWebView = chatWebView;
         final StreamRenderController sendSrc = streamRenderController;
         final ConversationManager sendConvMgr = conversationManager;
+        // ★ 多标签隔离：捕获发起时 UI 下拉选中的模型配置——base/key/模型名/格式全以此为准。
+        //   旧实现 DeepSeekClient/AnthropicClient 内部硬取全局"当前聊天模型"，
+        //   多标签切换会互相覆盖 → 模型名/格式/地址拼接错乱（anthropic 格式 + deepseek 地址 → 404）。
+        final com.codepal.model.ModelConfig sendModelCfg;
+        {
+            Object selObj = modelCombo != null ? modelCombo.getSelectedItem() : null;
+            com.codepal.model.ModelConfig cfg = null;
+            if (selObj instanceof ModelComboItem && ((ModelComboItem) selObj).id != null) {
+                cfg = CPSettings.getInstance().findChatModelById(((ModelComboItem) selObj).id);
+            }
+            sendModelCfg = cfg;
+        }
 
         // ★ 后台线程：streamChat 全部异步（streamChat 内部 OkHttp enqueue）
         ApplicationManager.getApplication().executeOnPooledThread(() -> {
@@ -2362,8 +2377,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             // 防止后台准备期间用户取消了请求
             if (!sendSrc.isCurrentGeneration(myGen)) return;
 
-            com.codepal.agent.AgentBackend backend = agentBackendManager.getCurrentBackend();
-            backend.streamChat(historySnapshot, finalAllTools,
+            // ★ 后端选择与 base/key 同源：按发起时捕获的模型配置选链路并透传
+            com.codepal.agent.AgentBackend backend = agentBackendManager.getBackendForModel(sendModelCfg);
+            backend.streamChat(historySnapshot, finalAllTools, sendModelCfg,
                     createStreamCallback(myGen, sendSessionId, sendWebView, sendSrc, sendConvMgr));
         });
         // ★ 立即显示 AI 加载气泡（根据上一轮工具类型选择轮播提示词）
@@ -2573,10 +2589,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                     if (sendSrc.isAiStreamStarted()) {
                                         sendSrc.cancelPendingRenderAndBump();
                                         sendWebView.sealStream(false);
-                                    } else {
-                                        // ★ 纯 tool_calls 轮：加载占位 frame（头像+轮播）无人消费 → 清理
-                                        sendWebView.removeEmptyLoadingFrame();
                                     }
+                                    // ★ 空加载占位 frame 的清理已移至回合最终结束（onComplete）——
+                                    //   此处删除会抢在确认卡/结果卡落位之前，导致卡片裸奔在消息流尾部
                                 }
                                 sendSrc.setReceiving(false);
                                 restoreSendButton();
@@ -2596,11 +2611,12 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             } else if (sendSrc.isAiStreamStarted()) {
                                 sendSrc.cancelPendingRenderAndBump();
                                 sendWebView.sealStream(false);
-                            } else {
-                                // ★ 纯 tool_calls 轮：加载占位 frame（头像+轮播）无人消费 → 清理，
-                                //   消除"会话末尾孤立 L 头像"（frame 含工具卡/写入卡时保留不动）
-                                sendWebView.removeEmptyLoadingFrame();
                             }
+                            // ★ 空加载占位 frame 的清理移至回合最终结束（onComplete）——
+                            //   此处（onToolCalls）删除会抢在确认卡/结果卡落位之前（"执行 xx 命令"裸奔尾部）
+                            // ★ 每轮工具循环结束重估上下文并刷新圆环：工具结果持续累积进上下文
+                            //  （真实事故：圆环显示 41% 但端点实际收到 280%，用户毫无感知直到 400）
+                            refreshTokenStatsDisplay();
 
                             // 不在此创建气泡——工具卡片是独立元素，后续推理/正文到达时自动创建
 
@@ -3255,6 +3271,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                             //   （finalizeAiMessage 还要读 currentAiRawText 来渲染最终 HTML）。
                             sendSrc.finalizeAiMessage(CARD_BG());
                             clearStreamRefs();
+                            // ★ 纯 tool_calls 轮的空加载占位 frame 兜底清理（时机在回合最终完成——
+                            //   确认卡/结果卡已全部落位，只剩真空的 frame；只在 bubble-wrap 无文本
+                            //   且无工具卡时移除，正文 frame 安全）
+                            sendWebView.removeEmptyLoadingFrame();
 
                             // 输出完毕兜底刷新圆环：
                             // 口径与 updateTokenStats 统一——实时上下文 + 按模型分组的会话累计费用
@@ -4357,8 +4377,17 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 更新上下文进度圈：圆环本体 = 当前上下文用量（实时）
         if (contextCircle != null) {
             contextCircle.setTokens(usedContext);
+            // ★ 未载入历史提示：DB 全量消息（含懒加载窗口外的更早对话）估算显著大于
+            //   当前圆环值时，tooltip 追加警示——滚动加载历史会把这些消息重新纳入上下文，
+            //   用户应知晓"发送的上下文会随滚动增长"
+            String unloadedHint = "";
+            if (lastDbFullEstimate > usedContext + 4096) {
+                unloadedHint = String.format(
+                        "<br><small>⚠ 另有未载入的历史约 %s tokens（滚动查看历史会纳入上下文）</small>",
+                        formatTokenCount(lastDbFullEstimate));
+            }
             String circleTooltip = String.format(
-                "<html>当前上下文：%s / %s（%.0f%%）<br>"
+                "<html>当前上下文：%s / %s（%.0f%%）%s<br>"
                     + "当前 tokens：%s（缓存命中率 %s）<br>"
                     + "当前费用：%s（%s）<br><br>"
                     + "<b>会话累计（按模型）</b><br>%s<br><br>"
@@ -4366,6 +4395,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 formatTokenCount(usedContext),
                 formatTokenCount(contextCircle.getMaxContextTokens()),
                 usedContext * 100.0 / Math.max(1, contextCircle.getMaxContextTokens()),
+                unloadedHint,
                 formatTokenCount(curInput + lastCompletionTokens),
                 hitRateStr,
                 currentCost, model != null ? model : "—",
@@ -6042,6 +6072,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /** 历史面板搜索框（按会话标题实时过滤） */
     private com.intellij.ui.SearchTextField historySearchField;
+    /** DB 全量消息的上下文估算（含懒加载窗口外的未载入历史）——仅用于圆环 tooltip 提示，
+     *  不参与预检判断（预检校验的是实际将发送的窗口内容，两者口径不同） */
+    private long lastDbFullEstimate = 0;
     /** 历史会话全量缓存：搜索过滤只动列表模型，不动这个缓存（清空/重查时刷新） */
     private final java.util.List<ChatSessionEntity> allHistorySessions = new java.util.ArrayList<>();
 
@@ -6316,12 +6349,30 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         ThreadHelper.executeAsync(project, () -> {
             java.util.LinkedHashMap<String, com.codepal.model.ModelTokenUsage> loaded =
                     com.codepal.db.DBSessionUsageRepository.loadUsage(sid);
+            // ★ 上下文水位回填 = 快照 usage（重启前最后一次成功请求的真实值）——
+            //   语义即"上次关闭前最后一次给模型的上下文大小"，正是回显该显示的值。
+            //   ★ DB 全量估算（estimateContextTokensFromDb）【不】灌入 last*——那是"数据库
+            //   全量消息"的水位，而重启后实际发送的是懒加载窗口（最近 500 条）——两者口径
+            //   不同；把全量值灌进 last* 会让预检直判误拦窗口内本可发送的请求
+            //  （10/16 事故）。全量值改存 lastDbFullEstimate，仅用于圆环 tooltip 提示。
+            com.codepal.model.ChatResponse.Usage snap =
+                    com.codepal.db.DBSessionUsageRepository.loadContextSnapshot(sid);
+            long dbEst = com.codepal.db.DBSessionUsageRepository.estimateContextTokensFromDb(sid);
+            long snapTotal = snap != null ? snap.getPromptTokens() + snap.getCompletionTokens() : 0;
+            lastDbFullEstimate = dbEst;
             System.out.println("[UsageStats] 回填会话累计 sid=" + sid
                     + ", 模型数=" + (loaded != null ? loaded.size() : 0)
-                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : ""));
+                    + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : "")
+                    + ", 上下文快照=" + snapTotal + " db全量估算=" + dbEst);
             ApplicationManager.getApplication().invokeLater(() -> {
                 sessionModelUsage.clear();
                 if (loaded != null) sessionModelUsage.putAll(loaded);
+                if (snap != null && snapTotal > 0) {
+                    lastPromptTokens = snap.getPromptTokens();
+                    lastCompletionTokens = snap.getCompletionTokens();
+                    lastCacheHitTokens = snap.getPromptCacheHitTokens();
+                    lastCacheMissTokens = snap.getPromptCacheMissTokens();
+                }
                 refreshTokenStatsDisplay();
             });
         }, null);

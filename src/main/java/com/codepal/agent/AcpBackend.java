@@ -46,8 +46,10 @@ public class AcpBackend implements AgentBackend {
     public CompletableFuture<Void> streamChat(
             List<ChatMessage> messages,
             List<ChatRequest.ToolDefinition> tools,
+            com.codepal.model.ModelConfig model,
             StreamCallback callback
     ) {
+        // model 参数忽略：ACP 后端由 Claude Code 进程自身的配置决定模型，不走插件模型配置
         CompletableFuture<Void> future = new CompletableFuture<>();
 
         try {

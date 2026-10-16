@@ -286,13 +286,14 @@ public class ChatSessionManager {
         conversationManager.getMessages().clear();
         if (systemMsg != null) conversationManager.getMessages().add(systemMsg);
 
-        // 首屏：读入 CONTEXT_ROWS 行进模型上下文（模型记忆/压缩摘要都不缩水），
-        // 但 UI 只展示末尾 DISPLAY_ENTRIES 条（展示与上下文解耦）。
+        // 首屏：★ 全量读入（上下文精确恢复到关闭前的状态——用户需求：重启后发消息
+        // 是在最后上下文基础上累积，而不是缩水到 500 条窗口）。UI 只展示末尾
+        // DISPLAY_ENTRIES 条（展示与上下文解耦），向上滚动只做 UI 渲染（消息已在上下文）。
         // ★ 查询不过滤压缩消息：聊天记录全量可见；conversationManager 侧按 meta 跳过已压缩消息。
         ThreadHelper.executeAsync(project,
                 () -> {
                     try {
-                        return DBChatHistoryRepository.getSessionPage(sessionId, CONTEXT_ROWS, 0);
+                        return DBChatHistoryRepository.getSessionPage(sessionId, FULL_LOAD_ROWS, 0);
                     } catch (Exception e) {
                         // 同 loadMoreHistory：dbTask 抛异常时 uiTask 回调不会执行，isLoadingHistory 永久 true
                         System.err.println("[HistoryLoad] 首屏查询异常: " + e);
@@ -311,7 +312,8 @@ public class ChatSessionManager {
                         loadedEntries.clear();
                         loadedEntries.putAll(result);
                         loadedRows = page.dbRowCount;
-                        dbMaybeMore = page.dbRowCount >= CONTEXT_ROWS;
+                        // ★ 全量加载后：DB 行数 < 请求行数 → 永不再触发懒加载（滚动只渲染内存条目）
+                        dbMaybeMore = page.dbRowCount >= FULL_LOAD_ROWS;
                         displayedCount = 0;
                         System.out.println("[HistoryLoad] 首屏预载 " + loadedEntries.size()
                                 + " 条（DB 行 " + loadedRows + "），展示 "
@@ -425,8 +427,10 @@ public class ChatSessionManager {
         }
     }
 
-    /** 上下文预载行数：打开会话时读入模型上下文的规模（与"展示条数"解耦，保证模型记忆不缩水） */
-    private static final int CONTEXT_ROWS = 500;
+    /** ★ 会话加载行数：全量读入（上下文精确恢复到关闭前状态；含压缩摘要，压缩消息由
+     *  buildChatMessagesFromParts 过滤）。旧值 500 = 懒加载窗口，重启后上下文缩水、
+     *  滚动查看历史又会把早期消息塞回上下文（不可控膨胀）——已废弃该模式。 */
+    private static final int FULL_LOAD_ROWS = 1_000_000;
     /** 默认展示的最大条数（条 = 一条用户消息 或 一轮完整模型回复） */
     private static final int DISPLAY_ENTRIES = 20;
     /** 每次向上滚动展示的条数 */
@@ -640,31 +644,15 @@ public class ChatSessionManager {
     // ── Parts → ChatMessage 转换（用于 conversationManager 内存恢复） ──
 
     /**
-     * 将更早批次的历史记录构建成 ChatMessage，插入到 conversationManager 中
-     * system 之后、现有消息之前（保持时间正序）。
+     * ★ 已废弃上下文注入（10/16）：懒加载改为纯 UI 渲染。
+     * 旧实现把更早批次的消息 addAll 进 conversationManager（模型上下文）——
+     * 导致"滚动查看历史"悄悄撑大上下文（用户不可控的膨胀，83.9 万 token 事故的推手）。
+     * 现在会话加载即全量恢复上下文（FULL_LOAD_ROWS），懒加载只补 UI 展示。
+     * 保留方法壳以兼容调用点（UI 渲染分页不变），上下文注入逻辑移除。
      */
     private void insertHistoryBeforeExisting(
             Map<ChatMessageEntity, List<MessagePartEntity>> earlierRecords) {
-        if (earlierRecords == null || earlierRecords.isEmpty()) return;
-
-        List<ChatMessage> newMsgs = new ArrayList<>();
-        for (Map.Entry<ChatMessageEntity, List<MessagePartEntity>> entry : earlierRecords.entrySet()) {
-            List<ChatMessage> built = buildChatMessagesFromParts(entry.getKey(), entry.getValue());
-            if (built != null && !built.isEmpty()) {
-                newMsgs.addAll(built);
-            }
-        }
-        if (newMsgs.isEmpty()) return;
-
-        synchronized (conversationManager.getMessages()) {
-            List<ChatMessage> all = conversationManager.getMessages();
-            // 找到 system 之后（第一条非 system）的插入位置
-            int insertIdx = 0;
-            while (insertIdx < all.size() && "system".equals(all.get(insertIdx).getRole())) {
-                insertIdx++;
-            }
-            all.addAll(insertIdx, newMsgs);
-        }
+        // 纯 UI 渲染：消息已在上下文中（全量恢复），此处不再注入
     }
 
     public static List<ChatMessage> buildChatMessagesFromParts(ChatMessageEntity rec, List<MessagePartEntity> parts) {

@@ -1296,6 +1296,11 @@ public final class ChatHtmlTemplate {
                 + "+trustHtml;"
                 + "var target=lcTarget();"
                 + "var ts=null;"
+                // ★ 锚点重建：纯 tool_calls 轮收尾会清掉空 frame 与 lcStreamingMsgId（removeEmptyLoadingFrame），
+                //   确认卡此时弹出若直接 appendChild 会裸奔在消息流最末尾（用户报的"总在模型消息最后面"）。
+                //   重建 AI frame（头像+容器）后插入——确认卡与其它工具卡同为头像包裹的结构。
+                //   确认/拒绝后 frame 内有确认卡与命令结果卡，不会退化为孤立头像。
+                + "if(!lcStreamingMsgId)ensureAiFrame();"
                 + "if(lcStreamingMsgId){"
                 + "var w=document.getElementById(lcStreamingMsgId);"
                 + "if(w){var bw=w.querySelector('.bubble-wrap');if(bw){target=bw;ts=bw.querySelector('.ts');}}}"
