@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.codepal"
-version = "2.3.2"
+version = "2.3.3"
 
 repositories {
     maven { url = uri("https://maven.aliyun.com/repository/public") }

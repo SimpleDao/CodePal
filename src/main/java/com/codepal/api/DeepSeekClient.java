@@ -305,14 +305,30 @@ public class DeepSeekClient {
     public void streamChat(List<ChatMessage> messages,
                            List<ChatRequest.ToolDefinition> tools,
                            StreamCallback callback) {
+        // ★ 委托按模型配置的版本（单源取值）：base/key/model 名/输出上限全部来自
+        //   getCurrentChatModel()——消除"模型名取 A、base 取 B"的多源拼接可能
+        streamChat(messages, tools, CPSettings.getInstance().getCurrentChatModel(), callback);
+    }
+
+    /**
+     * ★ 按指定模型配置发送流式聊天请求（主聊天参数化）：
+     * 模型名/最大输出/温度/base/key 全部来自传入的 model 配置——
+     * 多标签/会话切换时不再依赖全局"当前聊天模型"状态，互不干扰。
+     * model 为 null 时回退 getCurrentChatModel()（兼容）。
+     */
+    public void streamChat(List<ChatMessage> messages,
+                           List<ChatRequest.ToolDefinition> tools,
+                           com.codepal.model.ModelConfig model,
+                           StreamCallback callback) {
         CPSettings settings = CPSettings.getInstance();
+        if (model == null) model = settings.getCurrentChatModel();
 
         ChatRequest request = new ChatRequest();
-        request.setModel(settings.getChatModelName());
+        request.setModel(model.getName());
         request.setMessages(messages);
         request.setStream(true);
-        request.setMax_tokens(settings.getChatMaxOutput());
-        request.setTemperature(settings.getChatTemperature());
+        request.setMax_tokens(model.getMaxOutput() > 0 ? model.getMaxOutput() : settings.getChatMaxOutput());
+        request.setTemperature(model.getTemperature() > 0 ? model.getTemperature() : settings.getChatTemperature());
         request.setThinking(true);
         request.setReasoning_effort(EnumsThinkingIntensity.High.getCode());
         if (tools != null && !tools.isEmpty()) {
@@ -320,7 +336,7 @@ public class DeepSeekClient {
             request.setTool_choice("auto");
         }
 
-        streamChat(request, callback);
+        streamChat(request, model.getApiBase(), model.getApiKey(), callback);
     }
 
     /**

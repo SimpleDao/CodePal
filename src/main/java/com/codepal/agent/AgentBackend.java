@@ -64,12 +64,17 @@ public interface AgentBackend {
      *
      * @param messages 对话历史
      * @param tools 可用工具定义列表
+     * @param model 本次请求使用的模型配置（来自 UI 下拉选中项）——base/key/模型名/输出上限
+     *              全部以此为准。★ 旧实现内部硬取全局"当前聊天模型"，多标签/切换会话时
+     *              全局 id 被其它标签覆盖 → 模型名/格式/地址拼接错乱（如 anthropic 格式 +
+     *              deepseek 地址 → 404 /v1/messages）。参数化后单源取值，互不干扰。
      * @param callback 流式回调
      * @return 可用于取消的 CompletableFuture
      */
     CompletableFuture<Void> streamChat(
             List<ChatMessage> messages,
             List<com.codepal.model.ChatRequest.ToolDefinition> tools,
+            com.codepal.model.ModelConfig model,
             StreamCallback callback
     );
 

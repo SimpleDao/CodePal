@@ -46,12 +46,15 @@ public class AnthropicBackend implements AgentBackend {
     public CompletableFuture<Void> streamChat(
             List<ChatMessage> messages,
             List<ChatRequest.ToolDefinition> tools,
+            com.codepal.model.ModelConfig model,
             StreamCallback callback
     ) {
         CompletableFuture<Void> future = new CompletableFuture<>();
 
         try {
-            client.streamChat(messages, tools, new AnthropicClient.StreamCallback() {
+            // ★ base/key/模型名按传入的 model 配置取（参数化核心）；
+            //   thinking=null = 不发 thinking 字段（保持主聊天历史行为）
+            client.streamChat(messages, tools, model, null, new AnthropicClient.StreamCallback() {
                 @Override
                 public void onMessage(String content) {
                     callback.onMessage(content);

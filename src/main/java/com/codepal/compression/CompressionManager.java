@@ -58,6 +58,13 @@ public class CompressionManager {
     public static final double COMPRESSION_THRESHOLD_RATIO = 0.80;
 
     /**
+     * 单次压缩摘要的输出 token 上限（写死，不随模型配置——用户定案，8192）。
+     * 摘要输出长度由 prompt 约束（凝练性 + 每批/最终的字数上限），本值仅作端点的硬顶兜底，
+     * 不再用于分块预算（分块预算只受输入窗口约束，否则大对话会拆成十几批、耗时爆炸）。
+     */
+    private static final int MAX_SUMMARY_TOKENS = 8192;
+
+    /**
      * token 预算允许时，压缩后仍尽量保留的最小尾部条数（软下限，超出预算也会保底）。
      *
      * <p>这不是「按条数限制压缩」——仅用于避免只留 1 条导致近期上下文过薄。
@@ -159,22 +166,27 @@ public class CompressionManager {
         // 解法：把 toCompress 分块，逐块摘要并以「前情摘要」衔接（保留时序），收敛进预算后
         // 再走正常压缩流程。contextWindowTokens 已由调用方按真实口径校准（effectiveCompressLimit）。
         long maxInputEst = (long) (contextWindowTokens * 0.5); // 估算口径的输入上限（真实约 0.5×窗口）
-        // 预估总批数（上界）：每批处理 maxInputEst/2 的原文量，待压缩总量除之即得；
+        // ★ 每批输入预算只受输入窗口约束（maxInputEst/2，恢复 3 批节奏）。摘要输出长度由
+        //   prompt 约束（凝练性 + 每批字数上限）+ max_tokens(8192) 硬顶兜底，不再把分块
+        //   预算绑定到输出上限——否则大对话拆成十几批，每批各生成一次摘要，结构性重复、
+        //   总摘要膨胀、耗时爆炸（生产实锤 10/16：13 批）。
+        final long batchBudget = maxInputEst / 2;
+        // 预估总批数（上界）：每批处理 batchBudget 的原文量，待压缩总量除之即得；
         // 首批摘要后 work 大幅收缩，实际批数只会少不会多 → 文案用"预计约"
-        final int estBatches = Math.max(1, (int) Math.ceil((double) toCompressTokens / (maxInputEst / 2)));
+        final int estBatches = Math.max(1, (int) Math.ceil((double) toCompressTokens / batchBudget));
         List<ChatMessage> work = new ArrayList<>(toCompress);
         int foldRound = 0;
         while (work.size() > 1 && sumTokens(work) > maxInputEst) {
             foldRound++;
             final int fr = foldRound;
             final long batchStartMs = System.currentTimeMillis();
-            // 从头部取一块（累积 ≤ maxInputEst/2，为摘要输出留余量）
+            // 从头部取一块（累积 ≤ batchBudget：窗口约束与输出上限约束取小）
             List<ChatMessage> block = new ArrayList<>();
             long acc = 0;
             int cut = 0;
             for (ChatMessage m : work) {
                 long t = estimateMessageTokens(m);
-                if (!block.isEmpty() && acc + t > maxInputEst / 2) break;
+                if (!block.isEmpty() && acc + t > batchBudget) break;
                 block.add(m);
                 acc += t;
                 cut++;
@@ -189,7 +201,7 @@ public class CompressionManager {
                     : "正在压缩对话（第 " + fr + " 批，预计约 " + estBatches + " 批）…");
             if (block.isEmpty()) {
                 // 单条消息超预算：复制并截断其内容（不污染原消息）
-                block.add(truncateMessageContent(work.get(0), maxInputEst / 2));
+                block.add(truncateMessageContent(work.get(0), batchBudget));
                 cut = 1;
             }
             // ★ 批摘要的流式输出实时上屏（分隔线区分批次，附预估总批数）
@@ -199,7 +211,9 @@ public class CompressionManager {
             }
             String blockSummary;
             try {
-                blockSummary = callLlmSummary(block, usageSink, streamConsumer);
+                // ★ foldBatch=true：批摘要用简化要点 prompt——完整 8 章节只在最终汇总生成一次，
+                //   否则每批填一份模板，多批结构性堆叠导致总摘要膨胀
+                blockSummary = callLlmSummary(block, usageSink, streamConsumer, true);
             } catch (java.util.concurrent.CancellationException ce) {
                 throw ce; // 用户主动取消：原样上抛
             } catch (Exception blockEx) {
@@ -268,10 +282,9 @@ public class CompressionManager {
                 oldCount, oldCount);
         }
 
-        messages.clear();
-        messages.addAll(newMessages);
-
-        int newCount = messages.size();
+        // ★ 纯计算：不再改传入的 messages（= conversationManager 共享列表）——
+        //   由调用方在校验"会话未切换"后再写入（防压缩期间切会话导致跨会话污染）
+        int newCount = newMessages.size();
         String msg = "压缩完成：" + oldCount + " → " + newCount + " 条消息（约 " + oldTokens + " → " + newTokens + " tokens）";
 
         // 找到第一条保留消息的 qaRound（用于 DB 标记压缩范围）
@@ -284,7 +297,7 @@ public class CompressionManager {
         }
 
         return new CompressionResult(true, msg, oldCount, newCount,
-            summary, firstPreservedQaRound, toCompress.size());
+            summary, firstPreservedQaRound, toCompress.size(), newMessages);
     }
 
     /** 切分方案 + 诊断信息（用于失败时给出准确、不误导的提示文案） */
@@ -354,9 +367,29 @@ public class CompressionManager {
             if ("system".equals(m.getRole())) continue;
 
             long t = estimateMessageTokens(m);
-            if (kept >= floor && acc + t > budget) {
-                split = i + 1;   // 本条不纳入保留集，它是最后一条待压缩消息
-                break;
+            if (acc + t > budget) {
+                // ★ 保留段必须是【连续区间】[split, end)——subList 语义 + 消息配对安全
+                //  （tool 结果必须紧跟对应 assistant tool_calls，离散保留会切断配对 → API 400）。
+                //   因此超大条的处理只能是【把分割点前移】（它进待压缩侧），不能"跳过后保留更早的"。
+                if (kept == 0 && i == messages.size() - 1) {
+                    // 防死循环兜底：最新一条本身就超预算——保留它（split=0 会让压缩白做），
+                    // 保留段超窗由上层预检拦截提示
+                    acc += t;
+                    kept++;
+                    split = i;
+                    break;
+                }
+                if (kept >= floor || t > budget) {
+                    // 常规停止（软下限已满足），或 ★单条超预算（软下限让位——
+                    //   巨型 tool 结果进待压缩侧被摘要，否则压缩后保留段依然爆窗）
+                    split = i + 1;   // 本条及更早的全部待压缩（连续区间，配对安全）
+                    break;
+                }
+                // 未满软下限的小条：继续保留（近期上下文不过薄）
+                acc += t;
+                kept++;
+                split = i;
+                continue;
             }
             acc += t;
             kept++;
@@ -436,6 +469,18 @@ public class CompressionManager {
     private String callLlmSummary(List<ChatMessage> toCompress,
                                   java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink,
                                   java.util.function.Consumer<String> streamConsumer) throws Exception {
+        return callLlmSummary(toCompress, usageSink, streamConsumer, false);
+    }
+
+    /**
+     * @param foldBatch true=分块折叠的批摘要（简化要点 prompt，无 8 章节结构——
+     *                  13 批各填一份完整模板会结构性堆叠膨胀，生产实锤 10/16）；
+     *                  false=最终摘要（完整 8 章节 state_snapshot）
+     */
+    private String callLlmSummary(List<ChatMessage> toCompress,
+                                  java.util.function.BiConsumer<String, com.codepal.model.ChatResponse.Usage> usageSink,
+                                  java.util.function.Consumer<String> streamConsumer,
+                                  boolean foldBatch) throws Exception {
         // 构建历史文本
         StringBuilder historyText = new StringBuilder();
         for (ChatMessage msg : toCompress) {
@@ -450,12 +495,16 @@ public class CompressionManager {
             }
         }
 
-        // 构建压缩请求
-        String systemPrompt = CompressionPrompts.getCompressionSystemPrompt();
+        // 构建压缩请求：批摘要用简化要点 prompt，最终摘要用完整 8 章节 prompt
+        String systemPrompt = foldBatch
+                ? CompressionPrompts.getFoldBatchSystemPrompt()
+                : CompressionPrompts.getCompressionSystemPrompt();
         String userPrompt =
             "--- 以下是需要压缩的对话历史 ---\n\n"
             + historyText
-            + "\n\n" + CompressionPrompts.getCompressionUserPrompt();
+            + "\n\n" + (foldBatch
+                ? CompressionPrompts.getFoldBatchUserPrompt()
+                : CompressionPrompts.getCompressionUserPrompt());
 
         List<ChatMessage> compressMessages = new ArrayList<>();
         compressMessages.add(new ChatMessage("system", systemPrompt));
@@ -485,9 +534,8 @@ public class CompressionManager {
         compressRequest.setModel(compressModelCfg != null ? compressModelCfg.getName() : settings.getChatModelName());
         compressRequest.setMessages(compressMessages);
         compressRequest.setStream(true);
-        // max_tokens 写死（用户定案：不随模型配置）——摘要输出通常 500-2000 token，
-        // 8192 留足余量防止截断
-        compressRequest.setMax_tokens(8192);
+        // max_tokens 写死（用户定案：不随模型配置），值见 MAX_SUMMARY_TOKENS
+        compressRequest.setMax_tokens(MAX_SUMMARY_TOKENS);
         compressRequest.setTemperature(0.3);
         // 关闭深度思考：压缩是结构化总结任务，不需要思考链条，节省时间和 token
         compressRequest.setThinking(false);
@@ -640,13 +688,27 @@ public class CompressionManager {
         public final String summaryText;
         public final int firstPreservedQaRound;
         public final int compressedMessageCount;
+        /**
+         * ★ 压缩后的完整消息列表（压缩是纯计算，不改共享上下文）。
+         * 旧实现 compress() 内部直接 clear+addAll 传入的 messages（= conversationManager
+         * 共享列表），压缩 LLM 调用期间若用户切会话，A 的压缩结果会把 B 的上下文整个替换
+         * （B 会话没几条消息却饱满的污染根因）。现在由调用方在**校验会话未切换后**写入。
+         */
+        public final java.util.List<ChatMessage> newMessages;
 
         public CompressionResult(boolean success, String message, int oldCount, int newCount) {
-            this(success, message, oldCount, newCount, null, 0, 0);
+            this(success, message, oldCount, newCount, null, 0, 0, null);
         }
 
         public CompressionResult(boolean success, String message, int oldCount, int newCount,
                                  String summaryText, int firstPreservedQaRound, int compressedMessageCount) {
+            this(success, message, oldCount, newCount, summaryText, firstPreservedQaRound,
+                    compressedMessageCount, null);
+        }
+
+        public CompressionResult(boolean success, String message, int oldCount, int newCount,
+                                 String summaryText, int firstPreservedQaRound, int compressedMessageCount,
+                                 java.util.List<ChatMessage> newMessages) {
             this.success = success;
             this.message = message;
             this.oldCount = oldCount;
@@ -654,6 +716,7 @@ public class CompressionManager {
             this.summaryText = summaryText;
             this.firstPreservedQaRound = firstPreservedQaRound;
             this.compressedMessageCount = compressedMessageCount;
+            this.newMessages = newMessages;
         }
 
         public int getSavedCount() {

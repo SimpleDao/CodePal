@@ -125,6 +125,36 @@ public final class DBSessionUsageRepository {
     }
 
     /** 读取某会话的上下文快照；无记录返回 null（调用方回退估算） */
+    /**
+     * ★ 按 DB 全量消息估算上下文 token（回显圆环的"全量兜底"）：
+     * 遍历未压缩消息的全部 parts（text/thinking/tool），逐条按 TokenEstimator 口径估算。
+     * 解决懒加载窗口低估——重启回显只载最近 500 条进上下文，圆环若只按窗口估算会
+     * 严重低估（真实事故：圆环 41% vs 端点实际收到 280%）。
+     */
+    public static long estimateContextTokensFromDb(String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) return 0;
+        long total = 0;
+        String sql = "SELECT p.content FROM messages m "
+                + "JOIN message_parts p ON p.message_id = m.id "
+                + "WHERE m.session_id = ? "
+                + "AND (m.meta IS NULL OR m.meta NOT LIKE '%compressed%true%')";
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String c = rs.getString(1);
+                    if (c != null && !c.isEmpty()) {
+                        total += com.codepal.utils.TokenEstimator.estimateTokens(c);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("estimateContextTokensFromDb failed, session=" + sessionId, e);
+        }
+        return total;
+    }
+
     public static ChatResponse.Usage loadContextSnapshot(String sessionId) {
         if (sessionId == null || sessionId.isEmpty()) return null;
         String sql = "SELECT prompt_tokens, completion_tokens, "

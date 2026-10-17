@@ -1512,7 +1512,9 @@ public final class ChatHtmlTemplate {
                 + "if(!root)return;"
                 + "var txt=root.textContent;if(!txt||!txt.trim())return;"
                 // 捕获行号范围：:行号 或 L行号[-行号]，单独存到 data-line 由 Java 端定位
-                + "var re=/([a-zA-Z0-9_\\-]+(?:\\.[a-zA-Z0-9_]+)+)(?::(\\d+)|\\s+L(\\d+)(?:-(\\d+))?)?/g;"
+                // ★ 文件名字符类含 CJK（\u4e00-\u9fff）：中文文件名（如 上锅二期-AI账单录入API.md）
+                //   整体进链接变蓝可点击——旧正则只认 ASCII，中文段留在链接外（半白半蓝、点击无跳转）
+                + "var re=/([\\u4e00-\\u9fffA-Za-z0-9_\\-]+(?:\\.[a-zA-Z0-9_]+)+)(?::(\\d+)|\\s+L(\\d+)(?:-(\\d+))?)?/g;"
                 + "var ms=[],m;while((m=re.exec(txt))){if(m[0].length>2){var ln='';if(m[2])ln=m[2];else if(m[3])ln=m[3]+(m[4]?'-'+m[4]:'');ms.push({s:m.index,e:re.lastIndex,t:m[0],ln:ln});}}"
                 + "if(!ms.length)return;"
                 + "var last=0,frag=document.createDocumentFragment();"
@@ -1538,8 +1540,8 @@ public final class ChatHtmlTemplate {
                 + "function linkifyFilePaths(root){"
                 + "var cont=(root&&root.querySelectorAll)?root:document;"
                 + "var winPath=/([a-zA-Z]:[\\\\/][^\\s:;\"'<>|*?]+\\.[a-zA-Z0-9]{1,10}(?::\\d+)?)/g;"
-                + "var unixPath=/(?<![\"'<>(\\[])(\\/[a-zA-Z0-9_\\-./]+\\.[a-zA-Z0-9]{1,10}(?::\\d+)?)/g;"
-                + "var relPath=/(?<![\"'<>(\\/a-zA-Z0-9_\\-.:])(src\\/|com\\/|test\\/|main\\/|app\\/|lib\\/|config\\/|[a-zA-Z0-9_\\-]+\\/[a-zA-Z0-9_\\-./]+\\.[a-zA-Z]{1,10}(?::\\d+)?)/g;"
+                + "var unixPath=/(?<![\"'<>(\\[])(\\/[\\u4e00-\\u9fffA-Za-z0-9_\\-./]+\\.[a-zA-Z0-9]{1,10}(?::\\d+)?)/g;"
+                + "var relPath=/(?<![\"'<>(\\/a-zA-Z0-9_\\-.:])(src\\/|com\\/|test\\/|main\\/|app\\/|lib\\/|config\\/|[\\u4e00-\\u9fffA-Za-z0-9_\\-]+\\/[\\u4e00-\\u9fffA-Za-z0-9_\\-./]+\\.[a-zA-Z]{1,10}(?::\\d+)?)/g;"
                 + "var res=[winPath,unixPath,relPath];"
                 + "var walker=document.createTreeWalker(cont,NodeFilter.SHOW_TEXT,{acceptNode:function(n){"
                 + "if(!n.nodeValue||!n.nodeValue.trim())return NodeFilter.FILTER_REJECT;"

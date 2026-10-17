@@ -46,6 +46,10 @@ public class ChatSessionManager {
     private static final String KEY_PREFIX = "codepal.session.";
     private static final Gson GSON = new Gson();
 
+    /** ★ 上下文纪元：会话切换/清空时递增；历史加载的异步回调以捕获纪元校验，
+     *  不匹配即丢弃——防止旧会话的全量加载回调污染新会话的 conversationManager */
+    private final java.util.concurrent.atomic.AtomicLong contextEpoch = new java.util.concurrent.atomic.AtomicLong(0);
+
     private final Project project;
     private final ConversationManager conversationManager;
 
@@ -238,6 +242,14 @@ public class ChatSessionManager {
         contextIds.clear();
         resetLoadedState();
 
+        // ★ 新建会话同样递增上下文纪元（跨会话污染缺口，生产实锤 10/16）：
+        //   上一会话的全量加载回调可能仍在途（大会话查询秒级），旧实现不递增纪元 →
+        //   回调纪元匹配通过校验 → A 的历史 addAll 进新会话上下文 + currentQaRound
+        //   被回调覆盖成 A 的最大轮次（用户现象：重启→新建会话发消息，端点收到
+        //   上个会话 295K prompt（400 饱满），圆环却显示 55%；消息 qa_round 泄漏为 132）。
+        //   递增后回调纪元不匹配即丢弃，round 泄漏一并根治。
+        contextEpoch.incrementAndGet();
+
         if (uiCallbacks != null) uiCallbacks.clearAllSessionState();
 
         ChatMessage systemMsg = conversationManager.getSystemMessage();
@@ -277,6 +289,12 @@ public class ChatSessionManager {
         resetLoadedState();
         isLoadingHistory = true;  // 历史加载期间阻止发送（避免上下文为空）
         loadingSessionConfig = false;
+        // ★ 上下文纪元递增（竞态污染根治）：会话全量加载是异步任务（大会话秒级），
+        //   期间用户切到其它会话 → 本会话的加载回调晚于新会话的上下文清空执行 →
+        //   旧会话的消息 addAll 进新会话上下文（新会话两条消息却 52 万 token 的污染根因）。
+        //   回调以捕获的纪元校验，不匹配即丢弃。
+        contextEpoch.incrementAndGet();
+        final long myEpoch = contextEpoch.get();
 
         if (uiCallbacks != null) uiCallbacks.clearAllSessionState();
 
@@ -302,6 +320,13 @@ public class ChatSessionManager {
                     }
                 },
                 page -> {
+                    // ★ 纪元校验：会话已切换（回调晚于新会话的上下文清空）→ 丢弃，
+                    //   防止旧会话的全量消息污染新会话的 conversationManager
+                    if (contextEpoch.get() != myEpoch) {
+                        System.out.println("[HistoryLoad] 纪元不匹配（回调=" + myEpoch
+                                + " 当前=" + contextEpoch.get() + "），丢弃过期加载");
+                        return;
+                    }
                     try {
                         var result = page != null ? page.merged : null;
                         if (result == null || result.isEmpty()) {
@@ -347,12 +372,15 @@ public class ChatSessionManager {
                         System.err.println("[HistoryLoad] 首屏渲染异常: " + t);
                         t.printStackTrace();
                     } finally {
-                        isLoadingHistory = false;
-                        boolean hasMore = hasMoreAvailable();
-                        System.out.println("[HistoryLoad] 首屏完成 loadedRows=" + loadedRows
-                                + " entries=" + loadedEntries.size() + " shown=" + displayedCount
-                                + " hasMore=" + hasMore);
-                        if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
+                        // ★ 纪元校验：过期回调不得重置新会话的 isLoadingHistory（新加载可能还在跑）
+                        if (contextEpoch.get() == myEpoch) {
+                            isLoadingHistory = false;
+                            boolean hasMore = hasMoreAvailable();
+                            System.out.println("[HistoryLoad] 首屏完成 loadedRows=" + loadedRows
+                                    + " entries=" + loadedEntries.size() + " shown=" + displayedCount
+                                    + " hasMore=" + hasMore);
+                            if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(hasMore);
+                        }
                     }
                 }
         );
@@ -519,6 +547,7 @@ public class ChatSessionManager {
         final String sid = currentSessionId;
         System.out.println("[HistoryLoad] 取更早一批：offset=" + offset
                 + " pageSize=" + LAZY_PAGE_SIZE);
+        final long myEpoch = contextEpoch.get(); // ★ 懒加载同样可能跨会话（大会话查询秒级）
 
         ThreadHelper.executeAsync(project,
                 () -> {
@@ -533,6 +562,11 @@ public class ChatSessionManager {
                     }
                 },
                 page -> {
+                    // ★ 纪元校验：会话已切换 → 丢弃（防旧会话消息污染新会话上下文/UI）
+                    if (contextEpoch.get() != myEpoch) {
+                        System.out.println("[HistoryLoad] 纪元不匹配（懒加载），丢弃过期批次");
+                        return;
+                    }
                     try {
                         var result = page != null ? page.merged : null;
                         if (result == null || result.isEmpty()) {
@@ -578,7 +612,10 @@ public class ChatSessionManager {
                         t.printStackTrace();
                         if (uiCallbacks != null) uiCallbacks.setHasMoreHistory(true);
                     } finally {
-                        isLoadingHistory = false;
+                        // ★ 纪元校验：过期懒加载不得重置新会话的 isLoadingHistory
+                        if (contextEpoch.get() == myEpoch) {
+                            isLoadingHistory = false;
+                        }
                     }
                 }
         );

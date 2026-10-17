@@ -42,12 +42,14 @@ public class DeepSeekBackend implements AgentBackend {
     public CompletableFuture<Void> streamChat(
             List<ChatMessage> messages,
             List<ChatRequest.ToolDefinition> tools,
+            com.codepal.model.ModelConfig model,
             StreamCallback callback
     ) {
         CompletableFuture<Void> future = new CompletableFuture<>();
 
         try {
-            client.streamChat(messages, tools, new com.codepal.api.DeepSeekClient.StreamCallback() {
+            // ★ base/key 由 DeepSeekClient 四参重载从 model 配置取（参数化核心）
+            client.streamChat(messages, tools, model, new com.codepal.api.DeepSeekClient.StreamCallback() {
                 @Override
                 public void onMessage(String content) {
                     callback.onMessage(content);

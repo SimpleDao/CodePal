@@ -74,6 +74,18 @@ public class AgentBackendManager {
         return getOrCreateBackend("openai");
     }
 
+    /**
+     * ★ 按指定模型配置选择后端（主聊天参数化）：backend 选择与 base/key 同源——
+     *   都来自调用方传入的 model，不再经过全局"当前聊天模型"（多标签/切换会话时
+     *   全局 id 被其它标签覆盖 → 链路与地址拼接错乱）。
+     */
+    public AgentBackend getBackendForModel(com.codepal.model.ModelConfig model) {
+        if (model != null && ModelConfig.FORMAT_ANTHROPIC.equals(model.getApiFormat())) {
+            return getOrCreateBackend("anthropic");
+        }
+        return getOrCreateBackend("openai");
+    }
+
     private String getCurrentChatModelFormat() {
         ModelConfig m = CPSettings.getInstance().getCurrentChatModel();
         return m != null ? m.getApiFormat() : ModelConfig.FORMAT_OPENAI;

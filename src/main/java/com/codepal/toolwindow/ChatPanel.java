@@ -1830,10 +1830,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             },
             result -> {
                 if (!streamRenderController.isCurrentGeneration((int)myGen)) {
+                    // ★ 代数不匹配 = 期间已切会话/新消息/停止——压缩结果作废，
+                    //   不写内存、不写 DB、不更新 UI（跨会话污染防护；配合
+                    //   clearAllSessionState 递增代数，切会话即让所有在途任务失效）
+                    System.out.println("[Compress] 代数不匹配（已切换会话/被打断），丢弃压缩结果");
                     isCompressing = false;
                     restoreSendButton();
                     restoreInputField();
                     return;
+                }
+                // ★ 压缩结果写入内存上下文（compress 已改为纯计算，写入放这里——
+                //   此处代数校验已通过 = 会话未切换，写入安全）
+                if (result.success && result.newMessages != null) {
+                    conversationManager.getMessages().clear();
+                    conversationManager.getMessages().addAll(result.newMessages);
                 }
                 isCompressing = false;
                 contextCircle.setEnabled(true);
@@ -1888,6 +1898,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     }
                     chatWebView.updateCompressCard(msg, true, false);
                     contextCircle.setToolTipText(result.message + " - 点击重新压缩");
+                    // ★ 压缩成功后重置 usage 快照（关键）：last* 是"上次请求"的用量（压缩前，
+                    //   可能 83.9 万）——保留会让预检直判误拦压缩后本可发送的请求（假饱满）。
+                    //   清零后圆环走 estimateSessionTokens()=压缩后真实水位。
+                    lastPromptTokens = 0;
+                    lastCompletionTokens = 0;
+                    lastCacheHitTokens = 0;
+                    lastCacheMissTokens = 0;
+                    lastDbFullEstimate = 0; // DB 消息未删但已进摘要，旧估算语义失效，待下次 reload 重算
+                    refreshTokenStatsDisplay();
                 } else {
                     // 失败：不修改 conversationHistory，圆环保持 API 上报的精确值
                     String msg = "压缩失败：" + result.message + "\n\n请稍后重试。";
@@ -5597,10 +5616,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 防御性检查：当前会话仅有 system 消息时，从数据库重新加载
         if (chatSessionManager.getCurrentSessionId() != null && conversationManager.size() <= 1
                 && (conversationManager.isEmpty() || "system".equals(conversationManager.getSystemMessage().getRole()))) {
+            // ★ 会话校验（跨会话污染防护）：异步查询期间可能已切会话——
+            //   旧实现回调里无条件 clear+addAll 重建上下文，会把 A 会话的最近消息
+            //   写进 B 会话（"B 会话没几条消息却饱满"的路径之一）
+            final String reloadSid = chatSessionManager.getCurrentSessionId();
             ThreadHelper.executeAsync(project,
-                    () -> DBChatHistoryRepository.getSessionMessagesWithParts(chatSessionManager.getCurrentSessionId(), 10, 0),
+                    () -> DBChatHistoryRepository.getSessionMessagesWithParts(reloadSid, 10, 0),
                     (result) -> {
                         if (result == null || result.isEmpty()) return;
+                        if (reloadSid == null || !reloadSid.equals(chatSessionManager.getCurrentSessionId())) {
+                            System.out.println("[ChatPanel] 兜底重载期间已切换会话，丢弃");
+                            return;
+                        }
                         chatWebView.clearMessages();
                         // 重建 conversationHistory（保留 system 消息）
                         ChatMessage systemMsg = conversationManager.getSystemMessage();
@@ -6239,6 +6266,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     @Override
     public void clearAllSessionState() {
+        // ★ 切会话统一失效纪元（跨会话上下文污染的总闸）：
+        //   递增流式代数——使在途的流式回调、工具执行（toolGen 守卫）、Craft 续轮、
+        //   压缩完成回调（handleCompress 的 myGen 守卫）全部失效。
+        //   旧实现只清 UI 状态、代数不变 → 上述守卫形同虚设：A 会话在途的工具执行/
+        //   压缩结果会 addMsgToConversation / clear+addAll 写入已切换的 B 会话上下文
+        //  （"B 会话没几条消息却直接饱满"的根因）。
+        if (streamRenderController != null) {
+            streamRenderController.cancelPendingRenderAndBump();
+        }
         // 清空todo管理器状态：只清 UI/内存，不落库。
         todoManager.clearUiOnly();
         // 清空文件变更内存状态
