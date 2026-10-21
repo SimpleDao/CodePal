@@ -1,0 +1,8 @@
+ע: ĳЩ�����ļ�ʹ�û򸲸����ѹ�ʱ�� API��
+ע: �й���ϸ��Ϣ, ��ʹ�� -Xlint:deprecation ���±��롣
+ע: E:\P-project\Java\LoongC\src\main\java\com\codepal\inline\CPInlineManager.javaʹ����δ�����򲻰�ȫ�Ĳ�����
+ע: �й���ϸ��Ϣ, ��ʹ�� -Xlint:unchecked ���±��롣
+2026-09-10 16:46:14,688 [  11607]   WARN - JetBrains UI DSL - Row should not be empty
+2026-09-10 16:46:16,733 [  13652]   WARN - #c.i.u.j.JBCefApp - JCEF is manually disabled in headless env via 'ide.browser.jcef.headless.enabled=false'
+2026-09-10 16:46:18,810 [  15729]   WARN - #com.codepal.api.DeepSeekClient - FIM SSE ����ʧ��: unknown
+sd

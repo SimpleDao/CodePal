@@ -95,19 +95,23 @@ public final class DBSessionUsageRepository {
     // 语义 = 最近一次主链路请求的 usage（覆盖式，非增量）。
     // 用途：会话激活/重启回显时回填 last* 快照，圆环跨重启/切会话保持精确值。
 
-    /** 覆盖式 upsert：记录某会话最近一次请求的真实 usage 快照 */
-    public static void saveContextSnapshot(String sessionId, ChatResponse.Usage u) {
+    /** 覆盖式 upsert：记录某会话最近一次请求的真实 usage 快照。
+     *  estTokens = 该次请求对应时刻的会话估算值（与 prompt_tokens 构成校准系数配对，
+     *  预检 projected = est_now × (prompt/est) 用；旧库无此列时默认 0 = 校准兜底）。 */
+    public static void saveContextSnapshot(String sessionId, ChatResponse.Usage u, long estTokens) {
         if (sessionId == null || sessionId.isEmpty() || u == null) return;
         String sql = """
             INSERT INTO session_context_snapshot
               (session_id, prompt_tokens, completion_tokens,
-               cache_hit_tokens, cache_miss_tokens, updated_at)
-            VALUES (?,?,?,?,?,?)
+               cache_hit_tokens, cache_miss_tokens, est_tokens, circle_tokens, updated_at)
+            VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT(session_id) DO UPDATE SET
               prompt_tokens     = excluded.prompt_tokens,
               completion_tokens = excluded.completion_tokens,
               cache_hit_tokens  = excluded.cache_hit_tokens,
               cache_miss_tokens = excluded.cache_miss_tokens,
+              est_tokens        = excluded.est_tokens,
+              circle_tokens     = excluded.circle_tokens,
               updated_at        = excluded.updated_at
             """;
         try (Connection conn = SqliteDatabaseManager.getConnection();
@@ -117,11 +121,52 @@ public final class DBSessionUsageRepository {
             ps.setInt(3, u.getCompletionTokens());
             ps.setInt(4, u.getPromptCacheHitTokens());
             ps.setInt(5, u.getPromptCacheMissTokens());
-            ps.setLong(6, System.currentTimeMillis());
+            ps.setLong(6, estTokens);
+            ps.setLong(7, (long) u.getPromptTokens() + u.getCompletionTokens()); // 圆环显示值 = prompt+completion
+            ps.setLong(8, System.currentTimeMillis());
             ps.executeUpdate();
         } catch (Exception e) {
             LOG.error("saveContextSnapshot failed, session=" + sessionId, e);
         }
+    }
+
+    /** 覆盖式 upsert：圆环显示值（单一事实源）。每次圆环刷新时调用，
+     *  会话激活时经 loadCircleTokens 原样恢复 → 不变量「重启后圆环 == 关闭前圆环」。 */
+    public static void saveCircleTokens(String sessionId, long circleTokens) {
+        if (sessionId == null || sessionId.isEmpty() || circleTokens <= 0) return;
+        String sql = """
+            INSERT INTO session_context_snapshot
+              (session_id, circle_tokens, updated_at)
+            VALUES (?,?,?)
+            ON CONFLICT(session_id) DO UPDATE SET
+              circle_tokens = excluded.circle_tokens,
+              updated_at    = excluded.updated_at
+            """;
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sessionId);
+            ps.setLong(2, circleTokens);
+            ps.setLong(3, System.currentTimeMillis());
+            ps.executeUpdate();
+        } catch (Exception e) {
+            LOG.error("saveCircleTokens failed, session=" + sessionId, e);
+        }
+    }
+
+    /** 读取某会话的圆环显示值（circle_tokens）；无记录返回 0（调用方走估算兜底） */
+    public static long loadCircleTokens(String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) return 0;
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT circle_tokens FROM session_context_snapshot WHERE session_id = ?")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getLong("circle_tokens");
+            }
+        } catch (Exception e) {
+            LOG.error("loadCircleTokens failed, session=" + sessionId, e);
+        }
+        return 0;
     }
 
     /** 读取某会话的上下文快照；无记录返回 null（调用方回退估算） */
@@ -153,6 +198,22 @@ public final class DBSessionUsageRepository {
             LOG.error("estimateContextTokensFromDb failed, session=" + sessionId, e);
         }
         return total;
+    }
+
+    /** 读取某会话快照配对的估算值（est_tokens）；无记录/旧库无列返回 0（调用方走兜底校准） */
+    public static long loadContextSnapshotEst(String sessionId) {
+        if (sessionId == null || sessionId.isEmpty()) return 0;
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT est_tokens FROM session_context_snapshot WHERE session_id = ?")) {
+            ps.setString(1, sessionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return rs.getLong("est_tokens");
+            }
+        } catch (Exception e) {
+            LOG.error("loadContextSnapshotEst failed, session=" + sessionId, e);
+        }
+        return 0;
     }
 
     public static ChatResponse.Usage loadContextSnapshot(String sessionId) {

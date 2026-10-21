@@ -397,6 +397,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
     // 最新一次请求的缓存命中/未命中快照（token 面板"本次回答"口径，不累加）
     private volatile long lastCacheHitTokens   = 0;
     private volatile long lastCacheMissTokens  = 0;
+    /** lastPromptTokens 配对的「usage 到达时刻」会话估算值（校准系数分母，必须与分子同源同时刻）。
+     *  预检 projected = est_now × (lastPromptTokens / lastEstTokens)；若误用当前 est 作分母，
+     *  分子分母相消 → projected ≡ lastPromptTokens，永远感知不到上次请求后上下文的增长
+     *  （圆环 48% 放行 325K 实发请求直达端点 400 的根因）。 */
+    private volatile long lastEstTokens        = 0;
+    /** ★ 会话激活时从快照恢复的「圆环显示值」（circle_tokens 列，= 上次会话最后刷新时的圆环值）。
+     *  优先级：本会话真实 usage（last* 之和） > restoredCircleTokens > 实时估算。
+     *  设计不变量：重启/切会话后圆环显示值 == 关闭前显示值（用户需求），落库时机 = 每次圆环刷新。 */
+    private volatile long restoredCircleTokens = 0;
     // 本轮流是否已收到 usage 帧（usage 与 finish_reason 同为流末帧）：
     // 中途出错/被掐断时未收到，lastPromptTokens 还是上一轮旧值，不得用于本轮 chip。
     // volatile：在解析线程同步置位（见 onUsage），EDT 的 onComplete 收尾读取
@@ -1005,6 +1014,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             lastCacheHitTokens   = 0;
             lastCacheMissTokens  = 0;
             lastUsageMsgTs       = 0;
+            lastEstTokens        = 0;
+            restoredCircleTokens = 0; // 快照已删，恢复值一并失效
             // 清空会话：上下文已清 → 真实快照一并失效删除（避免下次进入残留旧值）
             {
                 String clearedSid = chatSessionManager != null
@@ -1738,7 +1749,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         if (window <= 0) return window;
         long est = estimateSessionTokens();
         if (lastPromptTokens > 0 && est > 0) {
-            double cal = (double) lastPromptTokens / est;
+            // ★ 同源配对校准：真实 prompt ÷ 「usage 时刻」估算值。旧实现分母误用当前 est，
+            //   上下文增长时 cal 被稀释 → 压缩预算虚高 → 压缩后仍可能超限 400。
+            double cal = lastEstTokens > 0
+                    ? (double) lastPromptTokens / lastEstTokens : 1.0;
             cal = Math.max(0.1, Math.min(20.0, cal)); // 防异常值钳制
             return Math.max(4096, (long) (window / cal));
         }
@@ -1878,6 +1892,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     lastCompletionTokens = 0;
                     lastCacheHitTokens   = 0;
                     lastCacheMissTokens  = 0;
+                    lastEstTokens        = 0;
+                    restoredCircleTokens = 0; // 压缩前的恢复值失效（updateContextCircleFromHistory 改走估算）
                     final String compressedSid = chatSessionManager != null
                             ? chatSessionManager.getCurrentSessionId() : null;
                     if (compressedSid != null) {
@@ -1905,6 +1921,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     lastCompletionTokens = 0;
                     lastCacheHitTokens = 0;
                     lastCacheMissTokens = 0;
+                    lastEstTokens = 0; // 配对分母随分子一并失效（避免新分子 × 旧分母的错误校准）
                     lastDbFullEstimate = 0; // DB 消息未删但已进摘要，旧估算语义失效，待下次 reload 重算
                     refreshTokenStatsDisplay();
                 } else {
@@ -1940,12 +1957,21 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
 
     /**
      * 压缩成功 / 会话加载后刷新圆环。
-     * 此时真实 usage 快照已失效（历史被裁剪/尚未累积），统一用 estimateSessionTokens() 兜底估算，
-     * 与 onComplete 兜底刷新保持同一口径（TokenEstimator，系数对齐 DeepSeek 官方换算）。
+     * ★ 统一走 usedContextTokens()（真实 usage > 快照恢复值 > 估算兜底）——
+     *   旧实现无条件 estimateSessionTokens()，会话加载/回放期间 setQaRound 反复触发本方法，
+     *   把已恢复的真实快照值（48%）覆盖成估算值（口径不同必然跳变）→ "重启后圆环对不上"的直接根因。
      */
     private void updateContextCircleFromHistory() {
         if (contextCircle == null) return;
-        contextCircle.setTokens(estimateSessionTokens());
+        long val = usedContextTokens();
+        contextCircle.setTokens(val);
+        // 与 refreshTokenStatsDisplay 同步落库：压缩后/加载后的圆环值也要持久化，
+        // 否则压缩→重启会回退到压缩前的旧 circle_tokens（不变量被破坏）。
+        String circleSid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+        if (circleSid != null && val > 0) {
+            ThreadHelper.executeAsync(project, () ->
+                    com.codepal.db.DBSessionUsageRepository.saveCircleTokens(circleSid, val), null);
+        }
     }
 
     /**
@@ -2250,13 +2276,19 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
         // ★ 发送前预检（第二道防线）：按真实口径校准的上下文 + 输出预算 超过模型窗口时，
         //   不发请求（API 必 400），改为明确报错引导压缩。
-        //   校准系数 = 最近一次真实请求的 prompt_tokens / 当前消息估算值
+        //   校准系数 = 最近一次真实请求的 prompt_tokens / 「usage 到达时刻」的估算值（lastEstTokens）。
         //  （TokenEstimator 是 DeepSeek 口径，xai/Grok 等模型 tokenizer 密度可差 3~4 倍）。
+        //   ★ 根因修复：旧实现 cal = lastPromptTokens / 当前est → projected = est×cal ≡ lastPromptTokens
+        //   （数学恒等式，est 完全约掉）——上下文增长再多 projected 纹丝不动，预检形同虚设：
+        //   圆环 143K(48%) 放行 325K 实发请求直达端点 400。分母必须取 usage 时刻的配对值。
         long window = contextCircle != null ? contextCircle.getMaxContextTokens() : 0L;
         if (window > 0 && lastPromptTokens > 0) {
             long est = estimateSessionTokens();
-            double cal = est > 0 ? (double) lastPromptTokens / est : 1.0;
-            long projected = (long) (est * cal);
+            double cal = lastEstTokens > 0
+                    ? (double) lastPromptTokens / lastEstTokens : 1.0;
+            cal = Math.max(0.1, Math.min(20.0, cal)); // 钳制异常值
+            // 兜底 max：lastEstTokens 缺失（旧快照行）时 cal=1，仍不低于上次真实水位
+            long projected = Math.max(lastPromptTokens, (long) (est * cal));
             if (projected + 8192 > window
                     // ★ 直判追加（真实事故 10/16：估算 41% 但端点报 prompt_tokens=839790）——
                     //   上下文只增不减，**上次真实 prompt 已吃满窗口**时必然再超，无论估算怎么算
@@ -4293,7 +4325,11 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 圆环口径 = 当前上下文窗口用量 = 最近一次请求的 prompt(整段对话) + completion(最近一轮回复)，
         // 不是跨轮累加值（每次请求都重发整段对话，累加会把同一份上下文数倍重复计数 → 虚假爆满）。
         long snap = lastPromptTokens + lastCompletionTokens;
-        return snap > 0 ? snap : estimateSessionTokens();
+        if (snap > 0) return snap;
+        // ★ 无本会话 usage（后端不回 usage / 刚恢复会话）时优先用快照恢复的显示值——
+        //   保证"重启后圆环 == 关闭前圆环"；估算只作最后兜底（口径不同必有跳变）。
+        if (restoredCircleTokens > 0) return restoredCircleTokens;
+        return estimateSessionTokens();
     }
 
     private void updateTokenStats(com.codepal.model.ChatResponse.Usage usage) {
@@ -4307,13 +4343,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         //   走 accumulateModelUsage 但不代表当前对话上下文，不得污染快照。
         String snapSid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
         if (snapSid != null) {
+            final long estAtUsage = estimateSessionTokens();
             ThreadHelper.executeAsync(project, () ->
-                    com.codepal.db.DBSessionUsageRepository.saveContextSnapshot(snapSid, usage), null);
+                    com.codepal.db.DBSessionUsageRepository.saveContextSnapshot(snapSid, usage, estAtUsage), null);
         }
 
         // 上下文快照：只取最近一次请求的值（用于圆环，不能累加）
         lastPromptTokens     = usage.getPromptTokens();
         lastCompletionTokens = usage.getCompletionTokens();
+        // ★ 校准分母（必须与 lastPromptTokens 同一时刻）：usage 到达时的会话估算值。
+        //   后续上下文增长（工具结果/新消息入库）时，projected = est_now × (lastPrompt/lastEst)
+        //   才能线性放大真实预测；分子分母若取不同时刻则相消为恒等式（预检失效根因）。
+        lastEstTokens = estimateSessionTokens();
         // 缓存命中/未命中快照：也取最近一次请求的值（token 面板"本次回答"口径）
         lastCacheHitTokens   = usage.getPromptCacheHitTokens();
         lastCacheMissTokens  = usage.getPromptCacheMissTokens();
@@ -4396,13 +4437,25 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // 更新上下文进度圈：圆环本体 = 当前上下文用量（实时）
         if (contextCircle != null) {
             contextCircle.setTokens(usedContext);
+            // ★ 圆环显示值落库（单一事实源）：每次刷新把「正在显示的值」upsert 到快照表
+            //   circle_tokens 列。会话激活时原样恢复 → 不变量「重启后圆环 == 关闭前圆环」。
+            //   无论值的来源是真实 usage 还是估算（后端不回 usage 的会话同样成立）。
+            String circleSid = chatSessionManager != null ? chatSessionManager.getCurrentSessionId() : null;
+            if (circleSid != null && usedContext > 0) {
+                final long circleVal = usedContext;
+                ThreadHelper.executeAsync(project, () ->
+                        com.codepal.db.DBSessionUsageRepository.saveCircleTokens(circleSid, circleVal), null);
+            }
             // ★ 未载入历史提示：DB 全量消息（含懒加载窗口外的更早对话）估算显著大于
             //   当前圆环值时，tooltip 追加警示——滚动加载历史会把这些消息重新纳入上下文，
             //   用户应知晓"发送的上下文会随滚动增长"
             String unloadedHint = "";
             if (lastDbFullEstimate > usedContext + 4096) {
+                // ★ 文案修正：FULL_LOAD_ROWS=1M 全量加载后 DB 内容已全部在上下文中、
+                //   会随下次请求全部发送——差额是"上次请求后新增内容 + 估算口径偏差"，
+                //   不是"滚动才载入"（旧 500 行懒加载时代的说法，已失真）。
                 unloadedHint = String.format(
-                        "<br><small>⚠ 另有未载入的历史约 %s tokens（滚动查看历史会纳入上下文）</small>",
+                        "<br><small>⚠ 历史内容估算约 %s tokens，已超出上次请求上下文（将随下次请求发送）</small>",
                         formatTokenCount(lastDbFullEstimate));
             }
             String circleTooltip = String.format(
@@ -5549,6 +5602,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         o.addProperty("output", output);
         o.addProperty("cacheHit", ch);
         o.addProperty("cacheMiss", cm);
+        // ★ 配对估算值：重启回放回填 last* 时连同 lastEstTokens 一起恢复，
+        //   保证预检校准系数分子分母同源同时刻（est 缺失时回放端会清零走兜底）。
+        o.addProperty("est", lastEstTokens);
         o.addProperty("total", input + output);
         o.addProperty("cost", cost != null ? cost : "");
         // 记录产生本次回答的模型（便于 chip 展示与后续按消息追溯计费）
@@ -6353,6 +6409,8 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         lastCompletionTokens = 0;
         lastCacheHitTokens = 0;
         lastCacheMissTokens = 0;
+        lastEstTokens = 0;
+        restoredCircleTokens = 0; // 上个会话的圆环显示值随快照一并失效
         reloadSessionModelUsage();
         ApplicationManager.getApplication().invokeLater(() -> {
             // 保存上一个会话的输入框草稿
@@ -6393,13 +6451,20 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             //  （10/16 事故）。全量值改存 lastDbFullEstimate，仅用于圆环 tooltip 提示。
             com.codepal.model.ChatResponse.Usage snap =
                     com.codepal.db.DBSessionUsageRepository.loadContextSnapshot(sid);
+            // ★ 配对分母一并回填：快照 prompt_tokens 与 est_tokens 是同一请求的
+            //   (真实值, 估算值) 对，分开恢复会让校准系数分子分母错配（增长误判/漏判）。
+            long snapEst = com.codepal.db.DBSessionUsageRepository.loadContextSnapshotEst(sid);
+            // ★ 圆环显示值恢复（单一事实源）：circle_tokens = 上次会话最后刷新时的圆环值，
+            //   与 prompt 快照独立（后端不回 usage 的会话只有 circle_tokens 也照样恢复）。
+            long snapCircle = com.codepal.db.DBSessionUsageRepository.loadCircleTokens(sid);
             long dbEst = com.codepal.db.DBSessionUsageRepository.estimateContextTokensFromDb(sid);
             long snapTotal = snap != null ? snap.getPromptTokens() + snap.getCompletionTokens() : 0;
             lastDbFullEstimate = dbEst;
             System.out.println("[UsageStats] 回填会话累计 sid=" + sid
                     + ", 模型数=" + (loaded != null ? loaded.size() : 0)
                     + (loaded != null && !loaded.isEmpty() ? " -> " + loaded.keySet() : "")
-                    + ", 上下文快照=" + snapTotal + " db全量估算=" + dbEst);
+                    + ", 上下文快照=" + snapTotal + " 快照est=" + snapEst
+                    + " 圆环=" + snapCircle + " db全量估算=" + dbEst);
             ApplicationManager.getApplication().invokeLater(() -> {
                 sessionModelUsage.clear();
                 if (loaded != null) sessionModelUsage.putAll(loaded);
@@ -6408,7 +6473,10 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     lastCompletionTokens = snap.getCompletionTokens();
                     lastCacheHitTokens = snap.getPromptCacheHitTokens();
                     lastCacheMissTokens = snap.getPromptCacheMissTokens();
+                    lastEstTokens = snapEst;
                 }
+                // 圆环显示值无条件恢复（优先级低于本会话新 usage，见 usedContextTokens）
+                restoredCircleTokens = snapCircle;
                 refreshTokenStatsDisplay();
             });
         }, null);
@@ -6513,6 +6581,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         lastCompletionTokens = out;
                         lastCacheHitTokens = tu.has("cacheHit") ? tu.get("cacheHit").getAsLong() : 0;
                         lastCacheMissTokens = tu.has("cacheMiss") ? tu.get("cacheMiss").getAsLong() : 0;
+                        // ★ 配对分母：新消息 JSON 带 est 则同步回填；旧消息无 est 则清零
+                        //   （新分子 × 旧分母的错误校准比没有校准更危险）。
+                        lastEstTokens = tu.has("est") ? tu.get("est").getAsLong() : 0;
                         lastUsageMsgTs = rec.getCreatedAt();
                     }
                 } catch (Exception ignored) {}
@@ -8508,6 +8579,14 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 tokenStatsLabel.putClientProperty("detail_text", null);
             }
             if (contextCircle != null) contextCircle.setTokens(0);
+            // 新会话：旧会话的快照值全部失效（createNewSession 内部已递增纪元+清加载态）
+            lastPromptTokens     = 0;
+            lastCompletionTokens = 0;
+            lastCacheHitTokens   = 0;
+            lastCacheMissTokens  = 0;
+            lastEstTokens        = 0;
+            restoredCircleTokens = 0;
+            lastUsageMsgTs       = 0;
             compressionHintShown = false;
             taskWasInterrupted = false;
         });

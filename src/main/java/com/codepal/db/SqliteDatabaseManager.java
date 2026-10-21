@@ -248,9 +248,17 @@ public class SqliteDatabaseManager {
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
                     cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                    est_tokens INTEGER NOT NULL DEFAULT 0,
+                    circle_tokens INTEGER NOT NULL DEFAULT 0,
                     updated_at BIGINT NOT NULL
                 )
             """);
+            // 旧库补列：est_tokens = 快照请求对应时刻的会话估算值（与 prompt_tokens 配对，
+            // 构成发送预检的校准系数 real/est；旧库缺列时默认 0 = 无校准走兜底）。
+            // circle_tokens = 圆环显示值（每次圆环刷新 upsert，会话激活时原样恢复——
+            // 不变量「重启后圆环 == 关闭前圆环」的单一事实源，与 usage 无关也成立）。
+            addColumnIfMissing(stmt, "session_context_snapshot", "est_tokens", "INTEGER NOT NULL DEFAULT 0");
+            addColumnIfMissing(stmt, "session_context_snapshot", "circle_tokens", "INTEGER NOT NULL DEFAULT 0");
         }
     }
 
