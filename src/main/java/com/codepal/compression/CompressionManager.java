@@ -401,6 +401,23 @@ public class CompressionManager {
             plan.splitPoint = 0;
             return plan;
         }
+
+        // ★ 轮次边界对齐：切分点落在同一轮中间时，把该轮剩余部分整体划入待压缩侧
+        //  （splitPoint 前移到轮次变化处）。否则：
+        //  ① 保留段头部是孤儿 tool 结果/残缺工具链；
+        //  ② DB 标记按 "qa_round < firstPreservedQaRound" 会漏标同轮被压缩的前半
+        //     （重载后该前半回流上下文，与摘要重复）。
+        //  对齐后「整轮压缩或整轮保留」，标记条件与切分结果严格一致。
+        if (split > 0 && split < messages.size()) {
+            int lastCompressedRound = messages.get(split - 1).getQaRound();
+            if (lastCompressedRound > 0) {
+                while (split < messages.size()
+                        && messages.get(split).getQaRound() == lastCompressedRound) {
+                    split++;
+                }
+            }
+        }
+
         plan.splitPoint = split;
         return plan;
     }

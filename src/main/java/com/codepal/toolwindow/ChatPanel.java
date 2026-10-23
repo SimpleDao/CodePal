@@ -506,6 +506,15 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // ★ 初始 ConversationManager / ChatSessionManager（全局唯一，管理当前会话 ID）
         this.conversationManager = new com.codepal.memory.ConversationManager();
         this.chatSessionManager = new ChatSessionManager(project, conversationManager);
+        // ★ 内存消息 qaRound 兜底来源：流式 assistant/tool 消息入列时自动补当前轮次，
+        //   与 DB qa_round 对齐（压缩 DB 标记依赖轮次边界，缺失会导致标记整批跳过）
+        this.conversationManager.setQaRoundSupplier(() -> {
+            try {
+                return chatSessionManager.getCurrentQaRound();
+            } catch (Exception e) {
+                return 0;
+            }
+        });
         this.iterationGuard = new com.codepal.session.IterationGuard(conversationManager, chatSessionManager);
 
         conversationManager.initSystem(CPSettings.getInstance().getSystemPrompt(project, craftMode));
@@ -1875,8 +1884,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                     // 持久化压缩状态到 DB
                     String sessionId = chatSessionManager.getCurrentSessionId();
                     if (result.firstPreservedQaRound > 0) {
-                        com.codepal.db.DBChatHistoryRepository.markMessagesCompressedBeforeRound(
-                            sessionId, result.firstPreservedQaRound);
+                        int marked = com.codepal.db.DBChatHistoryRepository
+                                .markMessagesCompressedBeforeRound(sessionId, result.firstPreservedQaRound);
+                        // ★ 可观测性：标记 0 行 = 重启后旧消息全部回流（857K 回流事故的直接症状）
+                        System.out.println("[Compress] DB 压缩标记完成：qaRound<" + result.firstPreservedQaRound
+                                + "，标记 " + marked + " 条");
+                        if (marked == 0) {
+                            System.err.println("[Compress] ⚠️ DB 压缩标记 0 行！压缩范围/轮次异常，"
+                                    + "重启后旧消息会全部回流上下文");
+                        }
+                    } else {
+                        System.err.println("[Compress] ⚠️ firstPreservedQaRound=" + result.firstPreservedQaRound
+                                + "，跳过 DB 压缩标记——保留段无有效轮次，重启后旧消息会全部回流");
                     }
                     if (result.summaryText != null && !result.summaryText.isBlank()) {
                         // 与内存一致：摘要消息在内存里是 MEMORY_SUMMARY_PREFIX + summary，
@@ -4419,11 +4438,47 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         }
         String cumulativeHtml = cumulative.length() > 0 ? cumulative.toString() : "暂无";
 
+        // ── usage 数据源标注（透明化：圆环数字从哪来、可信度多少）──
+        // 三种状态：
+        //  ① 实测：usage 已返回（数字全部来自服务端，可信）
+        //  ② 在途：请求进行中，usage 未到（显示值是上一轮的）
+        //  ③ 兜底：从未收到 usage（400 失败/后端不支持）→ 圆环为估算或恢复值，
+        //     展示估算值与「上次实测」的脱节比例（lastPromptTokens/lastEstTokens 同源配对）；
+        //     从无实测参照时诚实显示"无法评估"，不编数字。
+        boolean hasRealUsage = lastPromptTokens > 0 || lastCompletionTokens > 0;
+        boolean inFlight = streamRenderController != null && streamRenderController.isReceiving();
+        String usageHtml;
+        if (inFlight) {
+            usageHtml = "⏳ 请求进行中，usage 未到——当前显示的是上一次请求的实测值";
+        } else if (hasRealUsage) {
+            usageHtml = "✅ usage 已返回：input " + formatTokenCount(lastCacheHitTokens + lastCacheMissTokens)
+                    + "｜output " + formatTokenCount(lastCompletionTokens)
+                    + "｜缓存命中 " + formatTokenCount(lastCacheHitTokens)
+                    + "｜未命中 " + formatTokenCount(lastCacheMissTokens);
+            if (lastEstTokens > 0) {
+                double cal = (double) lastPromptTokens / lastEstTokens;
+                usageHtml += String.format(
+                        "<br>└ 校准比例（实测/估算）=%.2f：本地估算 %s → 实际 %s%s",
+                        cal, formatTokenCount(lastEstTokens), formatTokenCount(lastPromptTokens),
+                        cal > 1.3 ? "（估算明显低估，见 2.3.5 末尾说明）" : "");
+            }
+        } else if (restoredCircleTokens > 0) {
+            usageHtml = "⚠️ 本会话从未收到 usage（上次请求 400 失败或后端不返回）<br>"
+                    + "└ 当前显示为重启前快照恢复值 " + formatTokenCount(restoredCircleTokens)
+                    + "，与真实值可能脱节；下次成功请求后恢复实测";
+        } else {
+            usageHtml = "⚠️ 从未收到 usage（400 失败或后端不支持）<br>"
+                    + "└ 当前显示为估算兜底 " + formatTokenCount(estimateSessionTokens())
+                    + "（TokenEstimator 口径：中文 0.6/字，其它 0.3/字符）<br>"
+                    + "└ 与真实值脱节比例：无法评估（无实测参照）；数字密集内容（JSON/SQL）估算可能低估 3 倍以上";
+        }
+
         String detailHtml = String.format(
                 "<html><b>当前上下文</b><br>"
                         + "tokens：%s（缓存命中 %s + 未命中 %s）<br>"
                         + "费用：%s（按 %s 单价）<br>"
                         + "上下文窗口：%s / %sK｜缓存命中率：%s<br>"
+                        + "<b>usage 数据源</b><br>%s<br>"
                         + "<b>会话累计（按模型）</b><br>%s</html>",
                 formatTokenCount(curInput + lastCompletionTokens),
                 formatTokenCount(lastCacheHitTokens),
@@ -4431,6 +4486,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 currentCost, model != null ? model : "—",
                 formatTokenCount(usedContext), getContextWindowLimit() / 1000,
                 hitRateStr,
+                usageHtml,
                 cumulativeHtml
         );
 
@@ -5605,6 +5661,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
         // ★ 配对估算值：重启回放回填 last* 时连同 lastEstTokens 一起恢复，
         //   保证预检校准系数分子分母同源同时刻（est 缺失时回放端会清零走兜底）。
         o.addProperty("est", lastEstTokens);
+        // ★ 校准比例（实测/估算，同源同时刻配对）：chip 弹窗"估算校准"行展示——
+        //   让用户直接看到本地估算与真实值的脱节程度（数字密集内容可低估 3 倍以上）。
+        o.addProperty("cal", lastEstTokens > 0 ? (double) input / lastEstTokens : 0);
         o.addProperty("total", input + output);
         o.addProperty("cost", cost != null ? cost : "");
         // 记录产生本次回答的模型（便于 chip 展示与后续按消息追溯计费）

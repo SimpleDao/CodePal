@@ -23,6 +23,27 @@ public class ConversationManager {
 
     // ==================== 基础操作 ====================
 
+    /** 当前 QA 轮次来源（由 ChatPanel 注入 chatSessionManager::getCurrentQaRound）。
+     *  ★ 根因修复：流式过程的 assistant/tool 消息此前从不设置 qaRound（内存里恒为 0，
+     *  而 DB 落库用的是独立 entity、qa_round 正确）→ 压缩切分若落在工具链中间，
+     *  保留段所有消息 qaRound=0 → firstPreservedQaRound=0 → DB 压缩标记整批跳过
+     *  → 重启全量回流（128 条/66.8K 变 770 条/857K 事故的根因）。 */
+    private java.util.function.IntSupplier qaRoundSupplier;
+
+    /** 注入当前轮次来源；add() 时对未设置轮次的消息兜底补齐（system 除外） */
+    public void setQaRoundSupplier(java.util.function.IntSupplier supplier) {
+        this.qaRoundSupplier = supplier;
+    }
+
+    private void backfillQaRound(ChatMessage msg) {
+        if (msg == null || msg.getQaRound() > 0) return;
+        if ("system".equals(msg.getRole())) return;
+        if (qaRoundSupplier != null) {
+            int r = qaRoundSupplier.getAsInt();
+            if (r > 0) msg.setQaRound(r);
+        }
+    }
+
     /** 获取底层消息列表（只读意图，调用方不应直接修改） */
     public synchronized List<ChatMessage> getMessages() {
         return messages;
@@ -71,11 +92,14 @@ public class ConversationManager {
     // ==================== 添加消息 ====================
 
     public synchronized void add(ChatMessage msg) {
+        backfillQaRound(msg);
         messages.add(msg);
     }
 
     public synchronized void addUserMessage(String text) {
-        messages.add(new ChatMessage("user", text));
+        ChatMessage msg = new ChatMessage("user", text);
+        backfillQaRound(msg);
+        messages.add(msg);
     }
 
     // ==================== 查询 ====================

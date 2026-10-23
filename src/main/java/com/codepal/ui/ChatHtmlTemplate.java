@@ -967,8 +967,14 @@ public final class ChatHtmlTemplate {
                 + "+(hitRate?'<div class=\\\"tk-foot\\\"><span>缓存命中</span><span class=\\\"tk-foot-val\\\">'+hitRate+'%<span class=\\\"tk-foot-sub\\\">'+fmtT(ch)+'/'+fmtT(dispInp)+'</span></span></div>':'')"
                 + "+(ch>0&&!hitRate?'<div class=\\\"tk-foot\\\"><span>缓存命中</span><span class=\\\"tk-foot-val\\\">'+fmtT(ch)+' tokens</span></div>':'')"
                 + "+(cm>0?'<div class=\\\"tk-foot\\\"><span>缓存未命中</span><span class=\\\"tk-foot-val\\\">'+fmtT(cm)+' tokens</span></div>':'')"
-                + "+'<div class=\\\"tk-foot\\\"><span>本次费用</span><span class=\\\"tk-foot-val\\\">'+(cost?cost:'未配置单价')+'</span></div>';"
-                + "p.style.display='flex';positionPayload(p,anchor);"
+                + "+'<div class=\\\"tk-foot\\\"><span>本次费用</span><span class=\\\"tk-foot-val\\\">'+(cost?cost:'未配置单价')+'</span></div>'"
+                // ★ 数据源标注：input/output 全部来自服务端 usage 实测；cal=实测/估算比例
+                //  （usage 到达时刻的同源配对），让用户直接看到本地估算与真实的脱节程度
+                + "+(function(){var est=info.est||0,cal=info.cal||0;"
+                + "var h='<div class=\\\"tk-foot\\\"><span>数据源</span><span class=\\\"tk-foot-val\\\">服务端 usage 实测</span></div>';"
+                + "if(cal>0){h+='<div class=\\\"tk-foot\\\"><span>估算校准</span><span class=\\\"tk-foot-val\\\">估算 '+fmtT(est)+' → 实测 '+cal.toFixed(2)+' 倍'+(cal>1.3?'（估算低估）':'')+'</span></div>';}"
+                + "return h;})()"
+                + ";p.style.display='flex';positionPayload(p,anchor);"
                 // 二级明细：工具/子智能体 hover 展开
                 ; String part4 = "var subTimer=null;"
                 + "function openSubPanel(axis){var labels=p.querySelectorAll('.tk-label.hot');"

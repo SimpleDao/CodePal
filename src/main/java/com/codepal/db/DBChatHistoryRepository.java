@@ -600,9 +600,10 @@ public class DBChatHistoryRepository {
     // ═══════════════════════════════════════════════════════════════
 
     /**
-     * 标记指定 qaRound 之前的所有消息为已压缩（不含 system 消息，不含已有摘要消息）
+     * 标记指定 qaRound 之前的所有消息为已压缩（不含 system 消息，不含已有摘要消息）。
+     * @return 实际标记的行数（0 = 范围内无可标记消息，调用方应告警——压缩等于白做）
      */
-    public static void markMessagesCompressedBeforeRound(String sessionId, int qaRound) {
+    public static int markMessagesCompressedBeforeRound(String sessionId, int qaRound) {
         String selectSql = "SELECT id, meta FROM messages WHERE session_id = ? AND qa_round < ? AND role != 'system' AND (meta IS NULL OR meta NOT LIKE '%compressed_summary%true%')";
         String updateSql = "UPDATE messages SET meta = ? WHERE id = ?";
         try (Connection conn = SqliteDatabaseManager.getConnection()) {
@@ -642,8 +643,15 @@ public class DBChatHistoryRepository {
                 }
             }
             conn.commit();
+            if (toUpdate.isEmpty()) {
+                // ★ 可观测性：标记 0 行 = 重载后旧消息全部回流（压缩白做），必须在日志可见
+                LOG.warn("markMessagesCompressedBeforeRound marked 0 rows! session=" + sessionId
+                        + ", qaRound=" + qaRound + "（压缩范围错误或范围内无未标记消息）");
+            }
+            return toUpdate.size();
         } catch (SQLException e) {
             LOG.error("Failed to mark messages compressed by qaRound for session: " + sessionId, e);
+            return 0;
         }
     }
 
