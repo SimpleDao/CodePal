@@ -44,7 +44,9 @@ public class SqliteDatabaseManager {
 
                 // 设置忙等待与 WAL，缓解文件锁并发。
                 try (Statement pragma = connection.createStatement()) {
-                    pragma.execute("PRAGMA busy_timeout = 5000");
+                    // 写锁竞争兜底：WAL 下多个写者自动排队，30s 足够覆盖压缩时刻摘要/落库/快照并发写的总排队耗时，
+                    // 彻底消除 SQLITE_BUSY 失败窗口（配合 markMessagesCompressedBeforeRound 的分批+重试）。
+                    pragma.execute("PRAGMA busy_timeout = 30000");
                     pragma.execute("PRAGMA journal_mode = WAL");
                 }
 
