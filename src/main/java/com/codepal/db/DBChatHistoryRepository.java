@@ -643,6 +643,8 @@ public class DBChatHistoryRepository {
 
     /** 单次标记尝试：SELECT 待标记行 → 分批（每 200 行）提交 UPDATE */
     private static int doMark(String sessionId, int qaRound) throws SQLException {
+        // 关键：排除 meta 含 compressed_summary=true 的「摘要消息」——它本就是历史归档的浓缩，
+        // 不应再被标记 compressed（重复标记虽由读取侧 isSummary 兜底仍能进上下文，但此处显式排除更清晰、解耦）。
         String selectSql = "SELECT id, meta FROM messages WHERE session_id = ? AND qa_round < ? AND role != 'system' AND (meta IS NULL OR meta NOT LIKE '%compressed_summary%true%')";
         String updateSql = "UPDATE messages SET meta = ? WHERE id = ?";
         List<String[]> toUpdate = new ArrayList<>();

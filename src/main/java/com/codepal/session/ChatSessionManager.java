@@ -709,6 +709,26 @@ public class ChatSessionManager {
             return result; // 空列表，不加入 conversationManager
         }
 
+        // ★ 压缩摘要消息：作为背景记忆注入上下文，但它是历史归档而非真实用户发言，
+        //   因此只提取纯文本、不追加「[发送时间]」时间戳（否则会污染发送给模型的摘要）。
+        //   角色仍沿用存储的 'user'（API 仅支持单 system 通道，摘要走 user 以保持兼容）。
+        if (isSummary) {
+            ChatMessage summaryMsg = new ChatMessage();
+            summaryMsg.setRole(rec.getRole());
+            summaryMsg.setQaRound(rec.getQaRound());
+            if (parts != null) {
+                for (MessagePartEntity p : parts) {
+                    if ("text".equals(p.getKind()) && p.getContent() != null) {
+                        summaryMsg.setContent(p.getContent());
+                        break;
+                    }
+                }
+            }
+            if (summaryMsg.getContent() == null) summaryMsg.setContent("");
+            result.add(summaryMsg);
+            return result;
+        }
+
         ChatMessage msg = new ChatMessage();
         msg.setRole(rec.getRole());
         msg.setQaRound(rec.getQaRound());
