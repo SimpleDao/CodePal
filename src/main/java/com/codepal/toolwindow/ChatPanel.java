@@ -1889,7 +1889,18 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                         // ★ 可观测性：标记 0 行 = 重启后旧消息全部回流（857K 回流事故的直接症状）
                         System.out.println("[Compress] DB 压缩标记完成：qaRound<" + result.firstPreservedQaRound
                                 + "，标记 " + marked + " 条");
-                        if (marked == 0) {
+                        if (marked < 0) {
+                            // ★ 重试 3 次仍失败（DB 锁竞争）——必须让用户知道后果，不能静默：
+                            //   内存已压缩（当前可用），但重启/切会话后旧消息全部回流
+                            System.err.println("[Compress] ❌ DB 压缩标记写入失败（重试后仍失败）");
+                            ApplicationManager.getApplication().invokeLater(() ->
+                                    Messages.showWarningDialog(project,
+                                            "压缩归档写入数据库失败（数据库忙，重试 3 次未成功）。\n\n"
+                                            + "当前内存上下文已压缩，可以继续对话；但重启或切换会话后，"
+                                            + "旧消息会重新进入上下文（表现为上下文突然爆满）。\n\n"
+                                            + "建议：稍后再次点击圆环压缩一次，即可补写归档标记。",
+                                            "压缩归档失败"));
+                        } else if (marked == 0) {
                             System.err.println("[Compress] ⚠️ DB 压缩标记 0 行！压缩范围/轮次异常，"
                                     + "重启后旧消息会全部回流上下文");
                         }

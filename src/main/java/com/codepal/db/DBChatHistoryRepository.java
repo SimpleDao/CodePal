@@ -599,60 +599,104 @@ public class DBChatHistoryRepository {
     // Compression (压缩持久化)
     // ═══════════════════════════════════════════════════════════════
 
+    /** 锁重试参数：压缩完成时刻并发着摘要写入/消息落库/快照写等多个 DB 写，
+     *  单个大事务（batch UPDATE 数百行）极易撞 SQLITE_BUSY。失败重试 3 次、退避 300ms。 */
+    private static final int MARK_RETRY_MAX = 3;
+    private static final long MARK_RETRY_BACKOFF_MS = 300;
+
     /**
      * 标记指定 qaRound 之前的所有消息为已压缩（不含 system 消息，不含已有摘要消息）。
-     * @return 实际标记的行数（0 = 范围内无可标记消息，调用方应告警——压缩等于白做）
+     * ★ 根因修复（2026-10-23）：原实现单个事务批量 UPDATE 数百行，压缩完成时刻与摘要写入/
+     *   消息落库/快照写并发，SQLITE_BUSY 锁竞争导致整个事务失败且静默返回 0 ——
+     *   标记一条都没写进 DB → 重启/切换会话全量回流（365.6K/857K 事故的最终根因）。
+     *   现改为：分批提交（每 200 行一个事务，缩短持锁时间）+ 整体锁重试 3 次。
+     *
+     * @return 实际标记的行数；-1 = 重试后仍失败（调用方必须告警并安排补救）
      */
     public static int markMessagesCompressedBeforeRound(String sessionId, int qaRound) {
-        String selectSql = "SELECT id, meta FROM messages WHERE session_id = ? AND qa_round < ? AND role != 'system' AND (meta IS NULL OR meta NOT LIKE '%compressed_summary%true%')";
-        String updateSql = "UPDATE messages SET meta = ? WHERE id = ?";
-        try (Connection conn = SqliteDatabaseManager.getConnection()) {
-            conn.setAutoCommit(false);
-            List<String[]> toUpdate = new ArrayList<>();
-            try (PreparedStatement ps = conn.prepareStatement(selectSql)) {
-                ps.setString(1, sessionId);
-                ps.setInt(2, qaRound);
-                try (ResultSet rs = ps.executeQuery()) {
-                    com.google.gson.Gson gson = new com.google.gson.Gson();
-                    while (rs.next()) {
-                        String id = rs.getString("id");
-                        String existingMeta = rs.getString("meta");
-                        com.google.gson.JsonObject metaObj;
-                        if (existingMeta != null && !existingMeta.isBlank()) {
-                            try {
-                                metaObj = com.google.gson.JsonParser.parseString(existingMeta).getAsJsonObject();
-                            } catch (Exception e) {
-                                metaObj = new com.google.gson.JsonObject();
-                            }
-                        } else {
-                            metaObj = new com.google.gson.JsonObject();
-                        }
-                        metaObj.addProperty("compressed", true);
-                        toUpdate.add(new String[]{id, gson.toJson(metaObj)});
-                    }
+        SQLException lastError = null;
+        for (int attempt = 1; attempt <= MARK_RETRY_MAX; attempt++) {
+            try {
+                int marked = doMark(sessionId, qaRound);
+                if (attempt > 1) {
+                    LOG.info("markMessagesCompressedBeforeRound succeeded on retry #" + attempt
+                            + ", session=" + sessionId + ", marked=" + marked);
+                }
+                return marked;
+            } catch (SQLException e) {
+                lastError = e;
+                LOG.warn("markMessagesCompressedBeforeRound attempt " + attempt + "/" + MARK_RETRY_MAX
+                        + " failed (lock?) for session=" + sessionId + ": " + e.getMessage());
+                try {
+                    Thread.sleep(MARK_RETRY_BACKOFF_MS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
-            if (!toUpdate.isEmpty()) {
+        }
+        LOG.error("markMessagesCompressedBeforeRound FAILED after " + MARK_RETRY_MAX
+                + " retries, session=" + sessionId + ", qaRound=" + qaRound
+                + " —— 压缩归档标记未写入 DB，重启/切换会话后旧消息将全部回流", lastError);
+        return -1;
+    }
+
+    /** 单次标记尝试：SELECT 待标记行 → 分批（每 200 行）提交 UPDATE */
+    private static int doMark(String sessionId, int qaRound) throws SQLException {
+        String selectSql = "SELECT id, meta FROM messages WHERE session_id = ? AND qa_round < ? AND role != 'system' AND (meta IS NULL OR meta NOT LIKE '%compressed_summary%true%')";
+        String updateSql = "UPDATE messages SET meta = ? WHERE id = ?";
+        List<String[]> toUpdate = new ArrayList<>();
+        try (Connection conn = SqliteDatabaseManager.getConnection();
+             PreparedStatement ps = conn.prepareStatement(selectSql)) {
+            ps.setString(1, sessionId);
+            ps.setInt(2, qaRound);
+            try (ResultSet rs = ps.executeQuery()) {
+                com.google.gson.Gson gson = new com.google.gson.Gson();
+                while (rs.next()) {
+                    String id = rs.getString("id");
+                    String existingMeta = rs.getString("meta");
+                    com.google.gson.JsonObject metaObj;
+                    if (existingMeta != null && !existingMeta.isBlank()) {
+                        try {
+                            metaObj = com.google.gson.JsonParser.parseString(existingMeta).getAsJsonObject();
+                        } catch (Exception e) {
+                            metaObj = new com.google.gson.JsonObject();
+                        }
+                    } else {
+                        metaObj = new com.google.gson.JsonObject();
+                    }
+                    metaObj.addProperty("compressed", true);
+                    toUpdate.add(new String[]{id, gson.toJson(metaObj)});
+                }
+            }
+        }
+        if (toUpdate.isEmpty()) {
+            // ★ 可观测性：标记 0 行 = 重载后旧消息全部回流（压缩白做），必须在日志可见
+            LOG.warn("markMessagesCompressedBeforeRound marked 0 rows! session=" + sessionId
+                    + ", qaRound=" + qaRound + "（压缩范围错误或范围内无未标记消息）");
+            return 0;
+        }
+        // 分批提交：每 200 行一个事务，缩短单次持锁时间（此前整批一个事务数百行，
+        // 与压缩完成时刻的其它 DB 写撞 SQLITE_BUSY，整个标记静默失败）
+        final int BATCH = 200;
+        int done = 0;
+        while (done < toUpdate.size()) {
+            int end = Math.min(done + BATCH, toUpdate.size());
+            try (Connection conn = SqliteDatabaseManager.getConnection()) {
+                conn.setAutoCommit(false);
                 try (PreparedStatement ps = conn.prepareStatement(updateSql)) {
-                    for (String[] pair : toUpdate) {
-                        ps.setString(1, pair[1]);
-                        ps.setString(2, pair[0]);
+                    for (int i = done; i < end; i++) {
+                        ps.setString(1, toUpdate.get(i)[1]);
+                        ps.setString(2, toUpdate.get(i)[0]);
                         ps.addBatch();
                     }
                     ps.executeBatch();
                 }
+                conn.commit();
             }
-            conn.commit();
-            if (toUpdate.isEmpty()) {
-                // ★ 可观测性：标记 0 行 = 重载后旧消息全部回流（压缩白做），必须在日志可见
-                LOG.warn("markMessagesCompressedBeforeRound marked 0 rows! session=" + sessionId
-                        + ", qaRound=" + qaRound + "（压缩范围错误或范围内无未标记消息）");
-            }
-            return toUpdate.size();
-        } catch (SQLException e) {
-            LOG.error("Failed to mark messages compressed by qaRound for session: " + sessionId, e);
-            return 0;
+            done = end;
         }
+        return toUpdate.size();
     }
 
     /**
