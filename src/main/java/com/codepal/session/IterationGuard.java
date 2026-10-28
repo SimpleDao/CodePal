@@ -216,6 +216,7 @@ public class IterationGuard {
         if (hasIncompleteToolCalls || lastIsTool) {
             cleanupOrphanTools();
             ensureConversationIntegrity(conversationManager.getMessages());
+
             String content = SYSTEM_AUTO_PREFIX + SYSTEM_AUTO_STOP_REASON_CRASH + "\n"
                     + "检测到上次会话异常中断（可能是插件关闭或程序崩溃）。"
                     + "当前上下文中保留了中断前的消息和已执行的工具结果。"

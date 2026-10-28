@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.codepal"
-version = "2.3.6"
+version = "2.3.7"
 
 repositories {
     maven { url = uri("https://maven.aliyun.com/repository/public") }
@@ -23,6 +23,10 @@ dependencies {
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
     implementation("com.mysql:mysql-connector-j:8.4.0") {
+        exclude(group = "org.slf4j", module = "slf4j-api")
+    }
+    // Redis 数据源（query_database 工具对 redis 类型走 Jedis，不影响 mysql/sqlite 分支）
+    implementation("redis.clients:jedis:5.1.0") {
         exclude(group = "org.slf4j", module = "slf4j-api")
     }
 }

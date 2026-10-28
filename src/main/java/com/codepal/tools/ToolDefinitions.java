@@ -831,8 +831,8 @@ public class ToolDefinitions {
         Map<String, Object> properties = new LinkedHashMap<>();
         properties.put("db_name", createStringProp(dbNameDesc));
         properties.put("db_type", createEnumProp(
-                "数据库类型，决定 JDBC 驱动与方言：mysql=MySQL；sqlite=SQLite",
-                Arrays.asList("mysql", "sqlite")));
+                "数据库类型，决定驱动与方言：mysql=MySQL；sqlite=SQLite；redis=Redis（用 command 参数传 Redis 命令）",
+                Arrays.asList("mysql", "sqlite", "redis")));
         properties.put("mode", createEnumProp(
                 "查询模式：schema=表结构查询（返回指定表的列名/类型/是否可空/注释，不返回数据行）；"
                         + "data=表数据查询（执行给定 SQL，最多返回 10 行数据，超出部分被截断）",
@@ -844,7 +844,12 @@ public class ToolDefinitions {
                         + "例如 SELECT * FROM users WHERE age>18，或 SHOW TABLES 列出所有表、DESC users 看结构。"
                         + "SELECT 会自动在末尾拼接 LIMIT 10，无需也不应自己写 LIMIT（SHOW/DESC 等不拼 LIMIT）。"
                         + "禁止写操作（INSERT/UPDATE/DELETE/DROP 等），且不得包含分号。"
-                        + "schema 模式忽略此字段。"));
+                        + "schema 模式忽略此字段。redis 数据源忽略此字段。"));
+        properties.put("command", createStringProp(
+                "redis 类型数据源专用：要执行的只读 Redis 命令（整条，含参数），例如 GET user:1、"
+                        + "HGETALL myhash、LRANGE mylist 0 -1、SCAN 0 MATCH session:* COUNT 100、KEYS user:*、TTL mykey。"
+                        + "仅允许只读命令（GET/HGETALL/LRANGE/SMEMBERS/ZRANGE/KEYS/SCAN/TTL/EXISTS/TYPE/DBSIZE 等），"
+                        + "禁止 SET/DEL/FLUSH 等写/删操作。mysql/sqlite 数据源忽略此字段。"));
         params.put("properties", properties);
         // ★ db_name / db_type 不再是 required：
         //   db_name 可回退到用户默认选中的数据源；db_type 可从数据源配置自动推断。
@@ -852,7 +857,8 @@ public class ToolDefinitions {
         params.put("required", Arrays.asList("mode"));
 
         StringBuilder desc = new StringBuilder();
-        desc.append("连接用户已配置的数据源执行 SQL 查询，只读、自动执行无需确认。");
+        desc.append("连接用户已配置的数据源执行查询，只读、自动执行无需确认。"
+                + "支持三类：mysql（SQL）、sqlite（SQL）、redis（用 command 参数传 Redis 只读命令）。");
         if (!sourceList.isEmpty()) {
             desc.append("【当前已配置的数据源】").append(sourceList);
             if (defaultName != null && !defaultName.isBlank()) {
@@ -875,6 +881,9 @@ public class ToolDefinitions {
                         + "请据此自行判断并修正（例如 1146=表不存在，可改用 SHOW TABLES 确认真实表名），"
                         + "而不是直接告诉用户「配置有问题」。"
                         + "注意：本工具只能查询已配置的库，不能访问任意未配置的数据库。");
+        desc.append("★ Redis 用法：当 db_type=redis（或该数据源本身类型就是 redis）时，请传 command 参数执行只读 Redis 命令"
+                + "（如 GET/HGETALL/LRANGE/SMEMBERS/ZRANGE/KEYS/SCAN/TTL/EXISTS/TYPE/DBSIZE 等），不要使用 mode/sql/table_name；"
+                + "例如 command=\"HGETALL myhash\"。本工具对 Redis 默认只读，禁止 SET/DEL/FLUSH 等写/删命令。");
 
         return new ChatRequest.ToolDefinition(
                 new ChatRequest.ToolDefinition.FunctionDef(

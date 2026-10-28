@@ -37,6 +37,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.params.ScanParams;
+import redis.clients.jedis.resps.ScanResult;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.regex.Matcher;
@@ -253,7 +256,7 @@ public class ToolExecutor {
         if (normalized != null) return normalized;
 
         return EditResult.error("错误（第 " + idx + " 处编辑）：在文件中未找到指定的文本（已尝试精确/柔性/正则/标准化空格四种匹配）。"
-                + "请确认 search 与文件实际内容一致，或用 read_file_range 核对真实缩进与空格。");
+                + "不要凭记忆猜测，用 read_file_range 核对当前实际代码以及真实缩进与空格，确认 search 与文件实际内容一致。");
     }
 
     /** 柔性匹配：逐行 trim 后滑动窗口比对；命中后保留首行缩进回填 replace */
@@ -1626,6 +1629,18 @@ public class ToolExecutor {
                         + "请先在「数据源」按钮里选择/配置一个数据源，或在调用时显式传 db_name。";
             }
         }
+
+        // ── 提前取数据源并按类型分流：Redis 走独立分支，彻底绕开 JDBC/SQL 路径（不影响 mysql/sqlite）──
+        DataSourceDao.DatabaseConnectionInfo info = DataSourceDao.getByName(dbName);
+        if (info == null) {
+            return "错误：未找到名为 \"" + dbName + "\" 的数据源。可用数据源见工具描述中的清单；"
+                    + "若确实需要该库，请让用户先在工具栏左侧的「数据源」按钮里配置。";
+        }
+        String actualType = info.type == null ? "mysql" : info.type.toLowerCase(java.util.Locale.ROOT);
+        if ("redis".equals(actualType)) {
+            return execRedisQuery(params, info);
+        }
+
         if (!"schema".equals(mode) && !"data".equals(mode)) {
             return "错误：mode 必须是 \"schema\"（表结构查询）或 \"data\"（表数据查询），当前收到 \"" + mode + "\"。";
         }
@@ -1640,13 +1655,7 @@ public class ToolExecutor {
             if (err != null) return "SQL 安全校验未通过：" + err;
         }
 
-        DataSourceDao.DatabaseConnectionInfo info = DataSourceDao.getByName(dbName);
-        if (info == null) {
-            return "错误：未找到名为 \"" + dbName + "\" 的数据源。可用数据源见工具描述中的清单；"
-                    + "若确实需要该库，请让用户先在工具栏左侧的「数据源」按钮里配置。";
-        }
         // db_type 允许省略：从数据源配置自动推断（去掉 required 后模型可能不传）
-        String actualType = info.type == null ? "mysql" : info.type.toLowerCase(java.util.Locale.ROOT);
         if (dbType.isBlank()) {
             dbType = actualType;
         } else if (!actualType.equals(dbType)) {
@@ -1691,6 +1700,243 @@ public class ToolExecutor {
             // 连接建立本身失败（getConnection 抛出）
             return formatSqlError(e, dbName, dbType, info, mode, tableName, sql, null, jdbcUrl);
         }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Redis 查询分支：对 redis 类型数据源执行只读命令（Jedis），不影响 mysql/sqlite
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /** Redis 仅允许的只读命令（白名单，防止误执行写/删命令） */
+    private static final java.util.Set<String> REDIS_READONLY_COMMANDS = java.util.Set.of(
+            "GET", "MGET", "STRLEN", "EXISTS", "TYPE", "TTL", "PTTL",
+            "HGET", "HMGET", "HGETALL", "HKEYS", "HVALS", "HLEN", "HRANDFIELD",
+            "LLEN", "LRANGE", "LINDEX", "LPOS",
+            "SMEMBERS", "SCARD", "SISMEMBER", "SMISMEMBER", "SRANDMEMBER",
+            "ZCARD", "ZSCORE", "ZRANK", "ZREVRANK", "ZRANGE", "ZREVRANGE",
+            "ZRANGEBYSCORE", "ZCOUNT", "ZLEXCOUNT",
+            "KEYS", "SCAN", "RANDOMKEY", "DBSIZE", "OBJECT", "MEMORY"
+    );
+
+    /** Redis 单命令最大回显元素数（防超大结果撑爆上下文） */
+    private static final int REDIS_MAX_ELEMENTS = 500;
+
+    /**
+     * Redis 查询入口：解析 command、白名单校验、建连（Jedis）、分发到具体命令。
+     * @param info 已确认存在的数据源（type=redis）
+     */
+    private static String execRedisQuery(JsonObject params, DataSourceDao.DatabaseConnectionInfo info) {
+        String command = getString(params, "command", "").trim();
+        if (command.isEmpty()) {
+            return "错误：redis 类型数据源需要 command 参数（要执行的只读 Redis 命令，"
+                    + "例如 GET user:1、HGETALL myhash、LRANGE mylist 0 -1、SCAN 0 MATCH session:* COUNT 100）。";
+        }
+        String[] tokens = command.split("\\s+");
+        String cmd = tokens[0].toUpperCase(java.util.Locale.ROOT);
+        if (!REDIS_READONLY_COMMANDS.contains(cmd)) {
+            return "错误：仅允许只读命令，不允许 \"" + cmd + "\"。已放行："
+                    + String.join(" ", REDIS_READONLY_COMMANDS)
+                    + "。本工具对 Redis 默认只读，禁止 SET/DEL/FLUSH 等写/删操作。";
+        }
+
+        int dbNum = 0;
+        try {
+            if (info.dbName != null && !info.dbName.isEmpty()) {
+                int n = Integer.parseInt(info.dbName.trim());
+                if (n >= 0 && n <= 15) dbNum = n;
+            }
+        } catch (NumberFormatException ignore) { }
+
+        String host = (info.host == null || info.host.isEmpty()) ? "localhost" : info.host;
+        int port = info.port > 0 ? info.port : 6379;
+        try (Jedis jedis = new Jedis(host, port, 3000, 5000)) {
+            if (info.password != null && !info.password.isEmpty()) jedis.auth(info.password);
+            if (dbNum > 0) jedis.select(dbNum);
+            return execRedisCommand(jedis, cmd, tokens);
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            if (msg == null || msg.isEmpty()) msg = e.getClass().getSimpleName();
+            if (msg.length() > 200) msg = msg.substring(0, 200) + "…";
+            return "【Redis 查询失败】\n■ 错误信息：" + msg
+                    + "\n■ 连接上下文：主机=" + host + " 端口=" + port + " DB=" + dbNum
+                    + " 密码=******（已脱敏）"
+                    + "\n（请确认 Redis 是否启动、主机/端口可达、密码/DB 编号是否正确。注意：Redis 默认端口 6379。）";
+        }
+    }
+
+    /** 分发白名单内的只读命令并返回格式化文本（参数个数/类型错误由外层 catch 兜底） */
+    private static String execRedisCommand(Jedis jedis, String cmd, String[] tokens) {
+        try {
+            switch (cmd) {
+                case "GET": {
+                    String v = jedis.get(tokens[1]);
+                    return redisScalar("GET " + tokens[1], v == null ? "(nil)" : v);
+                }
+                case "MGET": {
+                    java.util.List<String> vs = jedis.mget(java.util.Arrays.copyOfRange(tokens, 1, tokens.length));
+                    return redisList("MGET", vs);
+                }
+                case "STRLEN":
+                    return redisScalar("STRLEN " + tokens[1], String.valueOf(jedis.strlen(tokens[1])));
+                case "EXISTS":
+                    return redisScalar("EXISTS " + tokens[1], String.valueOf(jedis.exists(tokens[1])));
+                case "TYPE":
+                    return redisScalar("TYPE " + tokens[1], jedis.type(tokens[1]));
+                case "TTL":
+                    return redisTtl("TTL " + tokens[1], jedis.ttl(tokens[1]));
+                case "PTTL":
+                    return redisTtl("PTTL " + tokens[1], jedis.pttl(tokens[1]));
+                case "HGET":
+                    return redisScalar("HGET " + tokens[1] + " " + tokens[2], str(jedis.hget(tokens[1], tokens[2])));
+                case "HMGET": {
+                    java.util.List<String> vs = jedis.hmget(tokens[1], java.util.Arrays.copyOfRange(tokens, 2, tokens.length));
+                    return redisList("HMGET " + tokens[1], vs);
+                }
+                case "HGETALL": {
+                    java.util.Map<String, String> m = jedis.hgetAll(tokens[1]);
+                    return redisMap("HGETALL " + tokens[1], m);
+                }
+                case "HKEYS":
+                    return redisList("HKEYS " + tokens[1], new java.util.ArrayList<>(jedis.hkeys(tokens[1])));
+                case "HVALS":
+                    return redisList("HVALS " + tokens[1], new java.util.ArrayList<>(jedis.hvals(tokens[1])));
+                case "HLEN":
+                    return redisScalar("HLEN " + tokens[1], String.valueOf(jedis.hlen(tokens[1])));
+                case "HRANDFIELD":
+                    return redisScalar("HRANDFIELD " + tokens[1], str(jedis.hrandfield(tokens[1])));
+                case "LLEN":
+                    return redisScalar("LLEN " + tokens[1], String.valueOf(jedis.llen(tokens[1])));
+                case "LRANGE": {
+                    long start = Long.parseLong(tokens[2]);
+                    long end = Long.parseLong(tokens[3]);
+                    java.util.List<String> vs = jedis.lrange(tokens[1], start, end);
+                    return redisList("LRANGE " + tokens[1] + " " + start + " " + end, vs);
+                }
+                case "LINDEX":
+                    return redisScalar("LINDEX " + tokens[1] + " " + tokens[2], str(jedis.lindex(tokens[1], Long.parseLong(tokens[2]))));
+                case "LPOS":
+                    return redisScalar("LPOS " + tokens[1] + " " + tokens[2], str(jedis.lpos(tokens[1], tokens[2])));
+                case "SMEMBERS":
+                    return redisList("SMEMBERS " + tokens[1], new java.util.ArrayList<>(jedis.smembers(tokens[1])));
+                case "SCARD":
+                    return redisScalar("SCARD " + tokens[1], String.valueOf(jedis.scard(tokens[1])));
+                case "SISMEMBER":
+                    return redisScalar("SISMEMBER " + tokens[1] + " " + tokens[2], String.valueOf(jedis.sismember(tokens[1], tokens[2])));
+                case "SMISMEMBER": {
+                    java.util.List<Boolean> bs = jedis.smismember(tokens[1], java.util.Arrays.copyOfRange(tokens, 2, tokens.length));
+                    return redisList("SMISMEMBER " + tokens[1], bs.stream().map(String::valueOf).toList());
+                }
+                case "SRANDMEMBER":
+                    return redisScalar("SRANDMEMBER " + tokens[1], str(jedis.srandmember(tokens[1])));
+                case "ZCARD":
+                    return redisScalar("ZCARD " + tokens[1], String.valueOf(jedis.zcard(tokens[1])));
+                case "ZSCORE":
+                    return redisScalar("ZSCORE " + tokens[1] + " " + tokens[2], str(jedis.zscore(tokens[1], tokens[2])));
+                case "ZRANK":
+                    return redisScalar("ZRANK " + tokens[1] + " " + tokens[2], str(jedis.zrank(tokens[1], tokens[2])));
+                case "ZREVRANK":
+                    return redisScalar("ZREVRANK " + tokens[1] + " " + tokens[2], str(jedis.zrevrank(tokens[1], tokens[2])));
+                case "ZRANGE": {
+                    java.util.List<String> vs = jedis.zrange(tokens[1], Long.parseLong(tokens[2]), Long.parseLong(tokens[3]));
+                    return redisList("ZRANGE " + tokens[1] + " " + tokens[2] + " " + tokens[3], vs);
+                }
+                case "ZREVRANGE": {
+                    java.util.List<String> vs = jedis.zrevrange(tokens[1], Long.parseLong(tokens[2]), Long.parseLong(tokens[3]));
+                    return redisList("ZREVRANGE " + tokens[1] + " " + tokens[2] + " " + tokens[3], vs);
+                }
+                case "ZRANGEBYSCORE": {
+                    java.util.List<String> vs = jedis.zrangeByScore(tokens[1], tokens[2], tokens[3]);
+                    return redisList("ZRANGEBYSCORE " + tokens[1] + " " + tokens[2] + " " + tokens[3], vs);
+                }
+                case "ZCOUNT":
+                    return redisScalar("ZCOUNT " + tokens[1] + " " + tokens[2] + " " + tokens[3],
+                            String.valueOf(jedis.zcount(tokens[1], tokens[2], tokens[3])));
+                case "ZLEXCOUNT":
+                    return redisScalar("ZLEXCOUNT " + tokens[1] + " " + tokens[2] + " " + tokens[3],
+                            String.valueOf(jedis.zlexcount(tokens[1], tokens[2], tokens[3])));
+                case "KEYS": {
+                    java.util.Set<String> ks = jedis.keys(tokens.length > 1 ? tokens[1] : "*");
+                    return redisList("KEYS " + (tokens.length > 1 ? tokens[1] : "*"), new java.util.ArrayList<>(ks));
+                }
+                case "SCAN": {
+                    String cursor = tokens.length > 1 ? tokens[1] : "0";
+                    StringBuilder pat = new StringBuilder();
+                    int count = 100;
+                    for (int i = 2; i < tokens.length; i++) {
+                        if ("MATCH".equalsIgnoreCase(tokens[i]) && i + 1 < tokens.length) pat.append(tokens[++i]);
+                        else if ("COUNT".equalsIgnoreCase(tokens[i]) && i + 1 < tokens.length) count = Integer.parseInt(tokens[++i]);
+                    }
+                    java.util.List<String> all = new java.util.ArrayList<>();
+                    String cur = cursor;
+                    do {
+                        ScanResult<String> res = pat.length() > 0
+                                ? jedis.scan(cur, new ScanParams().match(pat.toString()).count(count))
+                                : jedis.scan(cur, new ScanParams().count(count));
+                        all.addAll(res.getResult());
+                        cur = res.getCursor();
+                    } while (!"0".equals(cur) && all.size() <= REDIS_MAX_ELEMENTS);
+                    return redisList("SCAN " + cursor + (pat.length() > 0 ? " MATCH " + pat : "") + " COUNT " + count, all);
+                }
+                case "RANDOMKEY":
+                    return redisScalar("RANDOMKEY", str(jedis.randomKey()));
+                case "DBSIZE":
+                    return redisScalar("DBSIZE", String.valueOf(jedis.dbSize()));
+                case "OBJECT": {
+                    String sub = tokens.length > 1 ? tokens[1].toUpperCase(java.util.Locale.ROOT) : "";
+                    if ("ENCODING".equals(sub) && tokens.length > 2) return redisScalar("OBJECT ENCODING " + tokens[2], jedis.objectEncoding(tokens[2]));
+                    if ("REFCOUNT".equals(sub) && tokens.length > 2) return redisScalar("OBJECT REFCOUNT " + tokens[2], String.valueOf(jedis.objectRefcount(tokens[2])));
+                    if ("FREQ".equals(sub) && tokens.length > 2) return redisScalar("OBJECT FREQ " + tokens[2], String.valueOf(jedis.objectFreq(tokens[2])));
+                    return "错误：OBJECT 子命令仅支持 ENCODING / REFCOUNT / FREQ，例如 OBJECT ENCODING mykey。";
+                }
+                case "MEMORY": {
+                    String sub = tokens.length > 1 ? tokens[1].toUpperCase(java.util.Locale.ROOT) : "";
+                    if ("USAGE".equals(sub) && tokens.length > 2) return redisScalar("MEMORY USAGE " + tokens[2], str(jedis.memoryUsage(tokens[2])));
+                    return "错误：MEMORY 子命令仅支持 USAGE，例如 MEMORY USAGE mykey。";
+                }
+                default:
+                    return "错误：命令 \"" + cmd + "\" 暂未实现分发，请联系开发者扩展白名单。";
+            }
+        } catch (Exception e) {
+            String msg = e.getMessage();
+            if (msg == null || msg.isEmpty()) msg = e.getClass().getSimpleName();
+            if (msg.length() > 200) msg = msg.substring(0, 200) + "…";
+            return "【Redis 命令执行失败】\n■ 命令：" + cmd + "\n■ 信息：" + msg
+                    + "\n（请检查命令参数个数/类型，例如 LRANGE 需要 key start stop。）";
+        }
+    }
+
+    private static String str(Object o) { return o == null ? "(nil)" : o.toString(); }
+
+    /** Redis 标量结果格式化 */
+    private static String redisScalar(String title, String value) {
+        return "Redis 命令 `" + title + "` 结果：\n" + (value == null ? "(nil)" : value);
+    }
+    /** Redis TTL 结果格式化（-1 永不过期，-2 不存在） */
+    private static String redisTtl(String title, long ttl) {
+        String desc = ttl < 0 ? (ttl == -1 ? "（永不过期 -1）" : "（键不存在 -2）") : "（秒）";
+        return "Redis 命令 `" + title + "` 结果：" + ttl + " " + desc;
+    }
+    /** Redis 列表/集合结果格式化（限 REDIS_MAX_ELEMENTS） */
+    private static String redisList(String title, java.util.List<String> list) {
+        if (list == null || list.isEmpty()) return "Redis 命令 `" + title + "` 结果：空集合（0 个元素）。";
+        StringBuilder sb = new StringBuilder("Redis 命令 `").append(title).append("` 结果（")
+                .append(list.size()).append(" 个元素）：\n");
+        int n = Math.min(list.size(), REDIS_MAX_ELEMENTS);
+        for (int i = 0; i < n; i++) sb.append(i).append("] ").append(truncateCell(str(list.get(i)))).append("\n");
+        if (list.size() > REDIS_MAX_ELEMENTS) sb.append("…（已截断，仅显示前 ").append(REDIS_MAX_ELEMENTS).append(" 个）\n");
+        return sb.toString();
+    }
+    /** Redis 哈希结果格式化（限 REDIS_MAX_ELEMENTS） */
+    private static String redisMap(String title, java.util.Map<String, String> map) {
+        if (map == null || map.isEmpty()) return "Redis 命令 `" + title + "` 结果：空哈希（0 个字段）。";
+        StringBuilder sb = new StringBuilder("Redis 命令 `").append(title).append("` 结果（")
+                .append(map.size()).append(" 个字段）：\n");
+        int i = 0, n = Math.min(map.size(), REDIS_MAX_ELEMENTS);
+        for (java.util.Map.Entry<String, String> e : map.entrySet()) {
+            if (i++ >= n) break;
+            sb.append(e.getKey()).append(" = ").append(truncateCell(str(e.getValue()))).append("\n");
+        }
+        if (map.size() > REDIS_MAX_ELEMENTS) sb.append("…（已截断，仅显示前 ").append(REDIS_MAX_ELEMENTS).append(" 个字段）\n");
+        return sb.toString();
     }
 
     // ═════════════════════════════════════════════════════════════════════════

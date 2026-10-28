@@ -1348,16 +1348,14 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                 try {
                     String ins = safeGetEventText(e);
                     int insertPos = e.getOffset();
-                    // 仅当插入文本结尾是 @，且 @ 落在词首位置时才触发，避免行内已有 @ 误触
+                    // ★ 放宽触发：任意位置输入 @ 都弹出数据库选择（用户选择，接受邮箱/@var 等可能误弹的代价）。
+                    //   去掉原"仅词首/空白后触发"的 wordStart 限制；仍要求插入文本以 @ 结尾（逐字输入场景）。
                     if (ins != null && ins.endsWith("@") && !mentionActive) {
                         String cur = inputField.getText();
                         int atIdx = insertPos + ins.length() - 1;
                         if (atIdx >= 0 && atIdx < cur.length() && cur.charAt(atIdx) == '@') {
-                            boolean wordStart = (atIdx == 0) || Character.isWhitespace(cur.charAt(atIdx - 1));
-                            if (wordStart) {
-                                showMentionPopup(atIdx);
-                                return;
-                            }
+                            showMentionPopup(atIdx);
+                            return;
                         }
                     }
                     // 弹窗已显示：若 caret 之前无 @（说明已被删除/跨越），关闭弹窗
@@ -9263,10 +9261,9 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
             for (int i = caret - 1; i >= 0; i--) {
                 char c = txt.charAt(i);
                 if (c == '@') {
-                    if (i == 0) return 0;
-                    char prev = txt.charAt(i - 1);
-                    if (Character.isWhitespace(prev)) return i;
-                    return -1;
+                    // ★ 放宽：任意位置的 @ 都视为合法 mention 起点（与触发逻辑一致），
+                    //   仍要求 @ 与 caret 之间无空白（下方 isWhitespace 分支处理），保证"@ 后跟空格"即视为退出
+                    return i;
                 }
                 if (Character.isWhitespace(c)) return -1;
             }

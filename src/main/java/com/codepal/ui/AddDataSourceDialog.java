@@ -45,6 +45,7 @@ private JPanel formContainer;
     private JPanel segControl;
     private JRadioButton mysqlRadio;
     private JRadioButton sqliteRadio;
+    private JRadioButton redisRadio;
 
     /** 「测试连接」按钮：异步验证当前表单连接信息 */
     private RoundButton testBtn;
@@ -117,7 +118,9 @@ private JPanel formContainer;
         DataSourceDao.DatabaseConnectionInfo info = DataSourceDao.getByName(item.name);
         if (info == null) return;
         nameField.setText(info.name);
-        selectedType = "sqlite".equalsIgnoreCase(info.type) ? "sqlite" : "mysql";
+        if ("sqlite".equalsIgnoreCase(info.type)) selectedType = "sqlite";
+        else if ("redis".equalsIgnoreCase(info.type)) selectedType = "redis";
+        else selectedType = "mysql";
         hostField.setText(info.host == null ? "" : info.host);
         portField.setText(info.port > 0 ? String.valueOf(info.port) : "");
         dbField.setText(info.dbName == null ? "" : info.dbName);
@@ -223,7 +226,7 @@ private JPanel formContainer;
         label.setForeground(textPrimary());
         section.add(label, BorderLayout.NORTH);
 
-        segControl = new JPanel(new GridLayout(1, 2, 0, 0)) {
+        segControl = new JPanel(new GridLayout(1, 3, 0, 0)) {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
@@ -243,7 +246,8 @@ private JPanel formContainer;
         ButtonGroup group = new ButtonGroup();
         mysqlRadio = new SegRadio("MySQL", true);
         sqliteRadio = new SegRadio("SQLite", false);
-        for (JRadioButton rb : new JRadioButton[]{mysqlRadio, sqliteRadio}) {
+        redisRadio = new SegRadio("Redis", false);
+        for (JRadioButton rb : new JRadioButton[]{mysqlRadio, sqliteRadio, redisRadio}) {
             group.add(rb);
             segControl.add(rb);
             rb.addActionListener(e -> onTypeChanged());
@@ -253,25 +257,31 @@ private JPanel formContainer;
     }
 
     private void onTypeChanged() {
-        selectedType = mysqlRadio.isSelected() ? "mysql" : "sqlite";
+        selectedType = mysqlRadio.isSelected() ? "mysql"
+                : sqliteRadio.isSelected() ? "sqlite" : "redis";
         applyTypeConstraints();
     }
 
     private void updateTypeSelection() {
         mysqlRadio.setSelected("mysql".equals(selectedType));
         sqliteRadio.setSelected("sqlite".equals(selectedType));
+        redisRadio.setSelected("redis".equals(selectedType));
     }
 
     /** SQLite 类型：主机/端口整行隐藏；其他字段（名称/库名/用户名/密码）保留并支持填写。 */
     private void applyTypeConstraints() {
         boolean isMysql = "mysql".equals(selectedType);
+        boolean isSqlite = "sqlite".equals(selectedType);
+        boolean isRedis = "redis".equals(selectedType);
         // 「库名」标签/placeholder 切换
         if (dbLabel != null) {
-            dbLabel.setText(isMysql ? "库名" : "数据库文件地址");
+            dbLabel.setText(isMysql ? "库名" : isSqlite ? "数据库文件地址" : "DB 编号 (0-15)");
         }
         if (dbField != null) {
             dbField.putClientProperty("JTextField.placeholderText",
-                    isMysql ? "例如 mydb" : "例如 /path/to/app.db 或 :memory:");
+                    isMysql ? "例如 mydb"
+                            : isSqlite ? "例如 /path/to/app.db 或 :memory:"
+                            : "例如 0（Redis 逻辑库编号）");
         }
         // 重建表单行：GridBagLayout 不擅长隐藏占位空间，整体重建最稳
         rebuildFormRows();
@@ -300,6 +310,9 @@ private JPanel formContainer;
         if (formContainer == null) return;
         formContainer.removeAll();
         boolean isMysql = "mysql".equals(selectedType);
+        boolean isSqlite = "sqlite".equals(selectedType);
+        boolean showHostPort = !isSqlite;   // MySQL 与 Redis 显示主机/端口；SQLite 隐藏
+        boolean showUser = isMysql;          // 仅 MySQL 需要用户名；SQLite/Redis 隐藏
 
         // 字段是创建一次的（首次 buildFormSection 时），这里只调整可见性与文本
         if (nameField == null) {
@@ -335,7 +348,7 @@ private JPanel formContainer;
         gbc.gridy = row++;
         formContainer.add(formRow("名称", nameField), gbc);
 
-        if (isMysql) {
+        if (showHostPort) {
             gbc.gridy = row++;
             formContainer.add(formRow("主机", hostField), gbc);
             gbc.gridy = row++;
@@ -345,8 +358,10 @@ private JPanel formContainer;
         gbc.gridy = row++;
         formContainer.add(formRow(dbLabel, dbField), gbc);
 
-        gbc.gridy = row++;
-        formContainer.add(formRow("用户名", userField), gbc);
+        if (showUser) {
+            gbc.gridy = row++;
+            formContainer.add(formRow("用户名", userField), gbc);
+        }
 
         gbc.gridy = row++;
         formContainer.add(formRow("密码", passwordField), gbc);
@@ -496,6 +511,17 @@ private JPanel formContainer;
             @Override
             protected Boolean doInBackground() {
                 try {
+                    if ("redis".equals(info.type)) {
+                        int dbNum = parseRedisDb(info.dbName);
+                        try (redis.clients.jedis.Jedis j = new redis.clients.jedis.Jedis(
+                                info.host == null || info.host.isEmpty() ? "localhost" : info.host,
+                                info.port > 0 ? info.port : 6379, 2000, 2000)) {
+                            if (info.password != null && !info.password.isEmpty()) j.auth(info.password);
+                            if (dbNum > 0) j.select(dbNum);
+                            j.ping();
+                            return true;
+                        }
+                    }
                     if ("sqlite".equals(info.type)) {
                         Class.forName("org.sqlite.JDBC");
                     } else {
@@ -503,6 +529,8 @@ private JPanel formContainer;
                     }
                 } catch (ClassNotFoundException e) {
                     return false; // 驱动缺失
+                } catch (Exception e) {
+                    return false; // Redis 连接/认证失败
                 }
                 try (Connection conn = DriverManager.getConnection(url, userFinal, pwdFinal)) {
                     return conn != null && !conn.isClosed();
@@ -537,6 +565,24 @@ private JPanel formContainer;
      * 仍然失败则返回 Throwable 的简短描述。
      */
     private String probeFailureReason(DatabaseConnectionInfo info) {
+        if ("redis".equals(info.type)) {
+            try {
+                int dbNum = parseRedisDb(info.dbName);
+                try (redis.clients.jedis.Jedis j = new redis.clients.jedis.Jedis(
+                        info.host == null || info.host.isEmpty() ? "localhost" : info.host,
+                        info.port > 0 ? info.port : 6379, 2000, 2000)) {
+                    if (info.password != null && !info.password.isEmpty()) j.auth(info.password);
+                    if (dbNum > 0) j.select(dbNum);
+                    j.ping();
+                    return "未知原因";
+                }
+            } catch (Exception e) {
+                String msg = e.getMessage();
+                if (msg == null || msg.isEmpty()) msg = e.getClass().getSimpleName();
+                if (msg.length() > 120) msg = msg.substring(0, 120) + "…";
+                return msg;
+            }
+        }
         String url = info.buildJdbcUrl();
         String user = (info.user == null || info.user.isEmpty()) ? null : info.user;
         try {
@@ -706,7 +752,18 @@ private JPanel formContainer;
                 Math.max(0, (int)(c.getRed() * factor)),
                 Math.max(0, (int)(c.getGreen() * factor)),
                 Math.max(0, (int)(c.getBlue() * factor)),
-                c.getAlpha());
+                c.getAlpha()        );
+    }
+
+    /** 解析 Redis 逻辑库编号；非法/空 → 0（仅 Redis 类型使用）。 */
+    private static int parseRedisDb(String dbName) {
+        if (dbName == null || dbName.isEmpty()) return 0;
+        try {
+            int n = Integer.parseInt(dbName.trim());
+            return (n >= 0 && n <= 15) ? n : 0;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     /** 圆角输入框边框（复用 AddModelDialog 的 RoundBorder 逻辑）。 */
