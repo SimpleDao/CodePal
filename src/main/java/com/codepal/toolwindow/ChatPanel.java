@@ -2844,7 +2844,7 @@ public class ChatPanel extends JPanel implements ChatSessionManager.UiCallbacks 
                                         String rawArgs = tc.getFunction() != null ? tc.getFunction().getArguments() : "{}";
                                         String filePath = extractJsonString(rawArgs, "file_path");
                                         if (filePath.isBlank()) {
-                                            String errMsg = "错误：缺少必需参数 file_path";
+                                            String errMsg = "错误：缺少必需参数 file_path；[注意：如果是write_file调用产生此错误，产生此错误的原因可是大文件写入时，参数流转持续时间过长导致丢失， 如果文件过大，建议先用 write_file 写文件头，再用 edit_file 逐段追加，防止入参中途丢失]";
                                             System.err.println(errMsg);
                                             toolConvMgr.add(ChatMessage.toolResult(tc.getId(), rawName, errMsg));
                                             final String blankInput = tc.getFunction() != null ? tc.getFunction().getArguments() : "{}";

@@ -255,8 +255,72 @@ public class ToolExecutor {
         EditResult normalized = applyNormalizedMatch(work, search, replace, idx);
         if (normalized != null) return normalized;
 
+        // 5. 全部失败：附带差异诊断（search 实际内容可视化 + 文件最相似行 + 首个差异字符），
+        //    让模型下一轮直接看到真实差异自纠，而不是拿同一份内容无限重试
+        String diag = buildSearchDiagnosis(work, search);
+        System.err.println("[edit_file] 第 " + idx + " 处编辑匹配失败诊断:\n" + diag);
         return EditResult.error("错误（第 " + idx + " 处编辑）：在文件中未找到指定的文本（已尝试精确/柔性/正则/标准化空格四种匹配）。"
-                + "不要凭记忆猜测，用 read_file_range 核对当前实际代码以及真实缩进与空格，确认 search 与文件实际内容一致。");
+                + diag
+                + " 请根据上述差异修正 search 后重试（不要凭记忆猜测，可用 read_file_range 核对）。");
+    }
+
+    /** 匹配失败诊断：实际收到的 search 可视化 + 文件最相似行对比 + 首个差异字符码点 */
+    private static String buildSearchDiagnosis(String work, String search) {
+        StringBuilder sb = new StringBuilder();
+        String vis = escapeVisible(search);
+        sb.append("\n[诊断] 实际收到的 search（控制字符已可视化，长度 ").append(search.length())
+          .append("）:\n").append(vis.length() > 800 ? vis.substring(0, 800) + "…（截断）" : vis);
+        try {
+            List<String> sLines = toLines(search);
+            if (!sLines.isEmpty()) {
+                String sFirst = sLines.get(0).trim();
+                if (!sFirst.isEmpty()) {
+                    // 找与 search 首行公共前缀最长的文件行
+                    List<String> srcLines = toLines(work);
+                    int best = -1, bestLen = -1;
+                    for (int i = 0; i < srcLines.size(); i++) {
+                        int c = commonPrefixLen(sFirst, srcLines.get(i).trim());
+                        if (c > bestLen) { bestLen = c; best = i; }
+                    }
+                    if (best >= 0) {
+                        String fileLine = srcLines.get(best);
+                        sb.append("\n[诊断] 文件中最相似的行（L").append(best + 1).append("，控制字符已可视化）:\n")
+                          .append(escapeVisible(fileLine));
+                        int cp = commonPrefixLen(sFirst, fileLine.trim());
+                        if (cp < Math.min(sFirst.length(), fileLine.trim().length())) {
+                            char a = sFirst.charAt(cp), b = fileLine.trim().charAt(cp);
+                            sb.append("\n[诊断] 首个差异在第 ").append(cp + 1).append(" 个字符: search 端=U+")
+                              .append(String.format("%04X", (int) a)).append("('").append(a)
+                              .append("')  文件端=U+").append(String.format("%04X", (int) b))
+                              .append("('").append(b).append("')");
+                        } else if (bestLen < sFirst.length()) {
+                            sb.append("\n[诊断] 文件该行比 search 首行短（search 多出 ").append(sFirst.length() - bestLen).append(" 个字符）");
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignore) { }
+        return sb.toString();
+    }
+
+    /** 公共前缀长度 */
+    private static int commonPrefixLen(String a, String b) {
+        int n = Math.min(a.length(), b.length());
+        for (int i = 0; i < n; i++) if (a.charAt(i) != b.charAt(i)) return i;
+        return n;
+    }
+
+    /** 控制字符/不可见字符可视化（诊断用）：换行、回车、制表、其他 <0x20 与 DEL 转成可见形式 */
+    private static String escapeVisible(String s) {
+        StringBuilder sb = new StringBuilder(s.length() + 32);
+        for (char c : s.toCharArray()) {
+            if (c == '\n') sb.append("\\n\n");
+            else if (c == '\r') sb.append("\\r");
+            else if (c == '\t') sb.append("\\t");
+            else if (c < 0x20 || c == 0x7F) sb.append(String.format("\\u%04X", (int) c));
+            else sb.append(c);
+        }
+        return sb.toString();
     }
 
     /** 柔性匹配：逐行 trim 后滑动窗口比对；命中后保留首行缩进回填 replace */
