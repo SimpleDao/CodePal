@@ -1,3 +1,7 @@
+<h3>2.3.8</h3>
+<ul>
+  <li>edit_file 匹配失败诊断增强：search/replace 四层匹配（精确/柔性/正则/标准化空格）全部失败时，错误信息自动附带差异诊断——实际收到的 search 的控制字符可视化（转义显示隐形字符）、文件中最相似的行对比、首个差异字符的 Unicode 码点对照，同时写入 idea.log（[edit_file] 诊断）。模型下一轮可直接看到真实差异并自纠，不再拿同一份内容无限重试</li>
+</ul>
 <h3>2.3.7</h3>
 <ul>
   <li>新增 Redis 数据源支持：AddDataSourceDialog 增加 Redis 类型（host/port + DB 编号，user 可空、password 可选），query_database 工具对 redis 类型走 Jedis 只读查询分支（GET/MGET/HGET/HMGET/HGETALL/HKEYS/HVALS/HLEN/STRLEN/EXISTS/TYPE/TTL/PTTL/LLEN/LRANGE/LINDEX/LPOS/SCARD/SISMEMBER/SMEMBERS/SRANDMEMBER/ZCARD/ZSCORE/ZRANK/ZREVRANK/ZRANGE/ZREVRANGE/ZRANGEBYSCORE/ZCOUNT/ZLEXCOUNT/KEYS/SCAN/RANDOMKEY/DBSIZE/OBJECT 等），结果按类型格式化并限长截断；仅放只读命令，明确禁写/删（SET/DEL/FLUSH 等），与现有"只读 SQL 探索"定位一致</li>
